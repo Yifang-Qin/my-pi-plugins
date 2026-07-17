@@ -11,13 +11,46 @@
 //   1. Read the session tree + current leaf.
 //   2. Build a user-centric model (session-tree.ts) and show a large overlay
 //      (nav-overlay.ts) with the current turn preselected.
-//   3. On select, call ctx.navigateTree(id, { summarize: false }). If the target
-//      is a user turn, navigateTree returns its text as editorText (a rewind);
-//      we restore it into the editor when the editor is empty.
+//   3. On select, optionally ask whether to summarize the abandoned branch, then
+//      call ctx.navigateTree(id, { summarize, customInstructions }). pi's wrapper
+//      refreshes the transcript and, for a user-turn target, restores its prompt
+//      into an empty editor for us.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { collectEntriesForBranchSummary, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { NavOverlay } from "./nav-overlay.js";
 import { buildNavModel } from "./session-tree.js";
+
+interface SummarizeDecision {
+	cancelled?: boolean;
+	summarize: boolean;
+	customInstructions?: string;
+}
+
+// Ask whether to summarize the branch we're leaving behind. Skips the prompt
+// entirely when there is nothing to summarize (smarter than the built-in, which
+// always asks). Returns { cancelled } if the user backs out of the flow.
+async function promptSummarize(ctx: ExtensionContext, leafId: string | null, targetId: string): Promise<SummarizeDecision> {
+	const { entries } = collectEntriesForBranchSummary(ctx.sessionManager, leafId, targetId);
+	if (entries.length === 0) return { summarize: false };
+
+	const NO = "No summary";
+	const YES = "Summarize";
+	const CUSTOM = "Summarize with custom prompt";
+	const choice = await ctx.ui.select(`Summarize abandoned branch? (${entries.length} entries)`, [NO, YES, CUSTOM]);
+	if (choice === undefined) return { cancelled: true }; // esc backs out of navigation
+	if (choice === NO) return { summarize: false };
+
+	if (!ctx.model) {
+		ctx.ui.notify("tree-nav: no model available for summarization", "warning");
+		return { summarize: false };
+	}
+	if (choice === CUSTOM) {
+		const custom = await ctx.ui.editor("Custom summarization instructions");
+		if (custom === undefined) return { cancelled: true };
+		return { summarize: true, customInstructions: custom.trim() || undefined };
+	}
+	return { summarize: true };
+}
 
 async function openNav(ctx: ExtensionContext): Promise<void> {
 	if (ctx.mode !== "tui") {
@@ -55,15 +88,35 @@ async function openNav(ctx: ExtensionContext): Promise<void> {
 
 	if (!targetId || targetId === leafId) return;
 
-	// TODO(stage-2): mirror the built-in "Summarize branch?" prompt flow here.
-	const result = await ctx.navigateTree(targetId, { summarize: false });
-	if (result.cancelled) {
+	// Ask about summarizing the abandoned branch (esc = back out of navigation).
+	const decision = await promptSummarize(ctx, leafId, targetId);
+	if (decision.cancelled) {
 		ctx.ui.notify("tree-nav: navigation cancelled", "info");
 		return;
 	}
-	// A user-turn target rewinds and returns its prompt; restore it for editing.
-	if (result.editorText) ctx.ui.setEditorText(result.editorText);
-	ctx.ui.notify("tree-nav: navigated", "info");
+
+	// The extension wrapper for navigateTree runs the summarizer inline with no
+	// loader of its own, so surface a status while it works. Note: the summary
+	// LLM call cannot be aborted from an extension (abortBranchSummary is not
+	// exposed), so this status is intentionally non-cancellable.
+	if (decision.summarize) ctx.ui.setStatus("tree-nav", "summarizing abandoned branch…");
+	try {
+		const result = await ctx.navigateTree(targetId, {
+			summarize: decision.summarize,
+			customInstructions: decision.customInstructions,
+		});
+		if (result.cancelled) {
+			ctx.ui.notify("tree-nav: navigation cancelled", "info");
+			return;
+		}
+		// pi's navigateTree wrapper already refreshes the transcript and, for a
+		// user-turn target, restores its prompt into an empty editor — nothing to do.
+		ctx.ui.notify(decision.summarize ? "tree-nav: navigated (branch summarized)" : "tree-nav: navigated", "info");
+	} catch (err) {
+		ctx.ui.notify(`tree-nav: ${err instanceof Error ? err.message : String(err)}`, "error");
+	} finally {
+		ctx.ui.setStatus("tree-nav", undefined);
+	}
 }
 
 export default function (pi: ExtensionAPI): void {

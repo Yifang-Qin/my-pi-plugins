@@ -124,10 +124,12 @@ extensions/tree-nav/
 ### Stage 2 — 泳道图形 + 体验补齐
 - [x] 真·分支泳道 gutter：`│ ├─ ╰─` 画管线，`connectorCol`/`gutterCols`/`descGutterCols`/`isLastSibling`
       驱动连接线（参考 lazygit `graph.go`）；展开段落时非末位分支的 `│` 会继续延伸到下方兄弟分支。
-- [ ] "Summarize branch?" 流程对齐内置（`ctx.navigateTree` 前用 `ctx.ui.select` 询问 no/yes/custom）。
+- [ ] "Summarize branch?" 流程对齐内置：[x] 跳转前用 `ctx.ui.select` 问 no/yes/custom（custom 走 `ctx.ui.editor`），
+      并用 `collectEntriesForBranchSummary` 判空、无模型时降级。遗留：总结中途无法取消
+      （`abortBranchSummary` 未对扩展暴露）；esc 目前取消整个跳转，可优化为退回 overlay。
 - [ ] label 编辑（`pi.setLabel`）与 `labeled-only` 视图；书签跳转。
 - [ ] 段落内 assistant 文本 / toolCall 更好的缩略（复用内置 `formatToolCall` 的更多分支）。
-- [ ] 尊重用户 `editorText` 非空时不覆盖（当前直接 set，需读当前编辑器文本判空）。
+- [x] 尊重用户 `editorText` 非空时不覆盖（实为 pi 的 `navigateTree` 包装器已内置该守卫，扩展无需处理）。
 
 ### Stage 3 — 自适应布局 + 搜索
 - [ ] 视口内**自适应平衡**：当分支很多/很深时，按可视高度折叠远端分支、优先展开活动路径邻域。
