@@ -1,0 +1,11 @@
+# deps installed by pi via npm; never commit
+node_modules/
+npm-debug.log*
+
+# pi runtime state (should never be in a config repo)
+auth.json
+sessions/
+tmp/
+
+# OS junk
+.DS_Store

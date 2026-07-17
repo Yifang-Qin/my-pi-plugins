@@ -1,0 +1,11 @@
+{
+  "name": "my-pi-config",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal pi coding-agent config: extensions and theme.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["extensions"],
+    "themes": ["themes"]
+  }
+}
