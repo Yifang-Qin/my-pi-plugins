@@ -1,19 +1,21 @@
 // fuzzy-file-finder — a codex/telescope-style file picker for pi.
 //
 // Multi-file extension: pi loads this index.ts as one extension (jiti resolves
-// the relative ./files.js / ./finder-overlay.js / ./tree.js imports at runtime),
-// so no bundling or submodule is needed.
+// the relative ./*.js imports at runtime), so no bundling or submodule is needed.
 //
-// Stages:
-//   1 (done) — `/find-file` opens an overlay with a fuzzy flat list; the
-//                chosen path is inserted into the editor as `@path`.
-//   2 (done) — empty query shows a directory tree (tree.ts) with expand/
-//                collapse (→/←); typing switches to the flat fuzzy list.
-//   3 (todo) — intercept `@` at a word boundary via a CustomEditor wrapper
-//                (ctx.ui.setEditorComponent) to launch this overlay instead of
-//                the built-in autocomplete dropdown.
+// Triggered by the `/find-file` command:
+//   - empty query shows a collapsible directory tree (tree.ts); →/← expand or
+//     collapse, enter toggles dirs / selects files, tab picks the current node
+//     (directories insert as `@dir/`, files as `@path `).
+//   - typing switches to a flat subsequence-fuzzy list across all files.
+// The chosen path is inserted into the editor as an `@`-mention.
+//
+// Note: intercepting a literal "@" keystroke to auto-open this overlay was
+// prototyped (via a CustomEditor + setEditorComponent) but dropped — it relies
+// on session_start re-installing the editor on /reload, which proved unreliable.
+// The command trigger is the supported path.
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadFiles } from "./files.js";
 import { FinderOverlay } from "./finder-overlay.js";
 
@@ -41,39 +43,39 @@ export default function (pi: ExtensionAPI): void {
 		return inflight;
 	};
 
+	// Show the overlay for a known file list; resolves to the mention string to
+	// insert (`@path ` for files, `@dir/` for directories) or null if cancelled.
+	const showFinder = (ctx: ExtensionContext, files: string[]): Promise<string | null> =>
+		ctx.ui.custom<string | null>(
+			(tui, theme, _kb, done) =>
+				new FinderOverlay({
+					tui,
+					theme,
+					files,
+					maxVisible: 20,
+					onSelect: (path, isDir) => done(`@${path}${isDir ? "/" : " "}`),
+					onCancel: () => done(null),
+				}),
+			{
+				overlay: true,
+				overlayOptions: { anchor: "center", width: "85%", maxHeight: "85%", minWidth: 60, margin: 2 },
+			},
+		);
+
 	pi.registerCommand("find-file", {
-		description: "Fuzzy file finder overlay; inserts @path into the editor (Stage 1: flat list)",
+		description: "Fuzzy file finder overlay; inserts @path into the editor (tree browse + filter)",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("find-file needs the interactive TUI", "warning");
 				return;
 			}
-
 			const files = await getFiles(ctx.cwd);
 			if (files.length === 0) {
 				ctx.ui.notify("fuzzy-file-finder: no files found (need fd or a git repo)", "warning");
 				return;
 			}
-
-			const picked = await ctx.ui.custom<string | null>(
-				(tui, theme, _kb, done) =>
-					new FinderOverlay({
-						tui,
-						theme,
-						files,
-						maxVisible: 20,
-						onSelect: (path) => done(path),
-						onCancel: () => done(null),
-					}),
-				{
-					overlay: true,
-					overlayOptions: { anchor: "center", width: "85%", maxHeight: "85%", minWidth: 60, margin: 2 },
-				},
-			);
-
-			if (picked) {
-				ctx.ui.pasteToEditor(`@${picked} `);
-			}
+			const mention = await showFinder(ctx, files);
+			if (mention) ctx.ui.pasteToEditor(mention);
 		},
 	});
 }

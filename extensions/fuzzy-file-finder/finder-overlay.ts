@@ -25,7 +25,7 @@ export interface FinderOverlayOptions {
 	theme: Theme;
 	files: string[];
 	maxVisible: number;
-	onSelect: (path: string) => void;
+	onSelect: (path: string, isDir: boolean) => void;
 	onCancel: () => void;
 }
 
@@ -81,6 +81,10 @@ export class FinderOverlay implements Component, Focusable {
 		if (matchesKey(data, "down")) return this.moveAndRender(1);
 		if (matchesKey(data, "pageUp")) return this.moveAndRender(-this.opts.maxVisible);
 		if (matchesKey(data, "pageDown")) return this.moveAndRender(this.opts.maxVisible);
+		if (matchesKey(data, "tab")) {
+			this.acceptCurrent();
+			return;
+		}
 
 		if (!this.isFilter) {
 			// Tree navigation (browse mode only). In filter mode left/right/space
@@ -114,7 +118,7 @@ export class FinderOverlay implements Component, Focusable {
 	private confirm(): void {
 		if (this.isFilter) {
 			const pick = this.filtered[this.filterSel];
-			if (pick) this.opts.onSelect(pick);
+			if (pick) this.opts.onSelect(pick, false);
 			return;
 		}
 		const row = this.treeRows[this.treeSel];
@@ -123,8 +127,19 @@ export class FinderOverlay implements Component, Focusable {
 			this.toggleSelectedDir();
 			this.rerender();
 		} else {
-			this.opts.onSelect(row.node.path);
+			this.opts.onSelect(row.node.path, false);
 		}
+	}
+
+	/** Tab: accept the current node as-is — files select, directories insert @dir/. */
+	private acceptCurrent(): void {
+		if (this.isFilter) {
+			const pick = this.filtered[this.filterSel];
+			if (pick) this.opts.onSelect(pick, false);
+			return;
+		}
+		const row = this.treeRows[this.treeSel];
+		if (row) this.opts.onSelect(row.node.path, row.node.isDir);
 	}
 
 	private moveAndRender(delta: number): void {
@@ -243,7 +258,7 @@ export class FinderOverlay implements Component, Focusable {
 					lines.push(frameText(text, (t) => (isSel ? theme.fg("accent", t) : theme.fg("text", t))));
 				}
 			}
-			footer = `${this.filtered.length}/${this.opts.files.length} · ↑↓ move · enter select · esc cancel`;
+			footer = `${this.filtered.length}/${this.opts.files.length} · ↑↓ move · enter/tab select · esc cancel`;
 		} else {
 			const end = Math.min(this.treeScroll + this.opts.maxVisible, this.treeRows.length);
 			for (let i = this.treeScroll; i < end; i++) {
@@ -255,7 +270,7 @@ export class FinderOverlay implements Component, Focusable {
 				const text = (isSel ? "› " : "  ") + indent + marker + name;
 				lines.push(frameText(text, (t) => (isSel ? theme.fg("accent", t) : theme.fg("text", t))));
 			}
-			footer = `${this.opts.files.length} files · ↑↓ move · →/← expand · enter open · esc cancel`;
+			footer = `${this.opts.files.length} files · ↑↓ · →/← expand · enter open · tab pick dir · esc`;
 		}
 
 		lines.push(divider);
