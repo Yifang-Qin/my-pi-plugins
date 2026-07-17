@@ -72,6 +72,16 @@ function createFuzzyAtProvider(
 				return current.getSuggestions(lines, cursorLine, cursorCol, options);
 			}
 
+			// Bare "@" (no fuzzy query yet) -> delegate. This lets the
+			// fuzzy-file-finder overlay claim the bare "@" and, crucially, makes the
+			// two extensions order-independent in the provider chain (their load
+			// order depends on filesystem readdir order, which is not portable).
+			// Standalone (no finder), this falls through to the built-in provider,
+			// which lists all files just like this branch used to.
+			if (query.trim() === "") {
+				return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			}
+
 			const files = await getFiles();
 			if (options.signal.aborted || files.length === 0) {
 				return current.getSuggestions(lines, cursorLine, cursorCol, options);
@@ -79,9 +89,7 @@ function createFuzzyAtProvider(
 
 			// fuzzyFilter: subsequence match, splits query on whitespace and "/",
 			// requires every token to match, and ranks best-first.
-			const ranked = query.trim()
-				? fuzzyFilter(files, query, (p) => p)
-				: files;
+			const ranked = fuzzyFilter(files, query, (p) => p);
 
 			const items: AutocompleteItem[] = ranked.slice(0, MAX_SUGGESTIONS).map((p) => ({
 				value: `@${p}`,
