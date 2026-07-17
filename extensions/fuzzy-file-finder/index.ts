@@ -5,13 +5,13 @@
 // so no bundling or submodule is needed.
 //
 // Stages:
-//   1 (current) — `/find-file` opens an overlay with a fuzzy flat list; the
-//                 chosen path is inserted into the editor as `@path`.
-//   2 (todo)    — swap the flat list for the tree model (tree.ts): directory
-//                 expand/collapse with left/right.
-//   3 (todo)    — intercept `@` at a word boundary via a CustomEditor wrapper
-//                 (ctx.ui.setEditorComponent) to launch this overlay instead of
-//                 the built-in autocomplete dropdown.
+//   1 (done) — `/find-file` opens an overlay with a fuzzy flat list; the
+//                chosen path is inserted into the editor as `@path`.
+//   2 (done) — empty query shows a directory tree (tree.ts) with expand/
+//                collapse (→/←); typing switches to the flat fuzzy list.
+//   3 (todo) — intercept `@` at a word boundary via a CustomEditor wrapper
+//                (ctx.ui.setEditorComponent) to launch this overlay instead of
+//                the built-in autocomplete dropdown.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadFiles } from "./files.js";

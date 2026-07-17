@@ -8,7 +8,7 @@
 |---|---|---|
 | Extension | `extensions/bash-default-timeout.ts` | 给模型发起的 bash 调用补默认超时（默认 120s，`PI_BASH_DEFAULT_TIMEOUT` 可覆盖） |
 | Extension | `extensions/fuzzy-at-files.ts` | 把编辑器 `@` 文件补全换成 codex 风格子序列模糊匹配（`@patf` 命中 `path/to/file`，大小写不敏感，无需逐层写全目录） |
-| Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器。命令 `/find-file` 打开 overlay，选中后向编辑器插入 `@path`。分阶段开发：阶段 1 扁平模糊列表（已完成）→ 阶段 2 目录树展开/折叠 → 阶段 3 拦截 `@` 键直接弹出 |
+| Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器。命令 `/find-file` 打开 overlay，选中后向编辑器插入 `@path`。空搜索框=目录树浏览（→/← 展开折叠），打字=全库模糊列表；阶段 3（拦截 `@` 键直接弹出）待做 |
 | Theme | `themes/gruvbox-dark.json` | gruvbox 深色主题 |
 
 `package.json` 里的 `pi` manifest 声明了上述资源，pi 安装本包时自动加载。
