@@ -31,18 +31,37 @@ export interface SegmentEntry {
 /** A user turn — the first-class navigation unit. */
 export interface UserNode {
 	id: string;
-	/** Compact branch depth: 0 = mainline, +1 per real branch point. */
+	/**
+	 * Compact branch depth (also the glyph column): 0 = mainline, +1 per real
+	 * branch point. Linear chains keep the same depth.
+	 */
 	depth: number;
 	/** True when this turn lies on the current leaf → root path. */
 	onActivePath: boolean;
 	/** True for the turn nearest to (and at/above) the current leaf. */
 	isCurrent: boolean;
-	/** Last among its user siblings at a branch point (for lane glyphs). */
+	/** Last among its user siblings at a branch point (elbow └ vs tee ├). */
 	isLastSibling: boolean;
 	label?: string;
 	preview: string;
 	/** Assistant/tool entries produced in response to this turn (collapsed). */
 	segment: SegmentEntry[];
+	/**
+	 * Lane rendering (lazygit-style gutter):
+	 * - `gutterCols`: columns (< depth) that draw a vertical pipe │ on this row,
+	 *   because an ancestor branch has a later sibling still rendered below.
+	 * - `connectorCol`: column for this node's ├/└ elbow (= depth - 1), or -1 when
+	 *   this node is a linear continuation (no branch connector).
+	 * - `descGutterCols`: pipes that this turn's *descendants* (its expanded
+	 *   segment / child rows) carry — includes the branch column when this turn
+	 *   is a non-last sibling, so the line reaches the sibling below.
+	 * - `laneContinues`: whether this turn has a following user child, i.e. its
+	 *   own column keeps a │ through its expanded segment.
+	 */
+	gutterCols: number[];
+	connectorCol: number;
+	descGutterCols: number[];
+	laneContinues: boolean;
 }
 
 export interface NavModel {
@@ -211,26 +230,44 @@ export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): 
 		id = node?.entry.parentId ?? null;
 	}
 
-	// 5. Emit rows via preorder over the user-tree with compact depth.
+	// 5. Emit rows via preorder over the user-tree with compact depth AND lane
+	//    gutter info (mirrors tree-selector's connector/gutter propagation):
+	//    - `rowGutter`: pipes drawn on this node's own row (ancestor branches).
+	//    - `connectorCol`: this node's elbow column (branch children only).
+	//    - `childGutter`: pipes passed down to descendants; a non-last sibling
+	//      adds a pipe at the branch column so the line reaches the last sibling.
 	const users: UserNode[] = [];
-	const visit = (userId: string, depth: number) => {
+	const emit = (userId: string, glyphCol: number, rowGutter: number[], connectorCol: number, childGutter: number[]) => {
 		const node = byId.get(userId)!;
 		const siblings = userChildren.get(userParent.get(userId) ?? ROOT) ?? [];
 		const kids = userChildren.get(userId) ?? [];
 		users.push({
 			id: userId,
-			depth,
+			depth: glyphCol,
 			onActivePath: activePath.has(userId),
 			isCurrent: userId === currentUserId,
 			isLastSibling: siblings[siblings.length - 1] === userId,
 			label: node.label,
 			preview: previewOf(node.entry),
 			segment: collectSegment(node, byId, activePath),
+			gutterCols: rowGutter,
+			connectorCol,
+			descGutterCols: childGutter,
+			laneContinues: kids.length >= 1,
 		});
-		const childDepth = kids.length > 1 ? depth + 1 : depth;
-		for (const k of kids) visit(k, childDepth);
+		if (kids.length === 1) {
+			// Linear continuation: same column, no connector, inherit childGutter.
+			emit(kids[0]!, glyphCol, childGutter, -1, childGutter);
+		} else if (kids.length > 1) {
+			const branchCol = glyphCol;
+			kids.forEach((kid, i) => {
+				const isLast = i === kids.length - 1;
+				const kidDesc = isLast ? childGutter : [...childGutter, branchCol];
+				emit(kid, glyphCol + 1, childGutter, branchCol, kidDesc);
+			});
+		}
 	};
-	for (const rootUser of userChildren.get(ROOT) ?? []) visit(rootUser, 0);
+	for (const rootUser of userChildren.get(ROOT) ?? []) emit(rootUser, 0, [], -1, []);
 
 	const currentIndex = users.findIndex((u) => u.id === currentUserId);
 	return {

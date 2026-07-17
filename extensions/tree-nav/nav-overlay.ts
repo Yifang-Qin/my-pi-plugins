@@ -27,8 +27,8 @@ export interface NavOverlayOptions {
 }
 
 type Row =
-	| { kind: "user"; entryId: string; depth: number; user: UserNode }
-	| { kind: "seg"; entryId: string; depth: number; seg: SegmentEntry };
+	| { kind: "user"; entryId: string; user: UserNode }
+	| { kind: "seg"; entryId: string; seg: SegmentEntry; userCol: number; descGutter: number[]; laneContinues: boolean };
 
 export class NavOverlay implements Component, Focusable {
 	private readonly opts: NavOverlayOptions;
@@ -64,9 +64,11 @@ export class NavOverlay implements Component, Focusable {
 	private rebuild(): void {
 		const rows: Row[] = [];
 		for (const u of this.opts.model.users) {
-			rows.push({ kind: "user", entryId: u.id, depth: u.depth, user: u });
+			rows.push({ kind: "user", entryId: u.id, user: u });
 			if (this.expanded.has(u.id)) {
-				for (const s of u.segment) rows.push({ kind: "seg", entryId: s.id, depth: u.depth + 1, seg: s });
+				for (const s of u.segment) {
+					rows.push({ kind: "seg", entryId: s.id, seg: s, userCol: u.depth, descGutter: u.descGutterCols, laneContinues: u.laneContinues });
+				}
 			}
 		}
 		this.rows = rows;
@@ -165,7 +167,7 @@ export class NavOverlay implements Component, Focusable {
 			for (let i = this.scroll; i < end; i++) {
 				const row = this.rows[i]!;
 				const isSel = i === this.sel;
-				lines.push(frame(this.renderRow(row, isSel, inner, theme), inner >= 0 ? this.rowVisibleWidth(row, isSel, inner, theme) : 0));
+				lines.push(frame(this.renderRow(row, isSel, inner, theme), inner));
 			}
 		}
 
@@ -176,42 +178,56 @@ export class NavOverlay implements Component, Focusable {
 		return lines;
 	}
 
-	// Build the colored body of a single row (already truncated to `inner`).
+	// Render one row (already padded to exactly `inner` visible columns) with a
+	// lazygit-style lane gutter, then the node glyph / segment marker and text.
 	private renderRow(row: Row, isSel: boolean, inner: number, theme: Theme): string {
-		const raw = this.rowPlain(row);
-		const truncated = truncateToWidth(raw, inner, "");
-		let colored: string;
+		const cursor = isSel ? theme.fg("accent", "› ") : "  ";
+		const pipe = (s: string) => theme.fg("dim", s);
+
+		let prefix: string;
+		let prefixWidth: number;
+		let content: string;
+		let paint: (t: string) => string;
+
 		if (row.kind === "seg") {
-			colored = theme.fg("muted", truncated);
+			// Ancestor pipes (descGutter) keep sibling branches connected; the turn's
+			// own column shows a pipe only while its lane continues to a child below.
+			const laneSet = new Set(row.descGutter);
+			let lanes = "";
+			for (let lvl = 0; lvl < row.userCol; lvl++) lanes += laneSet.has(lvl) ? pipe("│ ") : "  ";
+			lanes += row.laneContinues ? pipe("│ ") : "  ";
+			prefix = cursor + lanes + theme.fg("muted", "╴");
+			prefixWidth = 2 + row.userCol * 2 + 2 + 1;
+			content = row.seg.preview;
+			paint = (t) => theme.fg("muted", t);
 		} else {
 			const u = row.user;
-			const paint = u.isCurrent ? (t: string) => theme.bold(theme.fg("accent", t)) : u.onActivePath ? (t: string) => theme.fg("text", t) : (t: string) => theme.fg("muted", t);
-			colored = paint(truncated);
+			const onPath = u.onActivePath;
+			const laneSet = new Set(u.gutterCols);
+			let lanes = "";
+			for (let lvl = 0; lvl < u.depth; lvl++) {
+				if (lvl === u.connectorCol) {
+					const g = u.isLastSibling ? "╰─" : "├─";
+					lanes += onPath ? theme.fg("accent", g) : pipe(g);
+				} else {
+					lanes += laneSet.has(lvl) ? pipe("│ ") : "  ";
+				}
+			}
+			const glyph = u.isCurrent ? "◉" : onPath ? "●" : "○";
+			paint = u.isCurrent ? (t) => theme.bold(theme.fg("accent", t)) : onPath ? (t) => theme.fg("text", t) : (t) => theme.fg("muted", t);
+			prefix = cursor + lanes + paint(glyph) + " ";
+			prefixWidth = 2 + u.depth * 2 + 2;
+			const fold = u.segment.length > 0 ? (this.expanded.has(u.id) ? "▾ " : "▸ ") : "";
+			const label = u.label ? `[${u.label}] ` : "";
+			const count = u.segment.length > 0 ? ` ·${u.segment.length}` : "";
+			content = `${fold}${label}${u.preview}${count}`;
 		}
-		if (isSel) colored = theme.bg("selectedBg", colored);
-		// Right-pad so the selection highlight spans the full inner width.
-		const pad = Math.max(0, inner - visibleWidth(truncated));
-		return colored + (isSel ? theme.bg("selectedBg", " ".repeat(pad)) : " ".repeat(pad));
-	}
 
-	private rowVisibleWidth(_row: Row, _isSel: boolean, inner: number, _theme: Theme): number {
-		return inner; // renderRow always pads to inner
-	}
-
-	// Plain (uncolored) row text: cursor + indent + glyph + label + preview.
-	private rowPlain(row: Row): string {
-		const cursor = this.rows[this.sel]?.entryId === row.entryId ? "› " : "  ";
-		const indent = "  ".repeat(row.depth);
-		if (row.kind === "seg") {
-			const g = row.seg.kind === "tool" ? "└╴" : "└─";
-			return `${cursor}${indent}${g} ${row.seg.preview}`;
-		}
-		const u = row.user;
-		const glyph = u.isCurrent ? "◉" : u.onActivePath ? "●" : "○";
-		const fold = u.segment.length > 0 ? (this.expanded.has(u.id) ? "▾" : "▸") : " ";
-		const label = u.label ? `[${u.label}] ` : "";
-		const seg = u.segment.length > 0 ? ` ·${u.segment.length}` : "";
-		return `${cursor}${indent}${fold}${glyph} ${label}${u.preview}${seg}`;
+		const avail = Math.max(0, inner - prefixWidth);
+		const textPlain = truncateToWidth(content, avail, "");
+		const pad = Math.max(0, inner - prefixWidth - visibleWidth(textPlain));
+		const line = prefix + paint(textPlain) + " ".repeat(pad);
+		return isSel ? theme.bg("selectedBg", line) : line;
 	}
 }
 

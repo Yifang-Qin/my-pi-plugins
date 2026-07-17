@@ -45,7 +45,8 @@
 
 - 计算 `leaf → root` 的 `activePath` 集合。
 - 遍历时，分支点上**含 activePath 的子树排在最前**，使"当前路径"始终位于顶部/左侧。
-- 行的字形区分：`◉` 当前轮次（accent 加粗）、`●` 在活动路径上、`○` 不在活动路径上。
+- 行的字形区分：`◉` 当前轮次（accent 加粗）、`●` 在活动路径上、`○` 不在活动路径上；
+  泳道连接线 `├─`/`╰─`/`│` 在活动路径上用 accent、否则 dim。
 
 ### 2.4 跳转语义（依赖 pi 的 `navigateTree`）
 
@@ -121,7 +122,8 @@ extensions/tree-nav/
 - [x] 预选当前轮；`navigateTree(id,{summarize:false})`，user 目标回填 `editorText`。
 
 ### Stage 2 — 泳道图形 + 体验补齐
-- [ ] 真·分支泳道 gutter：用 `│ ├ └ ╭ ╰` 画管线，`isLastSibling`/深度驱动连接线（参考 lazygit `graph.go`）。
+- [x] 真·分支泳道 gutter：`│ ├─ ╰─` 画管线，`connectorCol`/`gutterCols`/`descGutterCols`/`isLastSibling`
+      驱动连接线（参考 lazygit `graph.go`）；展开段落时非末位分支的 `│` 会继续延伸到下方兄弟分支。
 - [ ] "Summarize branch?" 流程对齐内置（`ctx.navigateTree` 前用 `ctx.ui.select` 询问 no/yes/custom）。
 - [ ] label 编辑（`pi.setLabel`）与 `labeled-only` 视图；书签跳转。
 - [ ] 段落内 assistant 文本 / toolCall 更好的缩略（复用内置 `formatToolCall` 的更多分支）。
