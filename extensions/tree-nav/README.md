@@ -118,7 +118,8 @@ extensions/tree-nav/
 - [x] `/nav` 命令 + 大 overlay（`width 90% / maxHeight 90% / center`）。
 - [x] 数据层：紧凑分支深度、活动路径、active-first 排序、段落折叠模型（已用合成树单测验证）。
 - [x] user 轮次一等公民列表：`◉/●/○` 字形、缩进表分支、`[label]`、预览、段落条数 `·N`。
-- [x] 键位：`↑↓` 移动、`PgUp/PgDn` 翻页、`enter` 跳转、`→/space/o` 展开段落、`←` 收起、`esc` 取消。
+- [x] 键位：`↑↓` 移动、`PgUp/PgDn` 翻页、`enter` 跳转、`→/space` 展开段落、`←` 收起、`esc` 取消。
+      （Stage 3 后打字即进入搜索，故去掉了早期的 `o` 展开快捷键以免挡输入。）
 - [x] 预选当前轮；`navigateTree(id,{summarize:false})`，user 目标回填 `editorText`。
 
 ### Stage 2 — 泳道图形 + 体验补齐
@@ -127,13 +128,16 @@ extensions/tree-nav/
 - [ ] "Summarize branch?" 流程对齐内置：[x] 跳转前用 `ctx.ui.select` 问 no/yes/custom（custom 走 `ctx.ui.editor`），
       并用 `collectEntriesForBranchSummary` 判空、无模型时降级。遗留：总结中途无法取消
       （`abortBranchSummary` 未对扩展暴露）；esc 目前取消整个跳转，可优化为退回 overlay。
-- [ ] label 编辑（`pi.setLabel`）与 `labeled-only` 视图；书签跳转。
+- [~] label 编辑（`pi.setLabel`）与 `labeled-only` 视图；书签跳转。——按需求取舍**暂不做**（非必要功能）。
 - [ ] 段落内 assistant 文本 / toolCall 更好的缩略（复用内置 `formatToolCall` 的更多分支）。
 - [x] 尊重用户 `editorText` 非空时不覆盖（实为 pi 的 `navigateTree` 包装器已内置该守卫，扩展无需处理）。
 
 ### Stage 3 — 自适应布局 + 搜索
+- [x] 搜索（B 方案：模式切换扫平列表）：空查询 = 泳道浏览；打字即切换为扁平匹配列表。
+      **仅搜 user 轮次**（+label），分词子串 AND、大小写不敏感；命中高亮（accent 加粗，与中性正文区分）；
+      内嵌 `Input` 并传播 `focused` 支持 IME；`esc` 先清查询回浏览、再按才关闭。
 - [ ] 视口内**自适应平衡**：当分支很多/很深时，按可视高度折叠远端分支、优先展开活动路径邻域。
-- [ ] 模糊搜索（`Input` + `Focusable` 已预留），跨 user/assistant 文本过滤并保留祖先链。
+- [ ] 搜索性能：超大 session 加 debounce（当前每键即时过滤，几百条内无压力）；可选“user 命中排前”排序。
 - [ ] 多根（forked session 合并展示）与超大树的性能（缓存 + 惰性）。
 - [ ] 可配置：默认过滤模式、字形主题、键位（`pi.registerShortcut` / keybindings.json）。
 
