@@ -8,7 +8,7 @@
 |---|---|---|
 | Extension | `extensions/bash-default-timeout.ts` | 给模型发起的 bash 调用补默认超时（默认 120s，`PI_BASH_DEFAULT_TIMEOUT` 可覆盖） |
 | Extension | `extensions/fuzzy-at-files.ts` | 把编辑器 `@` 文件补全换成 codex 风格子序列模糊匹配（`@patf` 命中 `path/to/file`，大小写不敏感，无需逐层写全目录） |
-| Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器。在编辑器里于**词首打 `@`** 自动弹 overlay（拦截内置内联下拉），也可用 `/find-file` 命令；选中后插入 `@path`（目录 tab 插入 `@dir/`）。空搜索框=目录树浏览（→/← 展开折叠），打字=全库模糊列表 |
+| Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器。在编辑器里于**词首打 `@`** 自动在编辑器位置就地打开（拦截内置内联下拉；不用 overlay 模式，避免与 pi-powerline-footer fixed editor 冲突导致全屏重印），也可用 `/find-file` 命令；选中后插入 `@path`（目录 tab 插入 `@dir/`）。空搜索框=目录树浏览（→/← 展开折叠），打字=全库模糊列表 |
 | Extension | `extensions/tree-nav/` | （多文件子目录扩展）lazygit 风格会话树导航器。命令 `/nav` 弹大 overlay，以 user 轮次为一等公民、左侧分支泳道，enter 跳转（跳前可选 summarize 被放弃分支），中间 assistant/tool 节点折叠可展开；打字即在 user 轮次里搜索 |
 | Theme | `themes/gruvbox-dark.json` | gruvbox 深色主题 |
 

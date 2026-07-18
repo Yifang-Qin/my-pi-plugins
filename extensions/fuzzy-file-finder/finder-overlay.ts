@@ -1,10 +1,14 @@
-// Finder overlay component (Stage 2: tree browse + fuzzy filter).
+// Finder component (Stage 2: tree browse + fuzzy filter).
 //
 // Two modes, switched automatically by the search box:
 //   - empty query  -> browse mode: directory tree with expand/collapse
 //   - typing        -> filter mode: flat subsequence-fuzzy list across all files
 //
-// A self-contained TUI component for ctx.ui.custom({ overlay: true }).
+// A self-contained TUI component for ctx.ui.custom() in the default
+// (editor-slot) mode — deliberately not an `{ overlay: true }` modal; see
+// index.ts for why overlays break under pi-powerline-footer's fixed editor.
+// The list area renders at a fixed height (blank-padded) so the surrounding
+// layout never resizes while typing.
 // enter selects a file -> onSelect(path); escape -> onCancel().
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -244,6 +248,7 @@ export class FinderOverlay implements Component, Focusable {
 		const inputLine = this.input.render(Math.max(1, inner))[0] ?? "";
 		lines.push(frame(inputLine, visibleWidth(inputLine)));
 		lines.push(divider);
+		const listStart = lines.length;
 
 		let footer: string;
 		if (this.isFilter) {
@@ -271,6 +276,14 @@ export class FinderOverlay implements Component, Focusable {
 				lines.push(frameText(text, (t) => (isSel ? theme.fg("accent", t) : theme.fg("text", t))));
 			}
 			footer = `${this.opts.files.length} files · ↑↓ · →/← expand · enter open · tab pick dir · esc`;
+		}
+
+		// Pad the list area to a fixed height: the component lives in the editor
+		// slot, so a changing height would resize the surrounding layout (and
+		// under pi-powerline-footer's fixed editor, resize the scroll region)
+		// on every keystroke.
+		for (let i = lines.length - listStart; i < this.opts.maxVisible; i++) {
+			lines.push(frame("", 0));
 		}
 
 		lines.push(divider);
