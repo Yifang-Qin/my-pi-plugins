@@ -9,7 +9,7 @@ fzf/telescope 风格的文件选择器,作为**多文件子目录扩展**加载(
 |---|---|
 | `index.ts` | 扩展入口。注册 `/find-file` 命令 + 在 `session_start` 加一个 autocomplete provider 包装器（词首 `@` 弹查找器）；打开查找器，选中后插入 mention。缓存文件清单（session_start 时预热） |
 | `finder-overlay.ts` | `ctx.ui.custom()`（编辑器槽位模式）用的 TUI 组件：搜索框 + 双模式（空查询=目录树浏览，打字=扁平模糊列表）+ 键位。列表区固定高度，打字时布局不振荡 |
-| `files.ts` | 数据层：`fd`（退回 `git ls-files`）列文件 + `fuzzyFilter` 子序列模糊排序 |
+| `files.ts` | 数据层：`fd`（退回 `git ls-files`）列文件 + 从文件清单提取目录前缀 + `fuzzyFilter` 子序列模糊排序 |
 | `tree.ts` | 目录树模型（`buildTree` / `flattenVisible`），浏览模式使用 |
 
 ## 分阶段
@@ -24,12 +24,13 @@ fzf/telescope 风格的文件选择器,作为**多文件子目录扩展**加载(
   - 插入：`@` 已在缓冲区里（就是触发的那一下），选中后只补插尾巴 `path `/`dir/`（`mention.slice(1)`）→ 得到 `@path `/`@dir/`；取消（esc）→ 留下裸 `@`（键不丢，也是打字面 `@`/邮箱、或回落到内联模糊下拉的逃生口）。
   - `@foo`（已打字）、`a@`（词中，如邮箱）都不拦，原样委托给 provider 链。
   - 必须在 `session_start` 里 `addAutocompleteProvider`：`/reload` 会清空 provider 包装器再以 `reason:"reload"` 重触发 `session_start`，装在这里才会被重装。
+- **阶段 4（已完成）**：过滤模式并入目录候选。此前候选清单只有文件（`fd --type f` / `git ls-files`），一打字目录就彻底消失；现在从文件清单提取全部目录前缀（零 IO，与树的数据来源一致），目录带 `/` 后缀与文件一起参与模糊匹配、按分数混排，选中插入 `@dir/`。空目录依然不可见（与浏览模式一致）。
 
 ## 交互
 
 - 触发：运行 `/find-file`，或在编辑器里于词首打 `@`。查找器渲染在编辑器位置（底部），不是悬浮 overlay。
 - 浏览模式：↑↓ 移动、→/← 展开折叠或跳父目录、enter 目录切换/文件选中、**tab 选中当前节点**（目录插入 `@dir/`，文件插入 `@path `）、esc 取消。
-- 过滤模式：打字过滤、↑↓ 移动、enter/tab 选中、esc 取消。
+- 过滤模式：打字过滤（目录与文件一起匹配，目录带 `/` 后缀）、↑↓ 移动、enter/tab 选中（目录插入 `@dir/`，文件插入 `@path `）、esc 取消。
 
 ## 依赖
 

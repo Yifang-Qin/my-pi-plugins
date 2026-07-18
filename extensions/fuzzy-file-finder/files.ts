@@ -29,11 +29,46 @@ export async function loadFiles(pi: ExtensionAPI, cwd: string, signal: AbortSign
 	return [];
 }
 
+/** One filter-mode candidate: a file or a directory. */
+export interface FinderEntry {
+	path: string;
+	isDir: boolean;
+}
+
 /**
- * Subsequence fuzzy filter over full paths. Empty query returns all files.
- * (fuzzyFilter splits on whitespace and "/", requires every token to match,
- * and ranks best-first — "src idx" and "src/idx" both hit "src/.../index.ts".)
+ * All directory prefixes implied by the file list, sorted. Synthesized from
+ * file paths (like tree.ts), so empty directories don't appear — consistent
+ * with browse mode, and zero extra IO.
  */
-export function filterFiles(files: string[], query: string): string[] {
-	return query.trim() ? fuzzyFilter(files, query, (p) => p) : files;
+export function extractDirs(files: string[]): string[] {
+	const dirs = new Set<string>();
+	for (const file of files) {
+		let slash = file.indexOf("/");
+		while (slash > 0) {
+			dirs.add(file.slice(0, slash));
+			slash = file.indexOf("/", slash + 1);
+		}
+	}
+	return [...dirs].sort();
+}
+
+/** Combined filter-mode candidate list: directories first, then files. */
+export function buildEntries(files: string[]): FinderEntry[] {
+	return [
+		...extractDirs(files).map((path) => ({ path, isDir: true })),
+		...files.map((path) => ({ path, isDir: false })),
+	];
+}
+
+/**
+ * Subsequence fuzzy filter over entries. Empty query returns everything.
+ * Directories match against "path/" so a trailing slash in the query still
+ * hits them; ranking interleaves dirs and files best-first.
+ * (fuzzyFilter splits on whitespace and "/", requires every token to match —
+ * "src idx" and "src/idx" both hit "src/.../index.ts".)
+ */
+export function filterEntries(entries: FinderEntry[], query: string): FinderEntry[] {
+	return query.trim()
+		? fuzzyFilter(entries, query, (e) => (e.isDir ? `${e.path}/` : e.path))
+		: entries;
 }

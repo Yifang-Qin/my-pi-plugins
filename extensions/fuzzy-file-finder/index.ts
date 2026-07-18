@@ -35,7 +35,8 @@
 //   - empty query shows a collapsible directory tree (tree.ts); →/← expand or
 //     collapse, enter toggles dirs / selects files, tab picks the current node
 //     (directories insert as `@dir/`, files as `@path `).
-//   - typing switches to a flat subsequence-fuzzy list across all files.
+//   - typing switches to a flat subsequence-fuzzy list across all files AND
+//     directories (dirs render with a trailing "/" and insert as `@dir/`).
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";

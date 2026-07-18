@@ -2,14 +2,17 @@
 //
 // Two modes, switched automatically by the search box:
 //   - empty query  -> browse mode: directory tree with expand/collapse
-//   - typing        -> filter mode: flat subsequence-fuzzy list across all files
+//   - typing        -> filter mode: flat subsequence-fuzzy list across all
+//     files AND directories (dirs render with a trailing "/" and select as
+//     `@dir/`, so a directory can be mentioned without drilling into it)
 //
 // A self-contained TUI component for ctx.ui.custom() in the default
 // (editor-slot) mode — deliberately not an `{ overlay: true }` modal; see
 // index.ts for why overlays break under pi-powerline-footer's fixed editor.
 // The list area renders at a fixed height (blank-padded) so the surrounding
 // layout never resizes while typing.
-// enter selects a file -> onSelect(path); escape -> onCancel().
+// enter/tab select the highlighted entry -> onSelect(path, isDir); escape ->
+// onCancel().
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -21,7 +24,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { filterFiles } from "./files.js";
+import { type FinderEntry, buildEntries, filterEntries } from "./files.js";
 import { type FlatRow, type TreeNode, buildTree, flattenVisible } from "./tree.js";
 
 export interface FinderOverlayOptions {
@@ -37,8 +40,9 @@ export class FinderOverlay implements Component, Focusable {
 	private readonly opts: FinderOverlayOptions;
 	private readonly input = new Input();
 
-	// Filter mode (non-empty query): flat fuzzy list.
-	private filtered: string[];
+	// Filter mode (non-empty query): flat fuzzy list over dirs + files.
+	private readonly entries: FinderEntry[];
+	private filtered: FinderEntry[];
 	private filterSel = 0;
 	private filterScroll = 0;
 
@@ -53,7 +57,8 @@ export class FinderOverlay implements Component, Focusable {
 
 	constructor(opts: FinderOverlayOptions) {
 		this.opts = opts;
-		this.filtered = filterFiles(opts.files, "");
+		this.entries = buildEntries(opts.files);
+		this.filtered = this.entries;
 		this.root = buildTree(opts.files);
 		this.treeRows = flattenVisible(this.root, this.expanded);
 	}
@@ -109,7 +114,7 @@ export class FinderOverlay implements Component, Focusable {
 
 		// Otherwise edit the query, then refilter and reset the filter cursor.
 		this.input.handleInput(data);
-		this.filtered = filterFiles(this.opts.files, this.input.getValue());
+		this.filtered = filterEntries(this.entries, this.input.getValue());
 		this.filterSel = 0;
 		this.filterScroll = 0;
 		this.rerender();
@@ -122,7 +127,7 @@ export class FinderOverlay implements Component, Focusable {
 	private confirm(): void {
 		if (this.isFilter) {
 			const pick = this.filtered[this.filterSel];
-			if (pick) this.opts.onSelect(pick, false);
+			if (pick) this.opts.onSelect(pick.path, pick.isDir);
 			return;
 		}
 		const row = this.treeRows[this.treeSel];
@@ -139,7 +144,7 @@ export class FinderOverlay implements Component, Focusable {
 	private acceptCurrent(): void {
 		if (this.isFilter) {
 			const pick = this.filtered[this.filterSel];
-			if (pick) this.opts.onSelect(pick, false);
+			if (pick) this.opts.onSelect(pick.path, pick.isDir);
 			return;
 		}
 		const row = this.treeRows[this.treeSel];
@@ -257,13 +262,13 @@ export class FinderOverlay implements Component, Focusable {
 			} else {
 				const end = Math.min(this.filterScroll + this.opts.maxVisible, this.filtered.length);
 				for (let i = this.filterScroll; i < end; i++) {
-					const path = this.filtered[i]!;
+					const entry = this.filtered[i]!;
 					const isSel = i === this.filterSel;
-					const text = (isSel ? "› " : "  ") + path;
+					const text = (isSel ? "› " : "  ") + entry.path + (entry.isDir ? "/" : "");
 					lines.push(frameText(text, (t) => (isSel ? theme.fg("accent", t) : theme.fg("text", t))));
 				}
 			}
-			footer = `${this.filtered.length}/${this.opts.files.length} · ↑↓ move · enter/tab select · esc cancel`;
+			footer = `${this.filtered.length}/${this.entries.length} · ↑↓ move · enter/tab select · esc cancel`;
 		} else {
 			const end = Math.min(this.treeScroll + this.opts.maxVisible, this.treeRows.length);
 			for (let i = this.treeScroll; i < end; i++) {
