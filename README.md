@@ -17,7 +17,7 @@
 ## 安装
 
 ```bash
-pi install git:github.com/you/my-pi-config
+pi install https://github.com/you/my-pi-config
 ```
 
 安装后：
@@ -26,13 +26,35 @@ pi install git:github.com/you/my-pi-config
   `/theme gruvbox-dark`（或在 `~/.pi/agent/settings.json` 里设 `"theme": "gruvbox-dark"`）。
   这是 pi 的机制——package 不能替用户强行选主题。
 
-> 本仓库只包含模型之外的通用 pi 配置，不含任何 provider / 模型 / 凭据，也不动
-> `defaultModel` / `defaultThinkingLevel` 等模型相关设置。
+## 新机器 Step by Step（只配插件与个性化，不含模型/key）
+
+1. **装 pi 本体**（见[官方文档](https://pi.dev)），可选外部依赖按需装：
+   `fd`（fuzzy-file-finder 加速，缺了会回退 `git ls-files`）、
+   `ffmpeg` + `yt-dlp`（pi-web-access 视频抽帧）。
+   macOS 用 `brew install fd ffmpeg yt-dlp`，Linux 用对应包管理器（如 `apt install fd-find`）。
+2. **装本配置包**
+   ```bash
+   pi install https://github.com/you/my-pi-config
+   ```
+3. **装配套 npm 包**
+   ```bash
+   pi install npm:pi-powerline-footer
+   pi install npm:pi-web-access
+   ```
+4. **个性化设置**：在 `~/.pi/agent/settings.json` 里加（或直接用 `/theme gruvbox-dark` 选主题）：
+   ```json
+   {
+     "theme": "gruvbox-dark",
+     "powerline": { "preset": "default", "fixedEditor": true, "placement": "above" }
+   }
+   ```
+5. **验证**：启动 pi，敲 `@` 应弹出模糊文件选择器，`/find-file`、`/nav` 命令可用，
+   底部出现 powerline 状态栏。
 
 ## 卸载
 
 ```bash
-pi remove git:github.com/you/my-pi-config
+pi remove https://github.com/you/my-pi-config
 ```
 
 移除后扩展自动失效；若之前选中了本主题，pi 会自动回退到默认主题。
@@ -41,24 +63,11 @@ pi remove git:github.com/you/my-pi-config
 
 pi 是「**登记引用 + 启动时按引用加载**」，不会把整个仓库拷进 `~/.pi`：
 
-- `pi install git:...` 把仓库 clone 到 `~/.pi/agent/git/<host>/<path>/`，并在
-  `~/.pi/agent/settings.json` 的 `packages` 数组里登记一条 `git:` 引用。
+- `pi install https://...`（或 `git:...`）把仓库 clone 到 `~/.pi/agent/git/<host>/<path>/`，
+  并在 `~/.pi/agent/settings.json` 的 `packages` 数组里登记一条引用。
 - 启动时 pi 读 `packages[]`，按每个包的 `pi` manifest 加载 `extensions/*.ts` 和
   `themes/*.json`。扩展默认启用，主题加入可选列表。
 - `pi remove` 只删掉 `packages` 里的引用，不会在 `~/.pi` 留下散落文件。
 
 用 `pi config` 可单独启用/禁用某个扩展或主题；用 `pi update --extensions` 更新已装包。
 
-## 不在本仓库范围内（新机器需手动）
-
-- **powerline 状态栏**：`pi install npm:pi-powerline-footer`，并按需在 settings 里配
-  `"powerline": { "preset": "default", "fixedEditor": true, "placement": "above" }`。
-- **联网搜索 / 网页・视频理解**：`pi install npm:pi-web-access`，开箱即用（Exa 免密钥、
-  无需配置，`web_search` / `fetch_content` 等工具在会话启动时自动注册）。如需 YouTube /
-  本地视频抽帧，另装 `brew install ffmpeg yt-dlp`；OpenAI / Gemini 等其它搜索源需自备 key，
-  写入本机 `~/.pi/web-search.json`（不进本仓库）。
-- **`fd` 二进制**：`brew install fd`。
-
-## 维护约定
-
-不提交任何机密/本机状态：`auth.json`、`sessions/`、`tmp/`、`node_modules/` 已在 `.gitignore` 中。
