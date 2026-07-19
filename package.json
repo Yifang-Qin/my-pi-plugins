@@ -1,5 +1,5 @@
 {
-  "name": "my-pi-config",
+  "name": "my-pi-plugins",
   "version": "0.1.0",
   "private": true,
   "description": "Personal pi coding-agent config: extensions and theme.",

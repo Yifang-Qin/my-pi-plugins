@@ -1,4 +1,4 @@
-# my-pi-config
+# my-pi-plugins
 
 个人 [pi](https://pi.dev) coding-agent 配置，做成一个原生 pi package，用 `pi install` / `pi remove` 直接安装卸载。
 
@@ -17,7 +17,7 @@
 ## 安装
 
 ```bash
-pi install https://github.com/you/my-pi-config
+pi install https://github.com/Yifang-Qin/my-pi-plugins
 ```
 
 安装后：
@@ -34,7 +34,7 @@ pi install https://github.com/you/my-pi-config
    macOS 用 `brew install fd ffmpeg yt-dlp`，Linux 用对应包管理器（如 `apt install fd-find`）。
 2. **装本配置包**
    ```bash
-   pi install https://github.com/you/my-pi-config
+   pi install https://github.com/Yifang-Qin/my-pi-plugins
    ```
 3. **装配套 npm 包**
    ```bash
@@ -54,7 +54,7 @@ pi install https://github.com/you/my-pi-config
 ## 卸载
 
 ```bash
-pi remove https://github.com/you/my-pi-config
+pi remove https://github.com/Yifang-Qin/my-pi-plugins
 ```
 
 移除后扩展自动失效；若之前选中了本主题，pi 会自动回退到默认主题。
