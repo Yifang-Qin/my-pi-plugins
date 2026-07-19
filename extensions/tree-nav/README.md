@@ -67,6 +67,36 @@
 所以：**选中一个 user 轮次 = 回退重问**（点 1/2）；**展开后选中中间节点 = 落到该处**（点 3）。
 `summarize: false` 时不生成"放弃分支总结"，跳转最快，贴合 vibe coding 的秒回退习惯。
 
+### 2.5 隐藏"空草稿"分支（默认开启，`tab` 切换）
+
+痛点：双击 ESC 或 `/nav` 往回**回溯**改上一轮输入时，只要你重新提交，Pi 的 append-only 会话就会
+在树上留下一条**死支**（旧 prompt 那一段）。若这段分支**从头到尾没产生任何 assistant/tool 回合**
+（典型：改错别字，回退后重问），它对之后的审计毫无价值，纯属噪音。
+
+本扩展**不删本地文件**（顺着 append-only 设计），只在 `/nav` 的**显示层过滤**掉这类分支：
+
+> **隐藏某个 user 轮 U，当且仅当：U 的整棵子树里不含任何"有价值内容"，且 U 不在当前 active path 上。**
+
+- **"有价值内容"** = **toolResult** / **有实质产出的 assistant 轮**（发过 tool call 或有非空文本）/ `branch_summary` /
+  `compaction`。注意：**空的 assistant 轮不算**——“敲回车立即生成一个 assistant 轮、马上 ESC
+  变 `(aborted)`”（`stopReason: "aborted"`、无文本无 tool call）或 errored 空轮，都不算真实工作，不会挡隐藏。
+  一旦真发起过 tool call、或有了（哪怕部分的）文本回复，就保留（审计价值在）。`branch_summary` 按需求保留；
+  纯 user 轮 + 元数据（label / model / thinking 变更）不算有价值。
+- **递归判定整棵子树**：若 U 自己没响应、但其某个 user 子孙有真实响应，U 是"通往有效对话的必经祖先"，
+  保留。只有**整段子树都无价值**才隐藏——此时从最顶端那个 user 节点剪掉整棵子树（其后代必然也无价值、
+  也都 off-path），分支深度/泳道自然塌回线性。
+- **active-path 例外**：绝不隐藏"当前所在"的轮次。比如刚提交、assistant 还没回复就开 `/nav`，最新那轮
+  暂时"无响应"但在 active path 上，照常显示，避免"当前位置消失"。
+- **`tab` 显隐开关**（默认隐藏）：overlay 内按 `tab` 在"隐藏空草稿 / 显示全部"间切换，标题栏显示
+  `+N hidden` 提示被隐藏的数量；切换时尽量保留当前选中项、否则回落到当前轮。想翻出某条被隐藏的旧草稿
+  原文去 copy/跳转时，切到"显示全部"即可。
+- **降级**：若隐藏后一条都不剩（极少见，如 leaf 重置到 root、树里只剩草稿），`/nav` 自动以"显示全部"
+  打开，保证有东西可导航。
+
+实现落点在数据层 `buildNavModel(roots, leafId, hideResponseless=true)`：过滤发生在"建 user 父子映射"
+的那次遍历里，跳过被隐藏的 user 节点，因此深度/泳道/`currentIndex`/段落折叠全部基于过滤后的模型，视图层
+几乎不用改。`index.ts` 同时构建隐藏视图与全量视图（`false`）两个模型交给 overlay，`tab` 只是切换用哪个。
+
 ---
 
 ## 3. 现状：pi 内置 `/tree` 摸底（复用与接线）
@@ -138,7 +168,8 @@ extensions/tree-nav/
   命中高亮（accent 加粗，与中性正文区分）；内嵌 `Input` 并传播 `focused` 支持 IME；`esc` 先清查询回浏览、再按才关闭。
 - **跳转**：`ctx.navigateTree`，user 目标回退并回填 prompt（pi 包装器自带“编辑器非空不覆盖”守卫）；跳转前用 `ctx.ui.select`
   询问是否 summarize 被放弃分支（`collectEntriesForBranchSummary` 判空、custom 走 `ctx.ui.editor`、无模型时降级）。
-- **键位**：`↑↓` 移动、`PgUp/PgDn` 翻页、`enter` 跳转、`esc` 取消/先清搜索（早期的 `o` 展开键已去掉，以免挡输入）。
+- **键位**：`↑↓` 移动、`PgUp/PgDn` 翻页、`enter` 跳转、`tab` 切换隐藏空草稿/显示全部、`esc` 取消/先清搜索（早期的 `o` 展开键已去掉，以免挡输入）。
+- **隐藏空草稿分支**（默认开启，见 2.5）：`buildNavModel` 第三参 `hideResponseless` 控制；判定"有价值内容"= toolResult / 有实质产出的 assistant 轮（有 tool call 或非空文本，空的 aborted/errored 轮不算）/ branch_summary / compaction，递归整棵子树 + active-path 例外；`index.ts` 建隐藏/全量两模型，overlay 内 `tab` 切换、标题栏显示 `+N hidden`、隐藏后为空则自动显示全部。
 
 均已用合成 `SessionTreeNode` 树 + 驱动真实 `Input` 的冷烟测试验证（多层分支泳道连接、模式切换、高亮、esc 语义）。
 

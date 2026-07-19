@@ -22,7 +22,12 @@ import type { NavModel, SegmentEntry, UserNode } from "./session-tree.js";
 export interface NavOverlayOptions {
 	tui: TUI;
 	theme: Theme;
+	/** Default view: empty drafts (response-less abandoned turns) hidden. */
 	model: NavModel;
+	/** Show-all view: every user turn, toggled with tab. */
+	fullModel: NavModel;
+	/** Start in show-all (used when hiding would leave nothing to navigate). */
+	startShowAll?: boolean;
 	onSelect: (entryId: string) => void;
 	onCancel: () => void;
 }
@@ -51,18 +56,32 @@ export class NavOverlay implements Component, Focusable {
 
 	private _focused = false;
 
+	// When false, `model` is the pruned view (empty drafts hidden); tab toggles.
+	private showAll = false;
+
 	constructor(opts: NavOverlayOptions) {
 		this.opts = opts;
+		this.showAll = opts.startShowAll ?? false;
 		const termRows = opts.tui.terminal?.rows ?? 24;
 		this.maxVisible = Math.max(6, Math.min(40, termRows - 10));
 		this.rebuild();
 		// Preselect the current turn (nearest user ancestor of the leaf).
-		const cur = opts.model.currentIndex;
-		if (cur >= 0) {
-			const idx = this.rows.findIndex((r) => r.kind === "user" && r.user.id === opts.model.users[cur]!.id);
-			if (idx >= 0) this.sel = idx;
-		}
+		this.preselectCurrent();
 		this.scroll = this.clampScroll(this.sel, 0, this.rows.length);
+	}
+
+	/** The active model for the current show-all state. */
+	private get model(): NavModel {
+		return this.showAll ? this.opts.fullModel : this.opts.model;
+	}
+
+	// Move selection onto the current turn if it's present in the active view.
+	private preselectCurrent(): void {
+		const cur = this.model.currentIndex;
+		if (cur < 0) return;
+		const id = this.model.users[cur]!.id;
+		const idx = this.rows.findIndex((r) => r.kind === "user" && r.user.id === id);
+		if (idx >= 0) this.sel = idx;
 	}
 
 	// Focusable — propagate focus to the search input for IME/cursor positioning.
@@ -81,7 +100,7 @@ export class NavOverlay implements Component, Focusable {
 
 	private rebuild(): void {
 		const rows: Row[] = [];
-		const users = this.opts.model.users;
+		const users = this.model.users;
 		users.forEach((u, i) => {
 			rows.push({ kind: "user", entryId: u.id, user: u });
 			if (this.expanded.has(u.id)) {
@@ -119,7 +138,7 @@ export class NavOverlay implements Component, Focusable {
 		this.tokens = q ? q.split(/\s+/).filter(Boolean) : [];
 		this.filtered = this.tokens.length === 0
 			? []
-			: this.opts.model.users.filter((u) => {
+			: this.model.users.filter((u) => {
 					const hay = `${u.label ?? ""} ${u.preview}`.toLowerCase();
 					return this.tokens.every((t) => hay.includes(t));
 				});
@@ -152,6 +171,7 @@ export class NavOverlay implements Component, Focusable {
 		if (matchesKey(data, "down")) return this.move(1);
 		if (matchesKey(data, "pageUp")) return this.move(-this.maxVisible);
 		if (matchesKey(data, "pageDown")) return this.move(this.maxVisible);
+		if (matchesKey(data, "tab")) return this.toggleShowAll();
 
 		if (!this.isFilter) {
 			// Browse-only structural keys. (No 'o' shortcut — letters start a search.)
@@ -227,6 +247,41 @@ export class NavOverlay implements Component, Focusable {
 		return -1;
 	}
 
+	// tab: toggle hiding of empty-draft turns. Preserve the selected turn across
+	// the switch when it still exists, else fall back to the current turn.
+	private toggleShowAll(): void {
+		const keepId = this.selectedUserId();
+		this.showAll = !this.showAll;
+		if (this.isFilter) {
+			this.refilter();
+		} else {
+			this.rebuild();
+			const idx = keepId ? this.rows.findIndex((r) => r.kind === "user" && r.entryId === keepId) : -1;
+			if (idx >= 0) this.sel = idx;
+			else {
+				this.sel = 0;
+				this.preselectCurrent();
+			}
+			this.sel = this.clampToSelectable(this.sel, 1);
+			this.scroll = this.clampScroll(this.sel, 0, this.rows.length);
+		}
+		this.opts.tui.requestRender();
+	}
+
+	// The user id currently under selection (in either mode), for preservation.
+	private selectedUserId(): string | undefined {
+		if (this.isFilter) return this.filtered[this.filterSel]?.id;
+		const r = this.rows[this.sel];
+		if (!r) return undefined;
+		if (r.kind === "user") return r.entryId;
+		if (r.kind === "seg") {
+			const owner = this.findOwnerUserIndex(this.sel);
+			const o = owner >= 0 ? this.rows[owner] : undefined;
+			return o && o.kind === "user" ? o.entryId : undefined;
+		}
+		return undefined;
+	}
+
 	private clampScroll(sel: number, scroll: number, len: number): number {
 		const mv = this.maxVisible;
 		let next = scroll;
@@ -240,12 +295,16 @@ export class NavOverlay implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
-		const { theme, model } = this.opts;
+		const { theme } = this.opts;
+		const model = this.model;
 		const border = (s: string): string => theme.fg("text", s);
 		const inner = Math.max(1, width - 4);
 
 		const filtering = this.isFilter;
-		const title = filtering ? ` search · ${this.filtered.length}/${model.totalUsers} turns ` : ` session tree · ${model.totalUsers} turns `;
+		const hiddenCount = Math.max(0, this.opts.fullModel.totalUsers - this.opts.model.totalUsers);
+		const title = filtering
+			? ` search · ${this.filtered.length}/${model.totalUsers} turns `
+			: ` session tree · ${model.totalUsers} turns${!this.showAll && hiddenCount > 0 ? ` · +${hiddenCount} hidden` : ""} `;
 		const topFill = Math.max(0, width - 3 - visibleWidth(title));
 		const top = border("╔═") + theme.bold(border(title)) + border(`${"═".repeat(topFill)}╗`);
 		const divider = border(`╠${"═".repeat(Math.max(0, width - 2))}╣`);
@@ -283,9 +342,10 @@ export class NavOverlay implements Component, Focusable {
 		}
 
 		lines.push(divider);
+		const toggleHint = this.showAll ? "tab hide empty" : "tab show empty";
 		const footer = filtering
-			? "↑↓ move · enter jump · esc clear"
-			: "↑↓ move · enter jump · →/← expand · type to search · esc";
+			? `↑↓ move · enter jump · ${toggleHint} · esc clear`
+			: `↑↓ move · enter jump · →/← expand · ${toggleHint} · type to search · esc`;
 		lines.push(frameText(footer, (t) => theme.fg("dim", t)));
 		lines.push(bottom);
 		return lines;

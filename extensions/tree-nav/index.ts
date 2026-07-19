@@ -65,11 +65,17 @@ async function openNav(ctx: ExtensionContext): Promise<void> {
 	}
 
 	const leafId = ctx.sessionManager.getLeafId();
-	const model = buildNavModel(roots, leafId);
-	if (model.users.length === 0) {
+	// Default view hides "empty draft" turns (abandoned prompts whose subtree has no
+	// assistant/tool/summary); the full view (tab in the overlay) shows everything.
+	const model = buildNavModel(roots, leafId, true);
+	const fullModel = buildNavModel(roots, leafId, false);
+	if (fullModel.users.length === 0) {
 		ctx.ui.notify("tree-nav: no user turns to navigate", "warning");
 		return;
 	}
+	// If hiding drafts leaves nothing (e.g. leaf reset to root with only abandoned
+	// drafts), open in show-all so there is still something to navigate.
+	const startShowAll = model.users.length === 0;
 
 	const targetId = await ctx.ui.custom<string | null>(
 		(tui, theme, _kb, done) =>
@@ -77,6 +83,8 @@ async function openNav(ctx: ExtensionContext): Promise<void> {
 				tui,
 				theme,
 				model,
+				fullModel,
+				startShowAll,
 				onSelect: (id) => done(id),
 				onCancel: () => done(null),
 			}),

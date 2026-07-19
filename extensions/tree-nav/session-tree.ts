@@ -87,6 +87,34 @@ function isUserNode(node: SessionTreeNode): boolean {
 	return e.type === "message" && e.message.role === "user";
 }
 
+/**
+ * Does this entry represent "real work" that should keep a branch visible?
+ * - toolResult: always (a tool actually ran → potential side effect).
+ * - assistant: ONLY if it produced content — a tool call or non-empty text. An
+ *   *empty* assistant turn (e.g. submitting a prompt spawns an assistant turn
+ *   that is immediately aborted, `stopReason: "aborted"` with no text/tool calls,
+ *   or an errored empty turn) is NOT real work and must not keep an abandoned
+ *   draft visible.
+ * - summary artifacts we deliberately preserve: branch_summary (per requirement)
+ *   and compaction.
+ * Bare user turns and metadata (label / model / thinking changes) are NOT
+ * valuable, so a subtree made only of those is treated as an empty draft.
+ */
+function entryIsValuable(entry: SessionEntry): boolean {
+	if (entry.type === "message") {
+		const msg = entry.message;
+		if (msg.role === "toolResult") return true;
+		if (msg.role === "assistant") return assistantHasContent(msg.content);
+		return false; // user
+	}
+	return entry.type === "branch_summary" || entry.type === "compaction";
+}
+
+/** An assistant turn counts as content iff it issued a tool call or has text. */
+function assistantHasContent(content: unknown): boolean {
+	return extractToolCalls(content).length > 0 || extractText(content).trim().length > 0;
+}
+
 /** First N chars of the plain-text content of an entry, whitespace-normalized. */
 export function previewOf(entry: SessionEntry, max = 160): string {
 	const norm = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, max);
@@ -176,8 +204,13 @@ function formatToolCall(tc: ToolCall): string {
  *
  * @param roots  ctx.sessionManager.getTree()
  * @param leafId ctx.sessionManager.getLeafId()
+ * @param hideResponseless When true (default), hide "empty draft" user turns —
+ *   those whose ENTIRE subtree produced no assistant/tool/summary content and
+ *   that lie off the active path (e.g. a prompt you rewound to fix a typo, which
+ *   would otherwise linger as a dead fork). The current/active turn is never
+ *   hidden, so the view always has a valid selection.
  */
-export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): NavModel {
+export function buildNavModel(roots: SessionTreeNode[], leafId: string | null, hideResponseless = true): NavModel {
 	// 1. Index every node by id, and record entry.parentId for upward walks.
 	const byId = new Map<string, SessionTreeNode>();
 	(function index(nodes: SessionTreeNode[]) {
@@ -212,13 +245,32 @@ export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): 
 		return has;
 	}
 
+	// 2b. Value cache: does a subtree contain any "real work" (assistant/tool turn
+	//     or a preserved summary artifact)? Memoized like subtreeHasActive; drives
+	//     the empty-draft pruning below.
+	const valueCache = new Map<string, boolean>();
+	function subtreeHasValue(node: SessionTreeNode): boolean {
+		const cached = valueCache.get(node.entry.id);
+		if (cached !== undefined) return cached;
+		let has = entryIsValuable(node.entry);
+		if (!has) for (const c of node.children) if (subtreeHasValue(c)) { has = true; break; }
+		valueCache.set(node.entry.id, has);
+		return has;
+	}
+
 	// 3. Map each user node to its nearest user ancestor, in DFS (active-first)
-	//    order, so userChildren preserves the desired render order.
+	//    order, so userChildren preserves the desired render order. When
+	//    hideResponseless is on, prune a user turn whose entire subtree produced no
+	//    assistant/tool/summary content AND is off the active path — a pure
+	//    abandoned draft. Pruning at the topmost such node drops its whole subtree
+	//    (all descendants are necessarily valueless and off-path too), so branch
+	//    depth/lanes collapse back to a clean linear view.
 	const userParent = new Map<string, string>(); // userId -> parentUserId | ROOT
 	const userChildren = new Map<string, string[]>([[ROOT, []]]);
 	(function walk(node: SessionTreeNode, nearestUser: string) {
 		let nextUser = nearestUser;
 		if (isUserNode(node)) {
+			if (hideResponseless && !activePath.has(node.entry.id) && !subtreeHasValue(node)) return;
 			userParent.set(node.entry.id, nearestUser);
 			(userChildren.get(nearestUser) ?? setGet(userChildren, nearestUser)).push(node.entry.id);
 			nextUser = node.entry.id;
