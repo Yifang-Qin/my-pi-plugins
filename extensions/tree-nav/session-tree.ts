@@ -42,6 +42,13 @@ export interface UserNode {
 	isCurrent: boolean;
 	/** Last among its user siblings at a branch point (elbow └ vs tee ├). */
 	isLastSibling: boolean;
+	/**
+	 * True when this turn's parent user turn sits in the SAME lane directly above
+	 * (i.e. a linear continuation). Drives the upward half of the lane's time-rail
+	 * `│` so consecutive turns read as connected even while collapsed. False for a
+	 * root's first turn and for branch children (which attach via an elbow ├/╰).
+	 */
+	parentSameLane: boolean;
 	label?: string;
 	preview: string;
 	/** Assistant/tool entries produced in response to this turn (collapsed). */
@@ -237,7 +244,7 @@ export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): 
 	//    - `childGutter`: pipes passed down to descendants; a non-last sibling
 	//      adds a pipe at the branch column so the line reaches the last sibling.
 	const users: UserNode[] = [];
-	const emit = (userId: string, glyphCol: number, rowGutter: number[], connectorCol: number, childGutter: number[]) => {
+	const emit = (userId: string, glyphCol: number, rowGutter: number[], connectorCol: number, childGutter: number[], parentSameLane: boolean) => {
 		const node = byId.get(userId)!;
 		const siblings = userChildren.get(userParent.get(userId) ?? ROOT) ?? [];
 		const kids = userChildren.get(userId) ?? [];
@@ -247,6 +254,7 @@ export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): 
 			onActivePath: activePath.has(userId),
 			isCurrent: userId === currentUserId,
 			isLastSibling: siblings[siblings.length - 1] === userId,
+			parentSameLane,
 			label: node.label,
 			preview: previewOf(node.entry),
 			segment: collectSegment(node, byId, activePath),
@@ -257,17 +265,17 @@ export function buildNavModel(roots: SessionTreeNode[], leafId: string | null): 
 		});
 		if (kids.length === 1) {
 			// Linear continuation: same column, no connector, inherit childGutter.
-			emit(kids[0]!, glyphCol, childGutter, -1, childGutter);
+			emit(kids[0]!, glyphCol, childGutter, -1, childGutter, true);
 		} else if (kids.length > 1) {
 			const branchCol = glyphCol;
 			kids.forEach((kid, i) => {
 				const isLast = i === kids.length - 1;
 				const kidDesc = isLast ? childGutter : [...childGutter, branchCol];
-				emit(kid, glyphCol + 1, childGutter, branchCol, kidDesc);
+				emit(kid, glyphCol + 1, childGutter, branchCol, kidDesc, false);
 			});
 		}
 	};
-	for (const rootUser of userChildren.get(ROOT) ?? []) emit(rootUser, 0, [], -1, []);
+	for (const rootUser of userChildren.get(ROOT) ?? []) emit(rootUser, 0, [], -1, [], false);
 
 	const currentIndex = users.findIndex((u) => u.id === currentUserId);
 	return {

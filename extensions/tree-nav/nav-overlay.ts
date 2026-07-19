@@ -29,7 +29,8 @@ export interface NavOverlayOptions {
 
 type Row =
 	| { kind: "user"; entryId: string; user: UserNode }
-	| { kind: "seg"; entryId: string; seg: SegmentEntry; userCol: number; descGutter: number[]; laneContinues: boolean };
+	| { kind: "seg"; entryId: string; seg: SegmentEntry; userCol: number; descGutter: number[]; laneContinues: boolean }
+	| { kind: "connector"; gutter: number[]; col: number; onActivePath: boolean; laneContinues: boolean; text: string };
 
 export class NavOverlay implements Component, Focusable {
 	private readonly opts: NavOverlayOptions;
@@ -80,14 +81,35 @@ export class NavOverlay implements Component, Focusable {
 
 	private rebuild(): void {
 		const rows: Row[] = [];
-		for (const u of this.opts.model.users) {
+		const users = this.opts.model.users;
+		users.forEach((u, i) => {
 			rows.push({ kind: "user", entryId: u.id, user: u });
 			if (this.expanded.has(u.id)) {
+				// Expanded: the segment rows are shown in full (and carry the │ thread),
+				// so no summary/connector row is needed.
 				for (const s of u.segment) {
 					rows.push({ kind: "seg", entryId: s.id, seg: s, userCol: u.depth, descGutter: u.descGutterCols, laneContinues: u.laneContinues });
 				}
+				return;
 			}
-		}
+			// Collapsed: drop a decorative row below the turn that (a) threads the
+			// centered time-rail │ down to a same-lane child and (b) summarizes the
+			// turn's response (tool calls / replies) in the gutter's free space. Putting
+			// the count here instead of at the end of the turn row means a long prompt
+			// can never truncate it, and there's room for a fuller breakdown.
+			const next = users[i + 1];
+			const text = summarizeSegment(u.segment);
+			if (next?.parentSameLane || text) {
+				rows.push({
+					kind: "connector",
+					gutter: u.descGutterCols,
+					col: u.depth,
+					onActivePath: u.onActivePath,
+					laneContinues: u.laneContinues,
+					text,
+				});
+			}
+		});
 		this.rows = rows;
 	}
 
@@ -116,7 +138,13 @@ export class NavOverlay implements Component, Focusable {
 			return this.opts.onCancel();
 		}
 		if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-			const id = this.isFilter ? this.filtered[this.filterSel]?.id : this.rows[this.sel]?.entryId;
+			let id: string | undefined;
+			if (this.isFilter) {
+				id = this.filtered[this.filterSel]?.id;
+			} else {
+				const r = this.rows[this.sel];
+				if (r && r.kind !== "connector") id = r.entryId;
+			}
 			if (id) this.opts.onSelect(id);
 			return;
 		}
@@ -144,10 +172,24 @@ export class NavOverlay implements Component, Focusable {
 			this.filterScroll = this.clampScroll(this.filterSel, this.filterScroll, this.filtered.length);
 		} else {
 			if (this.rows.length === 0) return;
-			this.sel = clamp(this.sel + delta, 0, this.rows.length - 1);
+			this.sel = this.clampToSelectable(this.sel + delta, delta >= 0 ? 1 : -1);
 			this.scroll = this.clampScroll(this.sel, this.scroll, this.rows.length);
 		}
 		this.opts.tui.requestRender();
+	}
+
+	// Snap an index onto the nearest selectable (non-connector) row, preferring the
+	// travel direction. Connectors are decorative and always sit between two user
+	// rows, so a scan in one direction (then the other) always lands on a turn.
+	private clampToSelectable(idx: number, dir: number): number {
+		const len = this.rows.length;
+		let i = clamp(idx, 0, len - 1);
+		while (i >= 0 && i < len && this.rows[i]!.kind === "connector") i += dir;
+		if (i < 0 || i >= len) {
+			i = clamp(idx, 0, len - 1);
+			while (i >= 0 && i < len && this.rows[i]!.kind === "connector") i -= dir;
+		}
+		return clamp(i, 0, len - 1);
 	}
 
 	private expandCurrent(): void {
@@ -161,7 +203,7 @@ export class NavOverlay implements Component, Focusable {
 
 	private collapseCurrent(): void {
 		const row = this.rows[this.sel];
-		if (!row) return;
+		if (!row || row.kind === "connector") return;
 		// On a segment row, collapse and return to its owning user row.
 		if (row.kind === "seg") {
 			const owner = this.findOwnerUserIndex(this.sel);
@@ -169,13 +211,13 @@ export class NavOverlay implements Component, Focusable {
 				const u = this.rows[owner] as Extract<Row, { kind: "user" }>;
 				this.expanded.delete(u.user.id);
 				this.rebuild();
-				this.sel = this.rows.findIndex((r) => r.entryId === u.user.id);
+				this.sel = this.rows.findIndex((r) => r.kind === "user" && r.entryId === u.user.id);
 			}
 		} else if (this.expanded.has(row.user.id)) {
 			this.expanded.delete(row.user.id);
 			this.rebuild();
 		}
-		this.sel = clamp(this.sel, 0, Math.max(0, this.rows.length - 1));
+		this.sel = this.clampToSelectable(clamp(this.sel, 0, Math.max(0, this.rows.length - 1)), -1);
 		this.scroll = this.clampScroll(this.sel, this.scroll, this.rows.length);
 		this.opts.tui.requestRender();
 	}
@@ -275,6 +317,27 @@ export class NavOverlay implements Component, Focusable {
 		const cursor = isSel ? theme.fg("accent", "› ") : "  ";
 		const pipe = (s: string) => theme.fg("dim", s);
 
+		// Connector: carries the centered time-rail (plus any passing ancestor pipes)
+		// and a muted summary of the turn's response. When there's a summary it hangs
+		// off the timeline as a short branch — ├╴ while the lane continues to a child
+		// below, ╰╴ when it caps the newest (leaf) turn so the line ends cleanly
+		// instead of dangling. A response-less turn keeps a plain │ thread.
+		if (row.kind === "connector") {
+			const laneSet = new Set(row.gutter);
+			let lanes = "";
+			for (let lvl = 0; lvl < row.col; lvl++) lanes += laneSet.has(lvl) ? pipe("│ ") : "  ";
+			const paintRail = row.onActivePath ? (s: string) => theme.fg("accent", s) : pipe;
+			if (!row.text) {
+				const w = 2 + row.col * 2 + 1;
+				return `  ${lanes}${paintRail("│")}${" ".repeat(Math.max(0, inner - w))}`;
+			}
+			const elbow = row.laneContinues ? "├╴" : "╰╴";
+			const prefixW = 2 + row.col * 2 + 2;
+			const label = truncateToWidth(row.text, Math.max(0, inner - prefixW - 1), "…");
+			const used = prefixW + 1 + visibleWidth(label);
+			return `  ${lanes}${paintRail(elbow)} ${theme.fg("muted", label)}${" ".repeat(Math.max(0, inner - used))}`;
+		}
+
 		let prefix: string;
 		let prefixWidth: number;
 		let content: string;
@@ -306,12 +369,13 @@ export class NavOverlay implements Component, Focusable {
 			}
 			const glyph = u.isCurrent ? "◉" : onPath ? "●" : "○";
 			paint = u.isCurrent ? (t) => theme.bold(theme.fg("accent", t)) : onPath ? (t) => theme.fg("text", t) : (t) => theme.fg("muted", t);
+			// Marker sits ON its lane column so the time-rail (connector/segment │ above
+			// and below) threads straight through the middle of the dot.
 			prefix = cursor + lanes + paint(glyph) + " ";
 			prefixWidth = 2 + u.depth * 2 + 2;
 			const fold = u.segment.length > 0 ? (this.expanded.has(u.id) ? "▾ " : "▸ ") : "";
 			const label = u.label ? `[${u.label}] ` : "";
-			const count = u.segment.length > 0 ? ` ·${u.segment.length}` : "";
-			content = `${fold}${label}${u.preview}${count}`;
+			content = `${fold}${label}${u.preview}`;
 		}
 
 		const avail = Math.max(0, inner - prefixWidth);
@@ -324,6 +388,25 @@ export class NavOverlay implements Component, Focusable {
 
 function clamp(value: number, min: number, max: number): number {
 	return Math.max(min, Math.min(max, value));
+}
+
+// Compact one-line summary of a turn's response for the connector gutter, e.g.
+// "3 tool calls · 2 replies". Counts toolResult entries as tool calls and
+// assistant messages as replies; returns "" when the turn produced nothing.
+function summarizeSegment(seg: SegmentEntry[]): string {
+	let tools = 0;
+	let replies = 0;
+	let other = 0;
+	for (const s of seg) {
+		if (s.kind === "tool") tools++;
+		else if (s.kind === "assistant") replies++;
+		else other++;
+	}
+	const parts: string[] = [];
+	if (tools) parts.push(`${tools} tool ${tools === 1 ? "call" : "calls"}`);
+	if (replies) parts.push(`${replies} ${replies === 1 ? "reply" : "replies"}`);
+	if (other) parts.push(`${other} other`);
+	return parts.join(" · ");
 }
 
 // Color `plain` with `base`, wrapping every (merged) token occurrence in `hl`.

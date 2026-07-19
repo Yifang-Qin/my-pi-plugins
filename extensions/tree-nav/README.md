@@ -47,6 +47,13 @@
 - 遍历时，分支点上**含 activePath 的子树排在最前**，使"当前路径"始终位于顶部/左侧。
 - 行的字形区分：`◉` 当前轮次（accent 加粗）、`●` 在活动路径上、`○` 不在活动路径上；
   泳道连接线 `├─`/`╰─`/`│` 在活动路径上用 accent、否则 dim。
+- **时间轨（time-rail）+ 响应摘要**：marker 坐在自己的 lane 列上；每个收起且有响应的轮次下方插一行
+  **连接行**，把该轮响应的摘要当作一条短支线挂在时间轴上：有同 lane 子轮时用 `├╴`（竖线从上一个圆点
+  正中间穿到下一个圆点，同时支出一条短线标注摘要），最新/叶子轮（如当前轮）用 `╰╴` 圆角收尾，让线干净
+  终止、不再拖一个悬空的 `╵` 断头。摘要文本 `N tool calls · M replies`（muted 色）——把以前放在行末、
+  会被长 prompt 截断的单个计数 `·N` 搬到这里，既不会被截断又能写得更详细。展开某轮时改由 segment 行自带的 `│`
+  承担连接、不再插连接行；无响应的轮次连接行只画纯 `│`。代价是线性对话收起时行数约翻倍（换取“线穿圆点”
+  + 摘要常驻）；连接行不可选中，`↑↓` 会自动跳过。
 
 ### 2.4 跳转语义（依赖 pi 的 `navigateTree`）
 
@@ -106,8 +113,8 @@ extensions/tree-nav/
 → `NavOverlay` 渲染并预选当前轮 → 用户选中 `entryId` → `ctx.navigateTree(entryId, {summarize:false})`。
 
 `NavModel` 关键字段：
-- `users[]`：`{ id, depth(紧凑分支深度), onActivePath, isCurrent, isLastSibling, label?, preview, segment[],
-  gutterCols, connectorCol, descGutterCols, laneContinues }`（后四个为泳道渲染信息）
+- `users[]`：`{ id, depth(紧凑分支深度), onActivePath, isCurrent, isLastSibling, parentSameLane, label?, preview, segment[],
+  gutterCols, connectorCol, descGutterCols, laneContinues }`（`parentSameLane` 驱动时间轨向上连接；最后四个为泳道渲染信息）
 - `segment[]`：该 user 轮次的响应（沿 active-first 子链收集到下一个 user 节点为止的 assistant/tool 条目）
 - `currentIndex`：当前轮（leaf 最近的 user 祖先）在 `users` 中的下标
 
@@ -121,7 +128,12 @@ extensions/tree-nav/
 - **数据层**（`session-tree.ts`，纯 `import type`、运行时零依赖）：紧凑分支深度（线性链不缩进、
   仅分支点 +1）、活动路径、active-first 排序、段落折叠模型。
 - **泳道 gutter**：`│ ├─ ╰─` 画管线，活动路径连接线用 accent；展开段落时非末位分支的 `│` 会延伸到下方兄弟分支。
-- **一等 user 轮次列表**：`◉`当前/`●`活动路径/`○`旁支 字形、`[label]`、预览、段落条数 `·N`；`→/space` 展开、`←` 收起。
+- **时间轨（time-rail）+ 响应摘要**：marker 坐在 lane 列上；收起且有响应的轮次下方插连接行，把摘要
+  当短支线挂在时间轴上：有子轮用 `├╴`、叶子轮（如最新轮）用 `╰╴` 圆角收尾（避免悬空 `╵` 断头）；文本
+  `summarizeSegment`：toolResult 计 tool call、assistant 消息计 reply。无响应轮的连接行只画纯 `│`。展开时
+  改由 segment 行的 `│` 承担。连接行在「有同 lane 子轮（`parentSameLane`）或有响应摘要」时插入，不可选中，
+  `move()` 经 `clampToSelectable` 跳过。
+- **一等 user 轮次列表**：`◉`当前/`●`活动路径/`○`旁支 字形、`[label]`、预览、可展开标记 `▸/▾`（响应条数摘要已移到连接行）；`→/space` 展开、`←` 收起。
 - **搜索**（B 方案）：打字即从泳道浏览切为扁平匹配列表，**仅搜 user 轮次**（+label），分词子串 AND、大小写不敏感；
   命中高亮（accent 加粗，与中性正文区分）；内嵌 `Input` 并传播 `focused` 支持 IME；`esc` 先清查询回浏览、再按才关闭。
 - **跳转**：`ctx.navigateTree`，user 目标回退并回填 prompt（pi 包装器自带“编辑器非空不覆盖”守卫）；跳转前用 `ctx.ui.select`
