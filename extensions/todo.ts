@@ -15,6 +15,23 @@ import { Type } from "typebox";
 
 type TodoStatus = "pending" | "in_progress" | "completed";
 
+// 常驻 system prompt 段落：Codex 风格，只讲工具用法，不做每-turn 状态提醒。
+// 措辞必须与下方 registerTool 的 schema 对齐（action: list/add/set/clear，status 三态）。
+const TODO_GUIDE = `
+
+## Task Management
+
+You have a \`todo\` tool for tracking multi-step work. Actions:
+- \`add\` (text): append a new todo (starts as pending).
+- \`set\` (id + status): move a todo to pending / in_progress / completed.
+- \`list\`: show the current todos.
+- \`clear\`: remove all todos.
+
+Use it when a task has 3+ distinct steps or is non-trivial:
+- Lay out the steps with \`add\` before starting the work.
+- Keep exactly one todo \`in_progress\` at a time; mark it \`completed\` as soon as it's done, then start the next.
+- Skip the tool for trivial single-step tasks — don't invent filler steps.`;
+
 interface Todo {
 	id: number;
 	text: string;
@@ -212,6 +229,15 @@ export default function (pi: ExtensionAPI) {
 			invalidate: () => {},
 		}));
 	};
+
+	// 常驻注入：仅当本插件的 todo 工具在当前提示里激活时才追加 guide。
+	// before_agent_start 每个 user turn 触发一次，system prompt 逐轮重建，
+	// 因此每个发给 LLM 的请求都会带上这段（等价于常驻），无自适应/状态提醒逻辑。
+	pi.on("before_agent_start", async (event) => {
+		const active = event.systemPromptOptions.selectedTools?.includes("todo") ?? false;
+		if (!active) return;
+		return { systemPrompt: event.systemPrompt + TODO_GUIDE };
+	});
 
 	// Reconstruct state on session events
 	pi.on("session_start", async (_event, ctx) => {
