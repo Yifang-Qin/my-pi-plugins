@@ -161,10 +161,11 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: "single" | "parallel" | "chain" | "background";
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	bgTaskId?: string;
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -454,16 +455,412 @@ const SubagentParams = Type.Object({
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
+	background: Type.Optional(
+		Type.Boolean({
+			description: "Run asynchronously (single mode only): returns a task id immediately and sends a completion notification.",
+			default: false,
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// Background tasks
+//
+// A background subagent is spawned detached from the tool call: the tool
+// returns a task id immediately, and when the child process exits we inject a
+// custom message (sendMessage + triggerTurn, deliverAs "followUp") so the main
+// agent picks up the result without blocking. Full results are also written to
+// ~/.pi/agent/subagent-results/ so they survive compaction and /reload.
+// ────────────────────────────────────────────────────────────────────────────
+
+const BG_NOTIFY_CUSTOM_TYPE = "afang-subagent-notify";
+const BG_MAX_TASKS = 4;
+const BG_NOTIFY_DEBOUNCE_MS = 400;
+const BG_NOTIFY_PREVIEW_CHARS = 2000;
+const BG_RESULT_INLINE_CAP = 10 * 1024;
+
+type BgStatus = "running" | "completed" | "failed" | "cancelled";
+
+interface BgTask {
+	id: string;
+	agentName: string;
+	agentSource: "user" | "project" | "unknown";
+	task: string;
+	cwd: string;
+	startedAtMs: number;
+	status: BgStatus;
+	proc?: ReturnType<typeof spawn>;
+	result: SingleResult;
+	resultFile?: string;
+	skipNotify?: boolean;
+}
+
+const bgTasks = new Map<string, BgTask>();
+let bgNextId = 1;
+let piApi: ExtensionAPI | null = null;
+const pendingBgNotify: BgTask[] = [];
+let bgNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Kill children left behind by a previous extension instance (e.g. /reload).
+// The registry lives on globalThis so it survives module re-instantiation.
+const BG_PIDS_KEY = Symbol.for("afang-subagent:bg-pids");
+const g = globalThis as Record<PropertyKey, unknown>;
+const stalePids = g[BG_PIDS_KEY] as Set<number> | undefined;
+if (stalePids) {
+	for (const pid of stalePids) {
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch {
+			/* already gone */
+		}
+	}
+	stalePids.clear();
+}
+const bgPids: Set<number> = stalePids ?? new Set();
+g[BG_PIDS_KEY] = bgPids;
+
+function bgResultsDir(): string {
+	return path.join(getAgentDir(), "subagent-results");
+}
+
+function bgElapsed(t: BgTask): string {
+	return `${((Date.now() - t.startedAtMs) / 1000).toFixed(1)}s`;
+}
+
+function writeBgResultFile(t: BgTask): void {
+	try {
+		const dir = bgResultsDir();
+		fs.mkdirSync(dir, { recursive: true });
+		const file = path.join(dir, `${t.id}.md`);
+		const lines = [
+			`# ${t.id} (${t.agentName}) — ${t.status}`,
+			"",
+			`- Started: ${new Date(t.startedAtMs).toISOString()}`,
+			`- Elapsed: ${bgElapsed(t)}`,
+			`- Model: ${t.result.model ?? "(unknown)"}`,
+			`- Usage: ${formatUsageStats(t.result.usage, t.result.model) || "n/a"}`,
+		];
+		if (t.result.errorMessage) lines.push(`- Error: ${t.result.errorMessage}`);
+		lines.push("", "## Task", "", t.task, "", "## Output", "", getResultOutput(t.result));
+		fs.writeFileSync(file, lines.join("\n"), { encoding: "utf-8" });
+		t.resultFile = file;
+	} catch {
+		/* best effort */
+	}
+}
+
+function formatBgCompletion(t: BgTask): string {
+	const output = getResultOutput(t.result);
+	const preview =
+		output.length > BG_NOTIFY_PREVIEW_CHARS
+			? `${output.slice(0, BG_NOTIFY_PREVIEW_CHARS)}\n…[truncated]`
+			: output;
+	const usage = formatUsageStats(t.result.usage, t.result.model);
+	return [
+		`**${t.id}** (${t.agentName}) — ${t.status}`,
+		preview.trim() || "(no output)",
+		usage,
+		t.resultFile
+			? `Full result: subagent_tasks {action:"result", id:"${t.id}"} or read ${t.resultFile}`
+			: `Full result: subagent_tasks {action:"result", id:"${t.id}"}`,
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
+function flushBgNotify(): void {
+	bgNotifyTimer = null;
+	const items = pendingBgNotify.splice(0);
+	if (items.length === 0 || !piApi) return;
+	const header =
+		items.length === 1 ? "Background subagent task finished:" : `Background subagent tasks finished (${items.length}):`;
+	const content = [header, "", ...items.map(formatBgCompletion)].join("\n\n");
+	try {
+		piApi.sendMessage(
+			{ customType: BG_NOTIFY_CUSTOM_TYPE, content, display: true, details: { taskIds: items.map((t) => t.id) } },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+	} catch {
+		/* session may be shutting down */
+	}
+}
+
+function scheduleBgNotify(t: BgTask): void {
+	pendingBgNotify.push(t);
+	if (bgNotifyTimer) clearTimeout(bgNotifyTimer);
+	bgNotifyTimer = setTimeout(flushBgNotify, BG_NOTIFY_DEBOUNCE_MS);
+}
+
+function finalizeBgTask(t: BgTask, exitCode: number): void {
+	if (t.proc?.pid) bgPids.delete(t.proc.pid);
+	if (t.status !== "cancelled") {
+		t.result.exitCode = exitCode;
+		t.status =
+			exitCode === 0 && t.result.stopReason !== "error" && t.result.stopReason !== "aborted" ? "completed" : "failed";
+		writeBgResultFile(t);
+		if (!t.skipNotify) scheduleBgNotify(t);
+	}
+}
+
+function killBgTask(t: BgTask): void {
+	if (t.status !== "running") return;
+	t.status = "cancelled";
+	t.skipNotify = true;
+	try {
+		t.proc?.kill("SIGTERM");
+	} catch {
+		/* ignore */
+	}
+	setTimeout(() => {
+		try {
+			t.proc?.kill("SIGKILL");
+		} catch {
+			/* ignore */
+		}
+	}, 5000);
+	writeBgResultFile(t);
+}
+
+function killAllBgTasks(): void {
+	for (const t of bgTasks.values()) {
+		if (t.status === "running") killBgTask(t);
+	}
+}
+
+function startBackgroundTask(
+	defaultCwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	cwd: string | undefined,
+): BgTask | string {
+	const agent = agents.find((a) => a.name === agentName);
+	if (!agent) {
+		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		return `Unknown agent: "${agentName}". Available agents: ${available}.`;
+	}
+	const running = [...bgTasks.values()].filter((t) => t.status === "running").length;
+	if (running >= BG_MAX_TASKS) {
+		return `Too many background tasks running (${running}/${BG_MAX_TASKS}). Wait for one to finish or cancel it with subagent_tasks.`;
+	}
+
+	const id = `task-${bgNextId++}`;
+	const t: BgTask = {
+		id,
+		agentName,
+		agentSource: agent.source,
+		task,
+		cwd: cwd ?? defaultCwd,
+		startedAtMs: Date.now(),
+		status: "running",
+		result: {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: -1,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			model: agent.model,
+		},
+	};
+	bgTasks.set(id, t);
+
+	void (async () => {
+		const args: string[] = ["--mode", "json", "-p", "--no-session"];
+		if (agent.model) args.push("--model", agent.model);
+		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+
+		let tmpPromptDir: string | null = null;
+		let tmpPromptPath: string | null = null;
+		try {
+			if (agent.systemPrompt.trim()) {
+				const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+				tmpPromptDir = tmp.dir;
+				tmpPromptPath = tmp.filePath;
+				args.push("--append-system-prompt", tmpPromptPath);
+			}
+			args.push(`Task: ${task}`);
+
+			const exitCode = await new Promise<number>((resolve) => {
+				const invocation = getPiInvocation(args);
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: t.cwd,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+				t.proc = proc;
+				if (proc.pid) bgPids.add(proc.pid);
+				let buffer = "";
+
+				const processLine = (line: string) => {
+					if (!line.trim()) return;
+					let event: any;
+					try {
+						event = JSON.parse(line);
+					} catch {
+						return;
+					}
+					if (event.type === "message_end" && event.message) {
+						const msg = event.message as Message;
+						t.result.messages.push(msg);
+						if (msg.role === "assistant") {
+							t.result.usage.turns++;
+							const usage = msg.usage;
+							if (usage) {
+								t.result.usage.input += usage.input || 0;
+								t.result.usage.output += usage.output || 0;
+								t.result.usage.cacheRead += usage.cacheRead || 0;
+								t.result.usage.cacheWrite += usage.cacheWrite || 0;
+								t.result.usage.cost += usage.cost?.total || 0;
+								t.result.usage.contextTokens = usage.totalTokens || 0;
+							}
+							if (!t.result.model && msg.model) t.result.model = msg.model;
+							if (msg.stopReason) t.result.stopReason = msg.stopReason;
+							if (msg.errorMessage) t.result.errorMessage = msg.errorMessage;
+						}
+					}
+					if (event.type === "tool_result_end" && event.message) {
+						t.result.messages.push(event.message as Message);
+					}
+				};
+
+				proc.stdout.on("data", (data) => {
+					buffer += data.toString();
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) processLine(line);
+				});
+				proc.stderr.on("data", (data) => {
+					t.result.stderr += data.toString();
+				});
+				proc.on("close", (code) => {
+					if (buffer.trim()) processLine(buffer);
+					resolve(code ?? 0);
+				});
+				proc.on("error", (err) => {
+					t.result.errorMessage = err.message;
+					resolve(1);
+				});
+			});
+			finalizeBgTask(t, exitCode);
+		} catch (err) {
+			t.result.errorMessage = err instanceof Error ? err.message : String(err);
+			finalizeBgTask(t, 1);
+		} finally {
+			if (tmpPromptPath)
+				try {
+					fs.unlinkSync(tmpPromptPath);
+				} catch {
+					/* ignore */
+				}
+			if (tmpPromptDir)
+				try {
+					fs.rmdirSync(tmpPromptDir);
+				} catch {
+					/* ignore */
+				}
+		}
+	})();
+
+	return t;
+}
+
+const BgTasksParams = Type.Object({
+	action: StringEnum(["list", "status", "result", "cancel"] as const, {
+		description: "list: all tasks; status/result/cancel: act on one task (requires id)",
+	}),
+	id: Type.Optional(Type.String({ description: "Task id, e.g. task-1" })),
+});
+
 export default function (pi: ExtensionAPI) {
+	piApi = pi;
+
+	pi.registerMessageRenderer(BG_NOTIFY_CUSTOM_TYPE, (message, _options, theme) => {
+		const text =
+			typeof message.content === "string"
+				? message.content
+				: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		return new Text(theme.fg("accent", "⏻ background subagent") + "\n" + theme.fg("toolOutput", text), 0, 0);
+	});
+
+	pi.on("session_shutdown", () => killAllBgTasks());
+	pi.on("session_before_switch", () => killAllBgTasks());
+	pi.on("session_before_fork", () => killAllBgTasks());
+
+	pi.registerTool({
+		name: "subagent_tasks",
+		label: "Subagent Tasks",
+		description:
+			"Manage background subagent tasks: list all tasks, check status, fetch a full result, or cancel a running task.",
+		parameters: BgTasksParams,
+
+		async execute(_toolCallId, params) {
+			const reply = (text: string, isError = false) => ({
+				content: [{ type: "text" as const, text }],
+				details: null,
+				...(isError ? { isError: true } : {}),
+			});
+			const find = (id?: string): BgTask | undefined => (id ? bgTasks.get(id) : undefined);
+
+			if (params.action === "list") {
+				if (bgTasks.size === 0) return reply("No background tasks.");
+				const lines = [...bgTasks.values()].map((t) => {
+					const preview = t.task.length > 60 ? `${t.task.slice(0, 60)}...` : t.task;
+					return `${t.id} [${t.status}] ${t.agentName} — ${bgElapsed(t)} — ${preview}`;
+				});
+				return reply(lines.join("\n"));
+			}
+
+			const t = find(params.id);
+			if (!t) {
+				const known = [...bgTasks.keys()].join(", ") || "none";
+				return reply(`Unknown task id: "${params.id ?? ""}". Known tasks: ${known}`, true);
+			}
+
+			if (params.action === "status") {
+				const lines = [
+					`${t.id} (${t.agentName}, ${t.agentSource}) — ${t.status}`,
+					`Elapsed: ${bgElapsed(t)} | Turns so far: ${t.result.usage.turns}`,
+					`Task: ${t.task}`,
+				];
+				if (t.resultFile) lines.push(`Result file: ${t.resultFile}`);
+				if (t.status === "failed" && t.result.errorMessage) lines.push(`Error: ${t.result.errorMessage}`);
+				return reply(lines.join("\n"));
+			}
+
+			if (params.action === "result") {
+				if (t.status === "running") {
+					return reply(
+						`${t.id} still running (${bgElapsed(t)}, ${t.result.usage.turns} turns so far). Try again later or cancel it.`,
+					);
+				}
+				let output = getResultOutput(t.result);
+				let note = "";
+				if (Buffer.byteLength(output, "utf8") > BG_RESULT_INLINE_CAP) {
+					output = `${output.slice(0, BG_RESULT_INLINE_CAP)}\n\n[truncated]`;
+					note = t.resultFile ? `\n\nFull result: read ${t.resultFile}` : "";
+				}
+				return reply(`${t.id} — ${t.status}\n\n${output}${note}`);
+			}
+
+			// cancel
+			if (t.status !== "running") {
+				return reply(`${t.id} is not running (status: ${t.status}).`);
+			}
+			killBgTask(t);
+			return reply(`Cancelled ${t.id}.`);
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+		"Single mode supports background: true — returns a task id at once, notifies via a custom message on completion; manage with the subagent_tasks tool.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -490,7 +887,7 @@ export default function (pi: ExtensionAPI) {
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
 			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
+				(mode: "single" | "parallel" | "chain" | "background") =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
 					agentScope,
@@ -534,6 +931,38 @@ export default function (pi: ExtensionAPI) {
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 						};
 				}
+			}
+
+			if (params.background) {
+				if (!hasSingle) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "background: true requires single mode: provide exactly {agent, task} (no tasks/chain arrays).",
+							},
+						],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				const started = startBackgroundTask(ctx.cwd, agents, params.agent!, params.task!, params.cwd);
+				if (typeof started === "string") {
+					return {
+						content: [{ type: "text", text: started }],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Started background ${started.id} (agent: ${started.agentName}). You will be notified when it completes; no need to poll. Use subagent_tasks {action:"status"|"result"|"cancel", id:"${started.id}"} to manage it.`,
+						},
+					],
+					details: { ...makeDetails("background")([]), bgTaskId: started.id },
+				};
 			}
 
 			if (params.chain && params.chain.length > 0) {
@@ -745,7 +1174,8 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
+				theme.fg("muted", ` [${scope}]`) +
+				(args.background ? theme.fg("warning", " [bg]") : "");
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
