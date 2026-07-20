@@ -10,9 +10,12 @@
 | Extension | `extensions/fuzzy-at-files.ts` | 把编辑器 `@` 文件补全换成 codex 风格子序列模糊匹配（`@patf` 命中 `path/to/file`，大小写不敏感，无需逐层写全目录） |
 | Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器。在编辑器里于**词首打 `@`** 自动在编辑器位置就地打开（拦截内置内联下拉；不用 overlay 模式，避免与 pi-powerline-footer fixed editor 冲突导致全屏重印），也可用 `/find-file` 命令；选中后插入 `@path`（目录插入 `@dir/`）。空搜索框=目录树浏览（→/← 展开折叠、tab 选目录），打字=全库模糊列表（目录带 `/` 后缀一起匹配） |
 | Extension | `extensions/tree-nav/` | （多文件子目录扩展）lazygit 风格会话树导航器。命令 `/nav` 弹大 overlay，以 user 轮次为一等公民、左侧分支泳道，enter 跳转（跳前可选 summarize 被放弃分支），中间 assistant/tool 节点折叠可展开；打字即在 user 轮次里搜索 |
+| Extension | `extensions/afang-subagent/` | （多文件子目录扩展）fork 自 pi 官方 subagent 示例、自维护演进。注册 `subagent` 工具把任务委派给独立 pi 子进程（上下文隔离），支持 single / parallel / chain 三模式；`background: true` 后台异步执行——完成时 followUp 通知（防抖合并）、结果落盘 `<任务cwd>/.pi/subagent-results/<时间戳>-task-N-<agent>-<topic>.md`；配套 `subagent_tasks` 工具（list / status / result / cancel）。agent 未指定 model 时继承主会话当前模型 |
 | Theme | `themes/gruvbox-dark.json` | gruvbox 深色主题 |
 
 `package.json` 里的 `pi` manifest 声明了上述资源，pi 安装本包时自动加载。
+
+> **注意**：`afang-subagent` 依赖的 **agent 定义**（`agents/*.md`）与 **workflow prompt**（`prompts/*.md`）不是 pi package 的资源类型，不会随包自动安装。扩展本体安装即生效，但 agent 需自行放置：用户级放 `~/.pi/agent/agents/`，项目级放 `.pi/agents/`——仓库 `extensions/afang-subagent/agents/` 下的 4 个样例（scout / planner / reviewer / worker）可直接拷贝；workflow prompt 拷到 `~/.pi/agent/prompts/` 后以 `/implement` 等形式使用。详见 `extensions/afang-subagent/README.md`。
 
 ## 安装
 
