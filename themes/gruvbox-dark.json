@@ -51,8 +51,8 @@
     "customMessageText": "",
     "customMessageLabel": "aquaBright",
     "toolPendingBg": "dark0Soft",
-    "toolSuccessBg": "#213a2b",
-    "toolErrorBg": "#4a221d",
+    "toolSuccessBg": "dark0Soft",
+    "toolErrorBg": "dark0Soft",
     "toolTitle": "aquaBright",
     "toolOutput": "",
 
