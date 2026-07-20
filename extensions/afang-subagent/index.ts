@@ -461,6 +461,12 @@ const SubagentParams = Type.Object({
 			default: false,
 		}),
 	),
+	topic: Type.Optional(
+		Type.String({
+			description:
+				"Short topic label for the task (background mode): shown in the task list/notifications and used in the result filename for easier lookup. Defaults to the agent name.",
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
@@ -485,6 +491,7 @@ type BgStatus = "running" | "completed" | "failed" | "cancelled";
 interface BgTask {
 	id: string;
 	agentName: string;
+	topic?: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
 	cwd: string;
@@ -520,7 +527,35 @@ if (stalePids) {
 const bgPids: Set<number> = stalePids ?? new Set();
 g[BG_PIDS_KEY] = bgPids;
 
-function bgResultsDir(): string {
+// Reports are project knowledge: write them under the task's own working
+// directory (<cwd>/.pi/subagent-results/), falling back to the global agent
+// dir when the project location is not writable.
+
+// Filename-safe slug; keeps Unicode letters (incl. CJK), digits, ._-
+function bgSlugify(s: string): string {
+	return s
+		.trim()
+		.replace(/[\s/\\:*?"<>|]+/g, "-")
+		.replace(/[^\p{L}\p{N}._-]/gu, "")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 60);
+}
+
+function bgResultFilePath(t: BgTask, dir: string): string {
+	const d = new Date(t.startedAtMs);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+	// Keep both semantics in the filename: who did it (agent) + what for (topic).
+	const slug = [bgSlugify(t.agentName), bgSlugify(t.topic ?? "")].filter(Boolean).join("-");
+	return path.join(dir, `${stamp}-${t.id}${slug ? `-${slug}` : ""}.md`);
+}
+
+function bgProjectResultsDir(t: BgTask): string {
+	return path.join(t.cwd, CONFIG_DIR_NAME, "subagent-results");
+}
+
+function bgGlobalResultsDir(): string {
 	return path.join(getAgentDir(), "subagent-results");
 }
 
@@ -529,25 +564,31 @@ function bgElapsed(t: BgTask): string {
 }
 
 function writeBgResultFile(t: BgTask): void {
-	try {
-		const dir = bgResultsDir();
-		fs.mkdirSync(dir, { recursive: true });
-		const file = path.join(dir, `${t.id}.md`);
-		const lines = [
-			`# ${t.id} (${t.agentName}) — ${t.status}`,
-			"",
-			`- Started: ${new Date(t.startedAtMs).toISOString()}`,
-			`- Elapsed: ${bgElapsed(t)}`,
-			`- Model: ${t.result.model ?? "(unknown)"}`,
-			`- Usage: ${formatUsageStats(t.result.usage, t.result.model) || "n/a"}`,
-		];
-		if (t.result.errorMessage) lines.push(`- Error: ${t.result.errorMessage}`);
-		lines.push("", "## Task", "", t.task, "", "## Output", "", getResultOutput(t.result));
-		fs.writeFileSync(file, lines.join("\n"), { encoding: "utf-8" });
-		t.resultFile = file;
-	} catch {
-		/* best effort */
+	for (const dir of [bgProjectResultsDir(t), bgGlobalResultsDir()]) {
+		try {
+			writeBgResultFileTo(t, dir);
+			return;
+		} catch {
+			/* try next location */
+		}
 	}
+}
+
+function writeBgResultFileTo(t: BgTask, dir: string): void {
+	fs.mkdirSync(dir, { recursive: true });
+	const file = bgResultFilePath(t, dir);
+	const lines = [
+		`# ${t.id} (${t.agentName}${t.topic ? ` — ${t.topic}` : ""}) — ${t.status}`,
+		"",
+		`- Started: ${new Date(t.startedAtMs).toISOString()}`,
+		`- Elapsed: ${bgElapsed(t)}`,
+		`- Model: ${t.result.model ?? "(unknown)"}`,
+		`- Usage: ${formatUsageStats(t.result.usage, t.result.model) || "n/a"}`,
+	];
+	if (t.result.errorMessage) lines.push(`- Error: ${t.result.errorMessage}`);
+	lines.push("", "## Task", "", t.task, "", "## Output", "", getResultOutput(t.result));
+	fs.writeFileSync(file, lines.join("\n"), { encoding: "utf-8" });
+	t.resultFile = file;
 }
 
 function formatBgCompletion(t: BgTask): string {
@@ -558,7 +599,7 @@ function formatBgCompletion(t: BgTask): string {
 			: output;
 	const usage = formatUsageStats(t.result.usage, t.result.model);
 	return [
-		`**${t.id}** (${t.agentName}) — ${t.status}`,
+		`**${t.id}** (${t.agentName}${t.topic ? ` — ${t.topic}` : ""}) — ${t.status}`,
 		preview.trim() || "(no output)",
 		usage,
 		t.resultFile
@@ -634,6 +675,7 @@ function startBackgroundTask(
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
+	topic: string | undefined,
 ): BgTask | string {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
@@ -649,6 +691,7 @@ function startBackgroundTask(
 	const t: BgTask = {
 		id,
 		agentName,
+		topic: topic?.trim() || undefined,
 		agentSource: agent.source,
 		task,
 		cwd: cwd ?? defaultCwd,
@@ -808,7 +851,7 @@ export default function (pi: ExtensionAPI) {
 				if (bgTasks.size === 0) return reply("No background tasks.");
 				const lines = [...bgTasks.values()].map((t) => {
 					const preview = t.task.length > 60 ? `${t.task.slice(0, 60)}...` : t.task;
-					return `${t.id} [${t.status}] ${t.agentName} — ${bgElapsed(t)} — ${preview}`;
+					return `${t.id} [${t.status}] ${t.agentName}${t.topic ? ` (${t.topic})` : ""} — ${bgElapsed(t)} — ${preview}`;
 				});
 				return reply(lines.join("\n"));
 			}
@@ -822,6 +865,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "status") {
 				const lines = [
 					`${t.id} (${t.agentName}, ${t.agentSource}) — ${t.status}`,
+					...(t.topic ? [`Topic: ${t.topic}`] : []),
 					`Elapsed: ${bgElapsed(t)} | Turns so far: ${t.result.usage.turns}`,
 					`Task: ${t.task}`,
 				];
@@ -946,7 +990,7 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				const started = startBackgroundTask(ctx.cwd, agents, params.agent!, params.task!, params.cwd);
+				const started = startBackgroundTask(ctx.cwd, agents, params.agent!, params.task!, params.cwd, params.topic);
 				if (typeof started === "string") {
 					return {
 						content: [{ type: "text", text: started }],

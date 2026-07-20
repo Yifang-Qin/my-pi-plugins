@@ -7,6 +7,9 @@ auth.json
 sessions/
 tmp/
 
+# afang-subagent background task reports
+.pi/subagent-results/
+
 # private local dev notes (per-machine dev workflow, symlink list)
 AGENTS.md
 

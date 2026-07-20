@@ -11,13 +11,19 @@
 - [ ] 子 agent session 持久化与恢复（多轮追问同一子 agent）
 - [ ] 运行中 steering（中途向子 agent 追加指令）
 - [ ] workflow 的代码侧编排（DAG / 状态机，不依赖 prompt 模板）
-- [x] artifacts 落盘管理（后台任务结果自动写 `subagent-results/<task-id>.md`）
+- [x] artifacts 落盘管理（后台任务结果自动写 `<任务cwd>/.pi/subagent-results/<时间戳>-<task-id>.md`，
+      写不进去时回退全局 `~/.pi/agent/subagent-results/`；建议在项目 .gitignore 里忽略该目录）
 
 ## 后台模式设计要点
 
 - `subagent` 工具新增 `background: true`（仅 single 模式）：立即返回 `task-N`，子进程异步运行
 - 完成通知：custom message（`afang-subagent-notify`），只放 ~2KB preview + 结果文件路径，
   400ms 防抖窗口合并多任务完成，避免通知风暴
+- 结果落盘：报告属于项目知识 → 优先写**任务工作目录**下的 `.pi/subagent-results/`，文件名带时间戳
+  防跨会话 task id 冲突，主 agent 后续用相对路径即可 read
+- 文件名含语义 slug：`<agent名>-<topic>` 拼接（topic 可选），
+  如 `20260720-133045-task-1-scout-tree-nav调研.md`，跨 session 翻历史报告一目了然；
+  `topic` 同时显示在 list / status / 完成通知 / 报告头里
 - `subagent_tasks` 管理工具：`list / status / result / cancel`
 - 上限 4 个并发后台任务，超出显式拒绝（不排队）
 - 生命周期：`session_shutdown` / `session_before_switch` / `session_before_fork` 杀全部子进程；
