@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -28,12 +29,34 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { makeBgNotifyFramer } from "../shared/bg-notify.js";
+import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents, discoverBuiltinAgents } from "./agents.ts";
+
+// 扩展自带的 workflow prompt 模板目录（prompts/*.md），通过 resources_discover 自包含地注册。
+const BUILTIN_PROMPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "prompts");
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+
+// 递归深度护栏：主 session 深度 0，每 spawn 一层子 pi 就把 PI_SUBAGENT_DEPTH +1 传下去。
+// 达到上限的子进程干脆不注册 subagent / subagent_tasks 工具（模型看不见，天然无法再派）。
+// 默认上限 2：主 session(0) 派的 subagent(1) 最多再派一层(2)；可用 PI_SUBAGENT_MAX_DEPTH 覆盖。
+function parseIntEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (!raw) return fallback;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+const SUBAGENT_DEPTH = parseIntEnv("PI_SUBAGENT_DEPTH", 0);
+const SUBAGENT_MAX_DEPTH = Math.max(1, parseIntEnv("PI_SUBAGENT_MAX_DEPTH", 2));
+const SUBAGENT_DEPTH_EXHAUSTED = SUBAGENT_DEPTH >= SUBAGENT_MAX_DEPTH;
+
+// 子进程环境：spawn 时现算（而非模块加载时快照），保证继承当前 process.env 的最新状态。
+function childEnv(): NodeJS.ProcessEnv {
+	return { ...process.env, PI_SUBAGENT_DEPTH: String(SUBAGENT_DEPTH + 1) };
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -148,7 +171,7 @@ interface UsageStats {
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -335,6 +358,7 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
+				env: childEnv(),
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -481,6 +505,13 @@ const SubagentParams = Type.Object({
 // ────────────────────────────────────────────────────────────────────────────
 
 const BG_NOTIFY_CUSTOM_TYPE = "afang-subagent-notify";
+// 后台完成通知的「系统通知框」：协议（标签/版式/剥框算法）在 ../shared/bg-notify.ts 单一来源，
+// 与 tmux-bash 共用；这里只定制引言文案。为什么需要框，见该共享模块头注释。
+const { frame: frameBgNotify, strip: stripBgNotifyFrame } = makeBgNotifyFramer(
+	"System notification from the subagent extension — NOT a message from the user. Background subagent " +
+		"task(s) you started earlier have finished; their results are below. Treat it as a status update: use " +
+		"it if relevant to the current task, otherwise acknowledge briefly and continue.",
+);
 const BG_MAX_TASKS = 4;
 const BG_NOTIFY_DEBOUNCE_MS = 400;
 const BG_NOTIFY_PREVIEW_CHARS = 2000;
@@ -492,7 +523,7 @@ interface BgTask {
 	id: string;
 	agentName: string;
 	topic?: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource | "unknown";
 	task: string;
 	cwd: string;
 	startedAtMs: number;
@@ -619,7 +650,7 @@ function flushBgNotify(): void {
 	const content = [header, "", ...items.map(formatBgCompletion)].join("\n\n");
 	try {
 		piApi.sendMessage(
-			{ customType: BG_NOTIFY_CUSTOM_TYPE, content, display: true, details: { taskIds: items.map((t) => t.id) } },
+			{ customType: BG_NOTIFY_CUSTOM_TYPE, content: frameBgNotify(content), display: true, details: { taskIds: items.map((t) => t.id) } },
 			{ triggerTurn: true, deliverAs: "followUp" },
 		);
 	} catch {
@@ -730,6 +761,7 @@ function startBackgroundTask(
 				const invocation = getPiInvocation(args);
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: t.cwd,
+					env: childEnv(),
 					shell: false,
 					stdio: ["ignore", "pipe", "pipe"],
 				});
@@ -820,17 +852,34 @@ const BgTasksParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	piApi = pi;
 
+	// 内建 agent 是注册时就确定的静态集合：扫描一次并写进工具描述，让模型在 system prompt
+	// 里就能看到可用 agent（描述随 /reload 重建，不会过期）；user/project 定制仍在 execute 时
+	// 动态发现，描述里只提示存放位置与查看方法（无 mode 调用 = 列出当前可用 agent）。
+	const builtinAgents = discoverBuiltinAgents();
+
+	// 自包含：把扩展自带的 workflow prompt（/scout-and-plan 等）注册进 prompt 模板发现，
+	// 本机自动发现与 pi install 两种加载方式下都生效，无需软链接到 ~/.pi/agent/prompts/。
+	pi.on("resources_discover", () => ({
+		promptPaths: [BUILTIN_PROMPTS_DIR],
+	}));
+
 	pi.registerMessageRenderer(BG_NOTIFY_CUSTOM_TYPE, (message, _options, theme) => {
-		const text =
+		const raw =
 			typeof message.content === "string"
 				? message.content
 				: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		// 注入时加的「系统通知框」只给模型看，UI 里剔掉。
+		const text = stripBgNotifyFrame(raw);
 		return new Text(theme.fg("accent", "⏻ background subagent") + "\n" + theme.fg("toolOutput", text), 0, 0);
 	});
 
 	pi.on("session_shutdown", () => killAllBgTasks());
 	pi.on("session_before_switch", () => killAllBgTasks());
 	pi.on("session_before_fork", () => killAllBgTasks());
+
+	// 递归深度护栏：到达上限的子进程不注册 subagent / subagent_tasks，模型看不到工具即无法再派。
+	// 深度经 spawn 时注入的 PI_SUBAGENT_DEPTH 逐层 +1 传递（见 childEnv）。
+	if (SUBAGENT_DEPTH_EXHAUSTED) return;
 
 	pi.registerTool({
 		name: "subagent_tasks",
@@ -904,10 +953,20 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-		"Single mode supports background: true — returns a task id at once, notifies via a custom message on completion; manage with the subagent_tasks tool.",
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-		].join(" "),
+			"Single mode supports background: true — returns a task id at once, notifies via a custom message on completion; manage with the subagent_tasks tool.",
+			...(builtinAgents.length > 0
+				? [
+						`Built-in agents (always available):\n${builtinAgents.map((a) => `- ${a.name}: ${a.description}`).join("\n")}`,
+					]
+				: []),
+			`Custom agents override same-name built-ins (priority: builtin < user < project). User-level: ${path.join(getAgentDir(), "agents")} (always loaded). Project-level: ${CONFIG_DIR_NAME}/agents, only loaded with agentScope "both" or "project" (default scope: "user").`,
+			'To list all currently available agents (including user/project customizations), call this tool with no mode parameters — e.g. {} or {agentScope:"both"}.',
+			...(SUBAGENT_DEPTH + 1 >= SUBAGENT_MAX_DEPTH
+				? [
+						`Nesting limit: subagents you spawn run at depth ${SUBAGENT_DEPTH + 1}/${SUBAGENT_MAX_DEPTH} and will NOT have the subagent tool — do not ask them to delegate further.`,
+					]
+				: []),
+		].join("\n"),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -939,16 +998,38 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			if (modeCount === 0) {
+				// 一等公民的 agent 发现入口：不传任何 mode 参数 = 列出当前 scope 下可用的 agent（非错误）。
+				const lines = agents.map((a) => `- ${a.name} (${a.source}): ${a.description}`);
+				let note: string;
+				if (agentScope === "user") {
+					note = `Project agents (${CONFIG_DIR_NAME}/agents) are not scanned in scope "user"; pass agentScope: "both" to include them.`;
+				} else if (discovery.projectAgentsDir) {
+					note = `Project agents dir: ${discovery.projectAgentsDir}`;
+				} else {
+					note = `No ${CONFIG_DIR_NAME}/agents directory found from ${ctx.cwd}.`;
+				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+							text: `Available agents (scope: ${agentScope}):\n${lines.join("\n") || "(none)"}\n\n${note}`,
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			if (modeCount > 1) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Invalid parameters: provide exactly one mode — single {agent, task}, parallel {tasks}, or chain {chain}.",
+						},
+					],
+					details: makeDetails("single")([]),
+					isError: true,
 				};
 			}
 
@@ -1212,6 +1293,16 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
+			}
+			if (!args.agent && !args.task) {
+				// 无 mode 参数 = 列出可用 agent（参数仍在流式传输时也会短暂走到这里，可接受）。
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+						theme.fg("accent", "list agents") +
+						theme.fg("muted", ` [${scope}]`),
+					0,
+					0,
+				);
 			}
 			const agentName = args.agent || "...";
 			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";

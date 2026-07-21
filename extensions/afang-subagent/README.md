@@ -8,6 +8,7 @@
 
 - [x] 后台 / 异步执行（`background: true` fire-and-forget，主 agent 不阻塞；完成时
       `sendMessage + triggerTurn + followUp` 通知，防抖合并；结果落盘 `~/.pi/agent/subagent-results/`）
+- [x] 递归深度护栏（`PI_SUBAGENT_DEPTH`，默认最多两层嵌套，见下方「与官方版的差异」）
 - [ ] 子 agent session 持久化与恢复（多轮追问同一子 agent）
 - [ ] 运行中 steering（中途向子 agent 追加指令）
 - [ ] workflow 的代码侧编排（DAG / 状态机，不依赖 prompt 模板）
@@ -31,7 +32,18 @@
 
 ## 与官方版的差异
 
+- **递归深度护栏（`PI_SUBAGENT_DEPTH`）**：spawn 子 pi 时注入 `PI_SUBAGENT_DEPTH = 当前深度 + 1`
+  （主 session 深度 0）；达到上限（默认 2，可用 `PI_SUBAGENT_MAX_DEPTH` 覆盖）的子进程**不再注册**
+  `subagent` / `subagent_tasks` 工具，模型看不见工具即无法继续嵌套。默认效果：主 session →
+  subagent（深度 1，仍可再派）→ 孙辈 subagent（深度 2，无 subagent 工具）。倒数第一层的工具描述
+  会附加提示，告知模型其子 agent 无法继续委派，避免写出依赖更深嵌套的任务。此前唯一的闸门是
+  `--tools` 白名单（worker 未限制工具，可无限递归）。
 - agent 未指定 `model` 时继承主会话当前模型（官方版不指定则回退 pi 默认模型）
+- **内建 agent 注册进工具描述（system prompt 常驻可见）**：注册时扫描扩展自带 `agents/*.md`，
+  把名字 + description 写入 `subagent` 工具描述，模型冷启动即可"看菜下单"；描述随 `/reload`
+  重建，不会过期。user/project 定制仍为运行时动态发现，描述里只提示存放位置与查看方法
+- **无 mode 调用 = 列出可用 agent（一等公民行为，非报错）**：`subagent {}` 返回当前 scope 下
+  全部 agent（含 source 与 description）；`subagent {agentScope:"both"}` 连 project 层一起列出
 
 ## 安装
 
@@ -56,12 +68,12 @@ subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
 ├── agents.ts            # Agent discovery logic
-├── agents/              # Sample agent definitions
+├── agents/              # Built-in agent definitions (auto-discovered, self-contained)
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
 │   ├── reviewer.md      # Code review
 │   └── worker.md        # General-purpose (full capabilities)
-└── prompts/             # Workflow presets (prompt templates)
+└── prompts/             # Workflow presets (prompt templates, auto-registered via resources_discover)
     ├── implement.md     # scout -> planner -> worker
     ├── scout-and-plan.md    # scout -> planner (no implementation)
     └── implement-and-review.md  # worker -> reviewer -> worker
@@ -69,25 +81,22 @@ subagent/
 
 ## Installation
 
-From the repository root, symlink the files:
+The extension is **self-contained**: built-in agents (`agents/*.md`) are discovered from the
+extension's own directory, and workflow prompts (`prompts/*.md`) are registered via the
+`resources_discover` event. No files need to be copied or symlinked into `~/.pi/agent/agents/`
+or `~/.pi/agent/prompts/`.
+
+Install the whole repo as a pi package (recommended):
 
 ```bash
-# Symlink the extension (must be in a subdirectory with index.ts)
-mkdir -p ~/.pi/agent/extensions/subagent
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
+pi install https://github.com/Yifang-Qin/my-pi-plugins
+```
 
-# Symlink agents
-mkdir -p ~/.pi/agent/agents
-for f in packages/coding-agent/examples/extensions/subagent/agents/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/agents/$(basename "$f")
-done
+Or, for local development, symlink just the extension directory (must keep `../shared/` as a sibling):
 
-# Symlink workflow prompts
-mkdir -p ~/.pi/agent/prompts
-for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
-done
+```bash
+ln -s "$(pwd)/extensions/afang-subagent" ~/.pi/agent/extensions/afang-subagent
+ln -s "$(pwd)/extensions/shared" ~/.pi/agent/extensions/shared
 ```
 
 ## Security Model
@@ -96,7 +105,7 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 **Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to read files, run bash commands, etc.
 
-**Default behavior:** Only loads **user-level agents** from `~/.pi/agent/agents`.
+**Default behavior:** Loads **built-in agents** (bundled in the extension's `agents/` directory) plus **user-level agents** from `~/.pi/agent/agents`.
 
 To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
@@ -130,6 +139,7 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 
 | Mode | Parameter | Description |
 |------|-----------|-------------|
+| List | `{}` (no mode params) | Lists available agents for the scope (name, source, description) |
 | Single | `{ agent, task }` | One agent, one task |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
@@ -176,12 +186,17 @@ System prompt for the agent goes here.
 ```
 
 **Locations:**
+- `<extension>/agents/*.md` - Built-in (bundled with the extension, always loaded, **listed in the tool description / system prompt**)
 - `~/.pi/agent/agents/*.md` - User-level (always loaded)
 - `.pi/agents/*.md` - Project-level (only with `agentScope: "project"` or `"both"`)
 
-Project agents override user agents with the same name when `agentScope: "both"`.
+Same-name overrides: builtin < user < project (project requires `agentScope: "both"`).
+To see what is actually available at runtime (including overrides), call `subagent {}` — or
+`subagent {agentScope:"both"}` to include project agents.
 
 ## Sample Agents
+
+Built-in agents (bundled in `agents/`, overridable by same-name user/project agents):
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|

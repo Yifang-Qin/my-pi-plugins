@@ -6,8 +6,7 @@
 
 | 类型 | 文件 | 说明 |
 |---|---|---|
-| Extension | `extensions/bash-default-timeout.ts` | 给模型发起的 bash 调用补默认超时（默认 120s，`PI_BASH_DEFAULT_TIMEOUT` 可覆盖） |
-| Extension | `extensions/bash-status-line.ts` | 内置 bash 工具结果不再用背景色区分成败，改为在输出末尾追加一行彩色状态（`✓ done · 1.2s` / `✗ exit 1 · 0.4s`）；需配合主题把 `toolSuccessBg`/`toolErrorBg` 设成与 `toolPendingBg` 同色 |
+| Extension | `extensions/tmux-bash/` | （多文件子目录扩展）用 tmux 后台化**覆盖内置 bash**：命令在 detached tmux 窗口里跑、前台流式转发输出。未设 `timeout` 时前台等待 ~120s（`PI_TMUX_BASH_FOREGROUND_TIMEOUT` 可覆盖）仍未结束则**自动转后台**（不杀命令），完成后自动通知；设 `timeout` 则到点硬杀（退出码 124，不转后台）；`background:true` 立即分离。附 `bg` 工具（`list`/`logs`/`kill`）管理后台任务；结果末尾附彩色状态行（`✓ done · 1.2s` / `✗ exit 1`）。进程交给 tmux server 持有，pi 重启/`/reload`/退出都不影响后台任务。**依赖系统安装 `tmux`。** |
 | Extension | `extensions/fuzzy-file-finder/` | （多文件子目录扩展）fzf/telescope 风格文件选择器，接管编辑器里 `@` 的全部交互。**词首裸 `@`** 自动在编辑器位置就地打开选择器（不用 overlay 模式，避免与 pi-powerline-footer fixed editor 冲突导致全屏重印），也可用 `/find-file` 命令；空搜索框=目录树浏览（→/← 展开折叠、tab 选目录），打字=全库模糊列表（目录带 `/` 后缀一起匹配），选中插入 `@path`（目录插入 `@dir/`）。**`@query`（已打字）** 则走 codex 风格子序列模糊内联下拉（`@patf` 命中 `path/to/file`，已吸收原独立扩展 `fuzzy-at-files.ts`）。索引全量（`--no-ignore`），但写死排除 `node_modules`/`.git`/`.env` 等不会手动引用的路径 |
 | Extension | `extensions/tree-nav/` | （多文件子目录扩展）lazygit 风格会话树导航器。命令 `/nav` 弹大 overlay，以 user 轮次为一等公民、左侧分支泳道，enter 跳转（跳前可选 summarize 被放弃分支），中间 assistant/tool 节点折叠可展开；打字即在 user 轮次里搜索 |
 | Extension | `extensions/afang-subagent/` | （多文件子目录扩展）fork 自 pi 官方 subagent 示例、自维护演进。注册 `subagent` 工具把任务委派给独立 pi 子进程（上下文隔离），支持 single / parallel / chain 三模式；`background: true` 后台异步执行——完成时 followUp 通知（防抖合并）、结果落盘 `<任务cwd>/.pi/subagent-results/<时间戳>-task-N-<agent>-<topic>.md`；配套 `subagent_tasks` 工具（list / status / result / cancel）。agent 未指定 model 时继承主会话当前模型 |
@@ -16,7 +15,7 @@
 
 `package.json` 里的 `pi` manifest 声明了上述资源，pi 安装本包时自动加载。
 
-> **注意**：`afang-subagent` 依赖的 **agent 定义**（`agents/*.md`）与 **workflow prompt**（`prompts/*.md`）不是 pi package 的资源类型，不会随包自动安装。扩展本体安装即生效，但 agent 需自行放置：用户级放 `~/.pi/agent/agents/`，项目级放 `.pi/agents/`——仓库 `extensions/afang-subagent/agents/` 下的 4 个样例（scout / planner / reviewer / worker）可直接拷贝；workflow prompt 拷到 `~/.pi/agent/prompts/` 后以 `/implement` 等形式使用。详见 `extensions/afang-subagent/README.md`。
+> **自包含说明**：`afang-subagent` 的 **agent 定义**（内建 scout / planner / reviewer / worker，位于扩展自身 `agents/` 目录）与 **workflow prompt**（`prompts/` 目录，`/implement`、`/scout-and-plan`、`/implement-and-review`）都随扩展自包含加载——agent 由扩展直接从自身目录发现，prompt 经 `resources_discover` 自动注册，`pi install` 后开箱即用，无需拷贝或软链接任何文件。想覆盖内建 agent 行为，在 `~/.pi/agent/agents/` 或项目 `.pi/agents/`（配 `agentScope: "both"`）放同名 `.md` 即可（优先级 builtin < user < project）。详见 `extensions/afang-subagent/README.md`。
 
 ## 安装
 
@@ -25,7 +24,7 @@ pi install https://github.com/Yifang-Qin/my-pi-plugins
 ```
 
 安装后：
-- **扩展自动生效**：bash 默认超时、`@` 模糊文件补全等扩展安装后立即起作用，无需其它操作。
+- **扩展自动生效**：tmux 后台化 bash、`@` 模糊文件补全等扩展安装后立即起作用，无需其它操作。
 - **主题需选一次**：安装只是让 `gruvbox-dark` 出现在可选列表里，激活运行一次
   `/theme gruvbox-dark`（或在 `~/.pi/agent/settings.json` 里设 `"theme": "gruvbox-dark"`）。
   这是 pi 的机制——package 不能替用户强行选主题。
@@ -33,9 +32,10 @@ pi install https://github.com/Yifang-Qin/my-pi-plugins
 ## 新机器 Step by Step（只配插件与个性化，不含模型/key）
 
 1. **装 pi 本体**（见[官方文档](https://pi.dev)），可选外部依赖按需装：
+   `tmux`（tmux-bash 后台化必需，缺了 bash 工具会直接报不可用）、
    `fd`（fuzzy-file-finder 加速，缺了会回退 `git ls-files`）、
    `ffmpeg` + `yt-dlp`（pi-web-access 视频抽帧）。
-   macOS 用 `brew install fd ffmpeg yt-dlp`，Linux 用对应包管理器（如 `apt install fd-find`）。
+   macOS 用 `brew install tmux fd ffmpeg yt-dlp`，Linux 用对应包管理器（如 `apt install tmux fd-find`）。
 2. **装本配置包**
    ```bash
    pi install https://github.com/Yifang-Qin/my-pi-plugins
