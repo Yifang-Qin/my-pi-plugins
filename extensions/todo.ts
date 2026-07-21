@@ -2,20 +2,34 @@
  * Todo Extension - 三态任务清单 + 常驻进度 widget
  *
  * - 注册 `todo` 工具给 LLM：list / add / set / clear
+ *   （add/set 的 tool result 回显全量清单快照，对齐 cc/codex 的「全量替换」语义，
+ *   让对话历史里始终有新鲜快照而非只有增量日志，降低长会话中被遗忘的概率）
  * - 注册 `/todos` 命令给用户查看清单
+ * - context 事件反应式 reminder：agentic loop 深处距上次 todo 调用过久时，
+ *   向本次请求 payload 注入非持久的 <system-reminder>（当前快照 + 对账提示），
+ *   对齐 cc 的「hasn't been used recently」机制；不落盘、不在历史里累积
  * - editor 上方常驻 widget：进度条 + 三态图标（○ pending / ◼ in_progress / ✓ completed）
  *
  * 状态存在工具结果的 details 里（非外部文件），因此分支切换时状态自动正确。
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type TodoStatus = "pending" | "in_progress" | "completed";
 
-// 常驻 system prompt 段落：Codex 风格，只讲工具用法，不做每-turn 状态提醒。
+// 反应式 reminder（cc「hasn't been used recently」风格）的两个阈值（单位：消息条数）：
+// GAP：距上次 todo 工具调用 / 距本 turn 的 user 消息都超过这个数才注入。
+//      tool-heavy loop 下每个 LLM call ≈ assistant + toolResult 两条，12 条 ≈ 6 个 call。
+// COOLDOWN：一次注入后至少再积累这么多条消息才允许下一次，防刷屏/防脱敏。
+const REMINDER_GAP = 12;
+const REMINDER_COOLDOWN = 12;
+
+// 常驻 system prompt 段落：Codex 风格，只讲工具用法（静态部分）。
+// 状态感知的注入（未完成快照 / 全完成 nudge）在 before_agent_start 里按当前状态另行追加。
 // 措辞必须与下方 registerTool 的 schema 对齐（action: list/add/set/clear，status 三态）。
 const TODO_GUIDE = `
 
@@ -231,12 +245,24 @@ export default function (pi: ExtensionAPI) {
 		}));
 	};
 
+	// 全量快照文本（发给 LLM 的纯文本格式）。add/set 的 tool result 与 system prompt 注入共用。
+	// 对齐 cc/codex 的「全量替换」语义：每次操作后历史里都留一份完整清单，而非只有增量日志。
+	const snapshotText = (): string => {
+		if (todos.length === 0) return "No todos";
+		const completed = todos.filter((t) => t.status === "completed").length;
+		const lines = todos.map((t) => `#${t.id} [${t.status}] ${t.text}`);
+		return `Todo list (${completed}/${todos.length} completed):\n${lines.join("\n")}`;
+	};
+
 	// 常驻注入：仅当本插件的 todo 工具在当前提示里激活时才追加 guide。
 	// before_agent_start 每个 user turn 触发一次，system prompt 逐轮重建，
 	// 因此每个发给 LLM 的请求都会带上这段（等价于常驻）。
-	// 额外做一处「状态感知」提醒：上一轮 todo 已全部完成、列表仍挂着时，
-	// 追加一句 nudge 让模型在开新任务前主动 clear（只提示，不自动清——
-	// 因为「全完成」不代表用户要开新活，同任务追问时自动清会丢掉刚做完的清单上下文）。
+	// 另做两处「状态感知」注入（互斥分支）：
+	// - 有未完成项：把全量快照带进本 turn 的 system prompt，开局即知有活没干完，
+	//   避免清单沉在历史深处被遗忘（长 agentic loop 场景的第一道保险）。
+	// - 全部完成但列表仍挂着：追加一句 nudge 让模型在开无关新任务前主动 clear
+	//   （只提示，不自动清——「全完成」不代表用户要开新活，同任务追问时
+	//   自动清会丢掉刚做完的清单上下文）。
 	pi.on("before_agent_start", async (event) => {
 		const active = event.systemPromptOptions.selectedTools?.includes("todo") ?? false;
 		if (!active) return;
@@ -248,19 +274,79 @@ export default function (pi: ExtensionAPI) {
 				`\n\n**Note:** All ${todos.length} todos from the previous task are completed. ` +
 				"If the user's new request is unrelated, call `todo clear` before starting " +
 				"(or clear and re-populate for the new task). Don't carry a stale completed list forward.";
+		} else if (todos.length > 0) {
+			systemPrompt +=
+				`\n\n**Note:** There are unfinished todos from earlier work:\n\n${snapshotText()}\n\n` +
+				"Continue from the `in_progress` item unless the user's new request changes priorities. " +
+				"Keep statuses up to date as you work; if the list no longer matches what you're doing, clean it up.";
 		}
 
 		return { systemPrompt };
+	});
+
+	// 反应式 reminder（②）：context 事件在**每次 LLM call 前**触发——含 agentic loop 中途，
+	// 这是 before_agent_start（每 user turn 一次）覆盖不到的。返回的 messages 是深拷贝，
+	// 只影响本次请求 payload、不写入 session（瞬时注入，不会在历史里累积）。
+	// 条件：有未完成项 && 距上次 todo 调用与距本 turn user 消息都超过 GAP && 冷却已过。
+	// （sinceUser 门槛：turn 开头的 system prompt 已由上方分支带上快照，只需覆盖深入 loop 之后）
+	// 注入在消息列表末尾：注意力位置最好，且不动前缀、对 prompt cache 友好。
+	// role:"custom" 的消息由 convertToLlm 转成 user 角色发给 provider。
+	let lastRemindedAt = -1; // 上次注入时的消息总数（用作冷却基准）
+
+	pi.on("context", async (event) => {
+		const msgs = event.messages;
+		if (msgs.length < lastRemindedAt) lastRemindedAt = -1; // 换分支/压缩后长度回退，重置冷却
+
+		if (todos.length === 0 || todos.every((t) => t.status === "completed")) return;
+		if (lastRemindedAt >= 0 && msgs.length - lastRemindedAt < REMINDER_COOLDOWN) return;
+
+		// 从尾部扫：距上次 todo 工具结果 / 距最近一条 user 消息的距离（没找到按无穷大算）
+		let sinceTodo = Number.POSITIVE_INFINITY;
+		let sinceUser = Number.POSITIVE_INFINITY;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const m = msgs[i];
+			if (sinceTodo === Number.POSITIVE_INFINITY && m.role === "toolResult" && m.toolName === "todo") {
+				sinceTodo = msgs.length - 1 - i;
+			}
+			if (sinceUser === Number.POSITIVE_INFINITY && m.role === "user") {
+				sinceUser = msgs.length - 1 - i;
+			}
+			if (sinceTodo !== Number.POSITIVE_INFINITY && sinceUser !== Number.POSITIVE_INFINITY) break;
+		}
+		if (sinceTodo < REMINDER_GAP || sinceUser < REMINDER_GAP) return;
+
+		lastRemindedAt = msgs.length;
+		const reminder: AgentMessage = {
+			role: "custom",
+			customType: "todo-reminder",
+			content: [
+				{
+					type: "text",
+					// 快照放前、指令放后；只说「对账」不催进度；结尾软化词防脱敏（对齐 cc 措辞）
+					text:
+						`<system-reminder>\n${snapshotText()}\n\n` +
+						"The `todo` tool hasn't been used in a while. If any of these items are already done, " +
+						"mark them completed (`todo set`); keep exactly one item in_progress. If the list no " +
+						"longer matches the work, clean it up. This is just a gentle reminder — ignore if not " +
+						"applicable.\n</system-reminder>",
+				},
+			],
+			display: false,
+			timestamp: Date.now(),
+		};
+		return { messages: [...msgs, reminder] };
 	});
 
 	// Reconstruct state on session events
 	pi.on("session_start", async (_event, ctx) => {
 		reconstructState(ctx);
 		refreshWidget(ctx);
+		lastRemindedAt = -1;
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		reconstructState(ctx);
 		refreshWidget(ctx);
+		lastRemindedAt = -1;
 	});
 
 	// Register the todo tool for the LLM
@@ -275,14 +361,7 @@ export default function (pi: ExtensionAPI) {
 			switch (params.action) {
 				case "list":
 					return {
-						content: [
-							{
-								type: "text",
-								text: todos.length
-									? todos.map((t) => `#${t.id} [${t.status}] ${t.text}`).join("\n")
-									: "No todos",
-							},
-						],
+						content: [{ type: "text", text: snapshotText() }],
 						details: { action: "list", todos: [...todos], nextId } as TodoDetails,
 					};
 
@@ -296,8 +375,9 @@ export default function (pi: ExtensionAPI) {
 					const newTodo: Todo = { id: nextId++, text: params.text, status: "pending" };
 					todos.push(newTodo);
 					refreshWidget(ctx);
+					// content 回显全量快照（进 LLM 上下文）；TUI 侧 renderResult 只显示增量行，不受影响
 					return {
-						content: [{ type: "text", text: `Added todo #${newTodo.id}: ${newTodo.text}` }],
+						content: [{ type: "text", text: `Added todo #${newTodo.id}: ${newTodo.text}\n\n${snapshotText()}` }],
 						details: { action: "add", todos: [...todos], nextId } as TodoDetails,
 					};
 				}
@@ -334,8 +414,9 @@ export default function (pi: ExtensionAPI) {
 					}
 					todo.status = params.status;
 					refreshWidget(ctx);
+					// content 回显全量快照（进 LLM 上下文）；TUI 侧 renderResult 只显示增量行，不受影响
 					return {
-						content: [{ type: "text", text: `Todo #${todo.id} → ${todo.status}` }],
+						content: [{ type: "text", text: `Todo #${todo.id} → ${todo.status}\n\n${snapshotText()}` }],
 						details: { action: "set", todos: [...todos], nextId } as TodoDetails,
 					};
 				}
@@ -417,8 +498,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "set": {
+					// content 现在带全量快照（给 LLM 的），UI 只取首行增量（清单本身有 widget/展开可看）
 					const text = result.content[0];
-					const msg = text?.type === "text" ? text.text : "";
+					const msg = text?.type === "text" ? (text.text.split("\n")[0] ?? "") : "";
 					return new Text(theme.fg("success", "✓ ") + theme.fg("muted", msg), 0, 0);
 				}
 
