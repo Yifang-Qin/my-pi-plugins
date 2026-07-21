@@ -233,11 +233,24 @@ export default function (pi: ExtensionAPI) {
 
 	// 常驻注入：仅当本插件的 todo 工具在当前提示里激活时才追加 guide。
 	// before_agent_start 每个 user turn 触发一次，system prompt 逐轮重建，
-	// 因此每个发给 LLM 的请求都会带上这段（等价于常驻），无自适应/状态提醒逻辑。
+	// 因此每个发给 LLM 的请求都会带上这段（等价于常驻）。
+	// 额外做一处「状态感知」提醒：上一轮 todo 已全部完成、列表仍挂着时，
+	// 追加一句 nudge 让模型在开新任务前主动 clear（只提示，不自动清——
+	// 因为「全完成」不代表用户要开新活，同任务追问时自动清会丢掉刚做完的清单上下文）。
 	pi.on("before_agent_start", async (event) => {
 		const active = event.systemPromptOptions.selectedTools?.includes("todo") ?? false;
 		if (!active) return;
-		return { systemPrompt: event.systemPrompt + TODO_GUIDE };
+
+		let systemPrompt = event.systemPrompt + TODO_GUIDE;
+
+		if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
+			systemPrompt +=
+				`\n\n**Note:** All ${todos.length} todos from the previous task are completed. ` +
+				"If the user's new request is unrelated, call `todo clear` before starting " +
+				"(or clear and re-populate for the new task). Don't carry a stale completed list forward.";
+		}
+
+		return { systemPrompt };
 	});
 
 	// Reconstruct state on session events
