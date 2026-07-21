@@ -8,6 +8,14 @@
 //   - typing a literal "@" at a word boundary in the editor, which opens this
 //     finder instead of pi's built-in inline "@" dropdown.
 //
+// The same autocomplete provider also owns the "@query" (already typing)
+// case: instead of the built-in consecutive-substring match it serves a
+// codex-style subsequence-fuzzy inline dropdown ("@patf" matches
+// "path/to/file"). This absorbed the former standalone fuzzy-at-files.ts
+// extension, so both "@" behaviors share one file list, one cache and one
+// token-boundary definition — and the old cross-extension "delegate on bare
+// @" handshake is gone.
+//
 // The finder renders in the editor slot (pi's classic `ctx.ui.custom` mode),
 // NOT as an `{ overlay: true }` floating modal. A pi-tui overlay flips
 // pi-powerline-footer's fixed-editor compositor into its "overlay visible"
@@ -39,13 +47,31 @@
 //     directories (dirs render with a trailing "/" and insert as `@dir/`).
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
+import {
+	type AutocompleteItem,
+	type AutocompleteProvider,
+	type AutocompleteSuggestions,
+	fuzzyFilter,
+} from "@earendil-works/pi-tui";
 import { loadFiles } from "./files.js";
 import { FinderOverlay } from "./finder-overlay.js";
 
 const CACHE_TTL_MS = 5_000;
-// A literal "@" at a token boundary with nothing typed after it yet.
-const BARE_AT = /(?:^|[ \t])@$/;
+const MAX_SUGGESTIONS = 20;
+// Mirror the built-in token boundaries (pi's autocomplete.ts PATH_DELIMITERS)
+// so the finder trigger and the inline fuzzy dropdown agree on what an "@"
+// token is.
+const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
+
+/** Return the "@..." token immediately before the cursor, or null. */
+function extractAtToken(textBeforeCursor: string): string | null {
+	let start = textBeforeCursor.length;
+	while (start > 0 && !PATH_DELIMITERS.has(textBeforeCursor[start - 1] ?? "")) {
+		start -= 1;
+	}
+	const token = textBeforeCursor.slice(start);
+	return token.startsWith("@") ? token.slice(1) : null;
+}
 
 export default function (pi: ExtensionAPI): void {
 	// Per-cwd file-list cache so repeat opens are instant.
@@ -143,12 +169,34 @@ export default function (pi: ExtensionAPI): void {
 				triggerCharacters: ["@"],
 				async getSuggestions(lines, cursorLine, cursorCol, options): Promise<AutocompleteSuggestions | null> {
 					const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
-					if (BARE_AT.test(before)) {
+					const query = extractAtToken(before);
+
+					// Not an "@" token (plain path, "a@b", slash command…) -> built-in chain.
+					if (query === null) {
+						return current.getSuggestions(lines, cursorLine, cursorCol, options);
+					}
+
+					// Bare "@": open the finder; empty items dismiss the inline dropdown.
+					if (query.trim() === "") {
 						if (!finderBusy) openFinder();
-						// Empty items -> the editor dismisses the inline dropdown.
 						return { items: [], prefix: "@" };
 					}
-					// Anything else (including "@foo") -> the normal provider chain.
+
+					// "@query": inline subsequence-fuzzy dropdown (absorbed from the
+					// former fuzzy-at-files.ts). This is the escape hatch after
+					// cancelling the finder, and covers fast typists who blow past the
+					// bare-"@" hook. fuzzyFilter splits the query on whitespace and "/",
+					// requires every token to match, and ranks best-first.
+					const files = await getFiles(ctx.cwd);
+					if (!options.signal.aborted && files.length > 0) {
+						const ranked = fuzzyFilter(files, query, (p) => p);
+						const items: AutocompleteItem[] = ranked.slice(0, MAX_SUGGESTIONS).map((p) => ({
+							value: `@${p}`,
+							label: p.split("/").pop() ?? p,
+							description: p,
+						}));
+						if (items.length > 0) return { items, prefix: `@${query}` };
+					}
 					return current.getSuggestions(lines, cursorLine, cursorCol, options);
 				},
 				applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
