@@ -30,7 +30,8 @@ You have a \`todo\` tool for tracking multi-step work. Actions:
 Use it when a task has 3+ distinct steps or is non-trivial:
 - Lay out the steps with \`add\` before starting the work.
 - Keep exactly one todo \`in_progress\` at a time; mark it \`completed\` as soon as it's done, then start the next.
-- Skip the tool for trivial single-step tasks — don't invent filler steps.`;
+- Skip the tool for trivial single-step tasks — don't invent filler steps.
+- Before the final response, reconcile the todo list with the work actually completed. Mark finished items \`completed\`; if no unfinished items remain, call \`clear\`. Otherwise keep the remaining items and mention them to the user.`;
 
 interface Todo {
 	id: number;
