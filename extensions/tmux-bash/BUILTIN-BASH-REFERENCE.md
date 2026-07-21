@@ -190,6 +190,17 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    （合并了早期 skeleton 的 `bg_start/bg_logs/bg_list/bg_kill`）。
 5. **进程生命周期**：命令交给 tmux server 持有，`session_shutdown` 故意不杀窗口/会话——后台任务
    在 pi 退出/`/reload` 后继续存活（`cleanup` 只关 watcher、清内存 job 表）。
+6. **`bash -n` 语法预检（新增，有意偏离）**：内置 bash 直接把命令交给 bash 运行，语法错误由
+   bash 自己报（stderr + 退出码 2）；本插件的命令嵌在 wrapper 脚本里跑，若不预检，解析失败会
+   表现为「窗口秒死 + 错误不可见 + 哨兵永不出现」。预检失败时文案对齐内置（stderr 正文 +
+   `Command exited with code 2`），并附加「命令未启动、无副作用」与本机 bash 版本注记；
+   `details` 多一个 `syntaxCheckFailed: true`。背景：macOS 系统 bash 3.2 的 $(…) 扫描器会把
+   heredoc 正文里的撚号误判为未闭合引号。
+7. **窗口死亡检测（新增）**：前台等待循环约每秒探测一次窗口存活（`windowExists`）；窗口未写
+   哨兵就消失时（wrapper 崩溃 / 外部 kill / tmux server 挂掉）立即以 isError 返回，状态行为
+   `Command's tmux window … disappeared without recording an exit code …`，`details.exitCode: -1`
+   （约定值，区别于 124/130）；检测到死亡后先留 200ms 复查哨兵，消除「刚写完哨兵就关窗」的
+   竞态。内置 bash 无对应场景（Node 自持子进程，进程死亡即 close 事件）。
 
 竞态处理：自动转后台的切换点先 `state.jobs.set(...)` 登记再复查哨兵文件，消除「恰在切换瞬间
 完成」导致 `fs.watch` 漏发通知的窗口（见 `runForegroundBash`）。
@@ -207,6 +218,9 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
       `{ exitCode, outputFile, truncated, durationMs }`。若有下游依赖内置 details 形状，需再对齐。
 - [ ] **跨 `/reload` 不恢复 job 表**：reload 前启动的任务完成时不再自动通知（任务仍在 tmux 里跑，
       可 `bg action=list` 或 tmux 手动查）。可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
+- [ ] **后台 job 的窗口死亡检测**：前台循环已检测（§7.7），但转后台/`background:true` 后只靠
+      哨兵文件——被外部 `kill-window` 的后台任务不会发完成通知，job 表残留计数（经本插件
+      `bg action=kill` 的会正确标记 done）。可在 watcher 侧加周期性存活巡检。
 - [ ] **流式为轮询而非事件驱动**（§3）：`.out` 每 ~150ms 轮询一次；量大/低延迟场景可评估用
       `tail -f` 或 `capture-pane` 事件化。
 

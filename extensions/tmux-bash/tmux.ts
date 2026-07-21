@@ -100,6 +100,15 @@ export function killWindow(opts: TmuxBashOptions, windowId: string): boolean {
 	return tmuxSafe(opts, ["kill-window", "-t", windowId]) !== null;
 }
 
+// 窗口是否仍存活。wrapper 崩溃（脚本解析失败、OOM 等）或被外部 kill 时，窗口会在
+// 没写退出码哨兵文件的情况下消失；前台等待循环靠它做死亡检测（tmux server 挂了
+// 同样返回 false，语义一致：命令已不可能再产出结果）。
+// 注意用 list-panes 而非 display-message：后者对不存在的 -t 目标也退出 0（实测
+// tmux 3.7b，回退到当前客户端上下文），无法用作存活判据。
+export function windowExists(opts: TmuxBashOptions, windowId: string): boolean {
+	return tmuxSafe(opts, ["list-panes", "-t", windowId]) !== null;
+}
+
 export function capturePane(opts: TmuxBashOptions, windowId: string, lines: number): string {
 	return tmuxSafe(opts, ["capture-pane", "-t", windowId, "-p", "-S", `-${lines}`]) ?? "";
 }

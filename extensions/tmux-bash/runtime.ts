@@ -7,8 +7,14 @@
 //     退出码，写入「退出码哨兵文件」，最后 exec $SHELL -l 让窗口在命令结束后仍可 attach。
 //   - 「是否完成」= 哨兵文件是否出现；用 fs.watch(runDir) 监听，完成后通过
 //     pi.sendMessage(followUp + triggerTurn) 唤醒模型。
+//   - 建窗口前先用 bash -n 对 wrapper 脚本做语法预检：解析不过的命令（典型如 macOS
+//     系统 bash 3.2 对 $(…) 内 heredoc 撚号的误判）立即以 isError 返回，不会变成
+//     「窗口秒死但前台空等 120s 后误转后台」的僵尸任务。
+//   - 前台等待循环附带窗口存活探测（约每秒一次）：窗口未写哨兵文件就消失
+//     （wrapper 崩溃 / 被外部 kill）时立即报错返回，而不是等满等待窗口假装转后台。
 //   - 工作目录用 ctx.cwd（不强制 git 仓库，这点比 pi-tmux-bash 宽松）。
 
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
 	chmodSync,
@@ -32,6 +38,7 @@ import {
 	newWindow,
 	setWindowOptions,
 	capturePane,
+	windowExists,
 } from "./tmux.js";
 
 interface Job {
@@ -150,6 +157,62 @@ function windowNameFor(command: string, name: string | undefined): string {
 	return first.split("/").pop() || "shell";
 }
 
+// —— bash -n 语法预检 —— //
+//
+// 背景：wrapper 脚本若有语法错误，bash 会在执行完前面的简单命令（含 `: > $__out_file`）后
+// 才在解析复合命令时报错退出——错误打到 pane 的 stderr（不进 .out）、哨兵文件永不出现、
+// 窗口秒关。典型诱因：macOS 系统 bash 3.2 的 $(…) 扫描器会把 heredoc 正文里的撚号（don't）
+// 误判为未闭合单引号。故建窗口前先 bash -n 预检，把错误在启动前直接返给模型。
+
+let cachedBashVersion: string | null | undefined;
+function bashVersion(): string | null {
+	if (cachedBashVersion === undefined) {
+		try {
+			cachedBashVersion =
+				execFileSync("bash", ["--version"], {
+					encoding: "utf-8",
+					timeout: 10_000,
+					stdio: ["ignore", "pipe", "ignore"],
+				})
+					.split("\n")[0]
+					?.trim() || null;
+		} catch {
+			cachedBashVersion = null;
+		}
+	}
+	return cachedBashVersion;
+}
+
+// 返回 null 表示通过；否则返回人类可读的语法错误信息（附本机 bash 版本，方便定位
+// 「老 bash 解析器」一类问题）。权威校验对象是 wrapper 脚本（它才是真正要跑的东西）；
+// 但报错信息优先用「直接 -n -c 校验原始命令」的结果——行号相对用户命令，更可读；
+// 命令本身校验通过而 wrapper 失败则说明是脚本生成的 bug，报 wrapper 错误（含脚本路径）。
+// 校验器自身不可用（bash 不在 PATH、超时等）时放行，不挡执行。
+export function checkBashSyntax(scriptPath: string, command: string): string | null {
+	const run = (args: string[]): string | null => {
+		try {
+			execFileSync("bash", args, {
+				encoding: "utf-8",
+				timeout: 10_000,
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			return null;
+		} catch (err) {
+			const e = err as { status?: unknown; stderr?: unknown };
+			// 非「带退出码的失败」（spawn 失败 / 超时被杀）不算语法错误，放行。
+			if (typeof e.status !== "number" || e.status === 0) return null;
+			const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
+			return stderr || `bash -n exited with code ${e.status}`;
+		}
+	};
+	const wrapperError = run(["-n", scriptPath]);
+	if (wrapperError === null) return null;
+	const commandError = run(["-n", "-c", command]);
+	const message = commandError ?? wrapperError;
+	const version = bashVersion();
+	return version ? `${message}\n[checked with ${version}]` : message;
+}
+
 export interface StartResult {
 	jobId: string;
 	windowId: string;
@@ -171,6 +234,11 @@ export function startBackgroundCommand(
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = command.replace(/\s+/g, " ").trim();
 	const scriptPath = writeScript(state, id, command, displayCommand);
+	const syntaxError = checkBashSyntax(scriptPath, command);
+	if (syntaxError) {
+		// 抛错交给 index.ts 的 catch → 「Failed to execute command: …」（isError）。
+		throw new Error(`bash -n pre-check failed; the command was never started:\n${syntaxError}`);
+	}
 	const windowId = newWindow(options, windowNameFor(command, name), cwd, scriptPath);
 	const outputFile = join(state.runDir!, `${id}.${windowId}.out`);
 
@@ -262,6 +330,21 @@ export async function runForegroundBash(
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = params.command.replace(/\s+/g, " ").trim();
 	const scriptPath = writeScript(state, id, params.command, displayCommand);
+	const syntaxError = checkBashSyntax(scriptPath, params.command);
+	if (syntaxError) {
+		// 对齐内置 bash 行为：语法错误 = stderr 正文 + 「Command exited with code 2」（bash 对
+		// 语法错误的真实退出码就是 2）；额外注明命令根本没启动，无任何副作用。
+		return {
+			content: [
+				{
+					type: "text",
+					text: `${syntaxError}\n\nCommand exited with code 2\n[rejected by bash -n pre-check; the command was never started]`,
+				},
+			],
+			details: { exitCode: 2, syntaxCheckFailed: true, durationMs: 0 },
+			isError: true,
+		};
+	}
 	const windowId = newWindow(options, windowNameFor(params.command, undefined), params.cwd, scriptPath);
 	const outputFile = join(state.runDir!, `${id}.${windowId}.out`);
 	const exitFile = join(state.runDir!, `${id}.${windowId}`);
@@ -283,6 +366,7 @@ export async function runForegroundBash(
 
 	params.onUpdate?.({ content: [], details: undefined });
 	let lastEmitted = "";
+	let lastLivenessCheckAt = startedAt;
 
 	// 命令已完成：清哨兵、按配置关窗口、返回最终结果。
 	const finishInline = (exitCode: number): ToolTextResult => {
@@ -310,6 +394,29 @@ export async function runForegroundBash(
 		if (existsSync(exitFile)) {
 			const exitCode = readExitCode(exitFile);
 			if (!Number.isNaN(exitCode)) return finishInline(exitCode);
+		}
+
+		// 窗口死亡检测（约每秒一次，避免每拍都起 tmux 子进程）：语法预检拦不住的崩溃
+		// （OOM、被外部 kill-window、tmux server 挂掉）会让窗口在没写哨兵文件的情况下
+		// 消失；不检测就会空等到前台窗口结束、把早已死透的任务误转后台（哨兵永不出现
+		// → 完成通知永不到来）。
+		if (Date.now() - lastLivenessCheckAt >= 1000) {
+			lastLivenessCheckAt = Date.now();
+			if (!windowExists(options, windowId)) {
+				// 留一拍复查：消除「哨兵刚写完、窗口随即被关」与本检测的竞态。
+				await sleep(200);
+				if (existsSync(exitFile)) {
+					const exitCode = readExitCode(exitFile);
+					if (!Number.isNaN(exitCode)) return finishInline(exitCode);
+				}
+				return buildFinalResult(
+					state,
+					outputFile,
+					-1,
+					Date.now() - startedAt,
+					`Command's tmux window ${windowId} disappeared without recording an exit code — the wrapper crashed or the window was killed externally. The command is no longer running.`,
+				);
+			}
 		}
 
 		// 用户中断：杀窗口，返回中断（对齐内置 bash 文案）。
