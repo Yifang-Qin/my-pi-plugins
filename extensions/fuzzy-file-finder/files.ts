@@ -4,27 +4,70 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
+// Full index (--no-ignore) with a hard-coded blocklist of things you'd never
+// reference by hand. fd gets these as --exclude globs; the git fallback
+// filters its output through isExcluded() so both paths agree.
+const EXCLUDED_DIRS = [
+	".git",
+	"node_modules",
+	".venv",
+	"venv",
+	"__pycache__",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+	".cache",
+	"dist",
+	"build",
+	"target",
+	".next",
+	".nuxt",
+	".turbo",
+	"coverage",
+	".idea",
+];
+const EXCLUDED_FILE_GLOBS = [".env", ".env.*", ".DS_Store", "*.pyc"];
+
+/** Mirror of the fd --exclude globs, for the git fallback path. */
+export function isExcluded(path: string): boolean {
+	const segs = path.split("/");
+	if (segs.some((s) => EXCLUDED_DIRS.includes(s))) return true;
+	const base = segs[segs.length - 1] ?? "";
+	return base === ".env" || base.startsWith(".env.") || base === ".DS_Store" || base.endsWith(".pyc");
+}
+
+const FD_ARGS = [
+	"--type",
+	"f",
+	"--hidden",
+	"--follow",
+	"--no-ignore",
+	...[...EXCLUDED_DIRS, ...EXCLUDED_FILE_GLOBS].flatMap((g) => ["--exclude", g]),
+	"--strip-cwd-prefix",
+];
+
 /**
  * Return repo-relative file paths for `cwd`.
- * Prefers `fd` (respects .gitignore, fast); falls back to `git ls-files`.
+ * Prefers `fd` (full index minus the blocklist); falls back to `git ls-files`
+ * (tracked + all untracked, filtered through the same blocklist).
  */
 export async function loadFiles(pi: ExtensionAPI, cwd: string, signal: AbortSignal): Promise<string[]> {
 	const fd = await pi
-		.exec("fd", ["--type", "f", "--hidden", "--follow", "--exclude", ".git", "--strip-cwd-prefix"], {
-			cwd,
-			timeout: 5_000,
-			signal,
-		})
+		.exec("fd", FD_ARGS, { cwd, timeout: 5_000, signal })
 		.catch(() => null);
 	if (fd && fd.code === 0 && fd.stdout.trim()) {
 		return fd.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
 	}
 
+	// No --exclude-standard: include gitignored untracked files too.
 	const git = await pi
-		.exec("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd, timeout: 5_000, signal })
+		.exec("git", ["ls-files", "--cached", "--others"], { cwd, timeout: 5_000, signal })
 		.catch(() => null);
 	if (git && git.code === 0 && git.stdout.trim()) {
-		return git.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+		return git.stdout
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l && !isExcluded(l));
 	}
 	return [];
 }

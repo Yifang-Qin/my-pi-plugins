@@ -22,6 +22,48 @@ import {
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
 const MAX_SUGGESTIONS = 20;
 
+// Full index (--no-ignore) with a hard-coded blocklist of things you'd never
+// reference by hand. Kept in sync with fuzzy-file-finder/files.ts (the two
+// extensions are intentionally standalone). fd gets these as --exclude globs;
+// the git fallback filters its output through isExcluded().
+const EXCLUDED_DIRS = [
+	".git",
+	"node_modules",
+	".venv",
+	"venv",
+	"__pycache__",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+	".cache",
+	"dist",
+	"build",
+	"target",
+	".next",
+	".nuxt",
+	".turbo",
+	"coverage",
+	".idea",
+];
+const EXCLUDED_FILE_GLOBS = [".env", ".env.*", ".DS_Store", "*.pyc"];
+
+function isExcluded(path: string): boolean {
+	const segs = path.split("/");
+	if (segs.some((s) => EXCLUDED_DIRS.includes(s))) return true;
+	const base = segs[segs.length - 1] ?? "";
+	return base === ".env" || base.startsWith(".env.") || base === ".DS_Store" || base.endsWith(".pyc");
+}
+
+const FD_ARGS = [
+	"--type",
+	"f",
+	"--hidden",
+	"--follow",
+	"--no-ignore",
+	...[...EXCLUDED_DIRS, ...EXCLUDED_FILE_GLOBS].flatMap((g) => ["--exclude", g]),
+	"--strip-cwd-prefix",
+];
+
 /** Return the "@..." token immediately before the cursor, or null. */
 function extractAtToken(textBeforeCursor: string): string | null {
 	let start = textBeforeCursor.length;
@@ -33,24 +75,24 @@ function extractAtToken(textBeforeCursor: string): string | null {
 }
 
 async function loadFiles(pi: ExtensionAPI, cwd: string, signal: AbortSignal): Promise<string[]> {
-	// Prefer fd (respects .gitignore, fast). pi bundles fd on PATH.
-	const fd = await pi.exec(
-		"fd",
-		["--type", "f", "--hidden", "--follow", "--exclude", ".git", "--strip-cwd-prefix"],
-		{ cwd, timeout: 5_000, signal },
-	).catch(() => null);
+	// Prefer fd (full index minus the blocklist, fast). pi bundles fd on PATH.
+	const fd = await pi.exec("fd", FD_ARGS, { cwd, timeout: 5_000, signal }).catch(() => null);
 	if (fd && fd.code === 0 && fd.stdout.trim()) {
 		return fd.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
 	}
 
-	// Fallback: tracked + untracked files via git.
+	// Fallback: tracked + ALL untracked (no --exclude-standard, so gitignored
+	// files are included too), filtered through the same blocklist.
 	const git = await pi.exec(
 		"git",
-		["ls-files", "--cached", "--others", "--exclude-standard"],
+		["ls-files", "--cached", "--others"],
 		{ cwd, timeout: 5_000, signal },
 	).catch(() => null);
 	if (git && git.code === 0 && git.stdout.trim()) {
-		return git.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+		return git.stdout
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l && !isExcluded(l));
 	}
 	return [];
 }
