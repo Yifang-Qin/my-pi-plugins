@@ -4,7 +4,9 @@
 前台同步等待并「流式转发」输出；未在前台等待窗口（默认 120s）内结束则**自动转后台**（不杀命令），
 完成后经 followUp 通知模型。另附一个 `bg` 工具管理这些后台任务。
 
-> 进程交给 tmux server 持有，pi 的 `/reload`、切换会话、崩溃、退出都不影响后台任务。
+> 进程交给 tmux server 持有：pi 运行期间的 `/reload`、切换会话、意外崩溃都不会中断后台任务
+> （也不占 Node 事件循环）。正常退出（quit）时插件会回收本会话的磁盘产物——**后台任务的受管
+> 生命周期即到 pi 退出 / reload 为止**（详见「产物权限与回收」）。
 > 覆盖内置 bash 时逐条对齐其结果/错误文案/截断等「形状」，权威清单见同目录
 > [`BUILTIN-BASH-REFERENCE.md`](./BUILTIN-BASH-REFERENCE.md)。
 
@@ -34,8 +36,11 @@
 - **覆盖内置 `bash`（而非另起 `bg_*` 工具）**：让「长命令自动转后台」成为默认路径，模型无需
   学新工具、也不会两套 bash 并存。代价是要严格对齐内置 bash 的结果/错误/截断形状，pi 升级
   后须复核（见 `BUILTIN-BASH-REFERENCE.md` 顶部的版本与复核方法）。
-- **进程交给 tmux server 持有**：Node 侧不 hold 子进程，`/reload`、切换会话、崩溃、退出都不
-  影响后台任务。这是相对「扩展内 `spawn(detached)` 自管进程」最大的优势。
+- **进程交给 tmux server 持有**：Node 侧不 hold 子进程，pi 运行期间的 `/reload`、切换会话、意外
+  崩溃都不会中断后台任务，也不占 Node 事件循环。这是相对「扩展内 `spawn(detached)` 自管进程」
+  最大的优势。注意：正常退出（quit）时插件按会话生命周期回收产物（见「产物权限与回收」），故
+  **后台任务的受管生命周期定位为「到 pi 退出 / reload 为止」**——不主动杀 tmux 窗口，但退出后不
+  再保证其日志与追踪。
 - **哨兵退出码文件 + `.out` 输出文件**：把「是否完成」和「输出内容」都落盘，和进程句柄解耦：
   - 完成检测走 `fs.watch(runDir)` 监听哨兵文件；
   - 日志读取优先读 `.out`，读不到再 `tmux capture-pane` 兜底；
@@ -47,6 +52,31 @@
   用 `stripBgNotifyFrame` 剥掉框。
 - **工作目录用 `ctx.cwd`**：不强制在 git 仓库内。
 - **tmux 调用全用 `execFileSync` 数组参数**：不拼 shell 字符串，从根上避开引号/空格问题。
+
+## 产物权限与回收
+
+**权限收紧**（wrapper 脚本内联了导出的环境变量，可能含密钥）：
+
+- runDir / scriptDir 目录：`0o700`（仅 owner 可进）。
+- wrapper `.sh` 脚本：`0o700`（仅 owner 执行 / `bash -n` 预检读取，不给 group/other）。
+- `.out` 输出与退出码哨兵文件：`0o600`。实现上用**子 shell 局部 `umask 077`** 创建这些内部
+  文件，**不影响用户命令自己创建的文件**（全局 `umask` 会把用户 `touch` 出来的文件也变 600，
+  故意避开）。
+
+**回收**（`session_shutdown` 按 `reason` 分类，前提：后台任务受管生命周期 = pi 进程生命周期）：
+
+| reason | 当前会话 runDir | 说明 |
+|---|---|---|
+| `quit`（pi 真正退出） | **整个删**（含 `.out`） | 进程一走任务即结束，产物全部回收 |
+| `reload` / `new` / `resume` / `fork`（进程仍在） | 只删 scriptDir，**保留 `.out`** | reload 后任务仍在 tmux 里跑、日志仍可 attach 复看；该旧 runDir 会在后续某次 shutdown 作为「本进程遗留的旧 runDir」被回收 |
+
+同时每次 `cleanup` 都会**回收历史会话产物**：扫 `outputDir` 下其它 runDir，按目录名里的创建
+`pid` 探活——pid 已死（那个 pi 早退出）或 pid == 本进程（自己遗留的旧 runDir）→ 删；pid 属于
+**另一个存活的 pi 实例** → 保留（不误删并存实例）；目录名解析不出 pid → 保守跳过。故意不杀 tmux
+窗口/会话（避免粗暴中断），回收的只是插件在磁盘上的临时产物与内存追踪状态。
+
+> 注意：pi 被 `SIGKILL` 强杀不会触发 `session_shutdown`，其残骸留待**下一个** pi 实例启动/退出时
+> 由上述历史回收清掉（届时老 pid 已死）。
 
 ## 依赖
 
@@ -83,9 +113,10 @@ tmux-bash/
 每个任务写一个一次性 wrapper `.sh`，交给 `tmux new-window -a -d -PF '#{window_id}'` 运行：
 
 ```bash
+( umask 077; : > "$out_file" )               # 内部文件 0o600（局部 umask，不污染用户命令）
 ( <用户命令> ) 2>&1 | tee -a "$out_file"   # 输出实时落盘
 rc=${PIPESTATUS[0]}                         # 取真实退出码
-printf '%s\n' "$rc" > "$exit_file.tmp"      # 先写 .tmp
+( umask 077; printf '%s\n' "$rc" > "$exit_file.tmp" )  # 先写 .tmp
 mv -f "$exit_file.tmp" "$exit_file"         # 原子出现，fs.watch 才看到完整哨兵
 exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 attach
 ```
@@ -101,12 +132,13 @@ exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 
 ## 已知限制 / TODO
 
 - **跨 `/reload` 不恢复 job 表**：reload 后内存里的 job 映射会清空，reload 前启动的任务完成时
-  不会再自动通知（任务本身仍在 tmux 里跑，可用 `bg action=list` / `tmux` 手动查）。后续可在
-  `session_start` 扫描 runDir + 窗口标签重建 job 表。
+  不会再自动通知（任务本身仍在 tmux 里跑、`.out` 日志仍保留，可用 `bg action=list` / `tmux`
+  手动查）。后续可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
 - **转后台的任务不会自动回收**：自动转后台/`background:true` 的命令除非手动 `bg action=kill`
   否则会一直保活占资源（这是相对旧 `bash-default-timeout`「120s 硬杀跑飞命令」的行为反转）。
 - **共享会话的占位窗口**：首次会建一个 `pi-bg` 占位 shell 窗口保证会话存活；`bg action=list`
-  已按标签过滤掉它。`session_shutdown` 故意不杀窗口/会话（任务要能在 pi 退出后继续）。
+  已按标签过滤掉它。`session_shutdown` 故意不杀窗口/会话（避免粗暴中断在跑的任务），仅回收
+  磁盘产物与内存追踪；按定位，后台任务受管生命周期止于 pi 退出 / reload（见「产物权限与回收」）。
 - `execFileSync` 同步调用 tmux、`fs.watch` 跨平台可靠性等，量大时可考虑加兜底轮询。
 
 ## 本地开发

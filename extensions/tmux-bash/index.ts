@@ -110,9 +110,10 @@ export default function (pi: ExtensionAPI): void {
 		updateStatus(state, ctx);
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async (event, ctx) => {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
-		cleanup(state); // 不杀 tmux 任务，让后台命令在 pi 退出后继续跑。
+		// 不杀 tmux 任务，让后台命令在 pi 退出后继续跑；reason 决定磁盘产物如何回收（见 cleanup）。
+		cleanup(state, event.reason);
 	});
 
 	// —— 覆盖内置 bash —— //

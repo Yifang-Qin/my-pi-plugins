@@ -188,8 +188,15 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
 3. **设 `timeout` = 硬杀，退出码 124，不转后台**（见 §6）。
 4. **`bg` 管理工具（新增）**：`action=list/logs/kill` 管理「自动转后台 / `background:true`」的任务
    （合并了早期 skeleton 的 `bg_start/bg_logs/bg_list/bg_kill`）。
-5. **进程生命周期**：命令交给 tmux server 持有，`session_shutdown` 故意不杀窗口/会话——后台任务
-   在 pi 退出/`/reload` 后继续存活（`cleanup` 只关 watcher、清内存 job 表）。
+5. **进程生命周期与产物回收**：命令交给 tmux server 持有，`session_shutdown` 故意不杀窗口/会话
+   （避免粗暴中断）——pi 运行期间的 `/reload` / 切换会话 / 意外崩溃不中断任务。但 `cleanup`
+   会按 `SessionShutdownEvent.reason`（`quit`/`reload`/`new`/`resume`/`fork`）**回收磁盘产物**：
+   `quit`（pi 真退）删当前会话整个 runDir（含 `.out`）；其它 reason（进程仍在）只删 scriptDir、
+   保留 `.out`；同时扫 `outputDir` 回收历史会话产物（按目录名 pid 探活：pi已死或 pid==本进程
+   → 删，属于另一存活 pi 实例→ 保留）。**定位：后台任务的受管生命周期 = pi 进程生命周期（到 pi
+   退出 / reload 为止）**。内置 bash 无此场景（Node 自持子进程，随 pi 退出而终止，无磁盘产物）。
+   产物权限一并收紧：runDir/scriptDir `0o700`、wrapper `.sh` `0o700`（含导出环境变量，可能含密钥）、
+   `.out`/哨兵 `0o600`（子 shell 局部 `umask 077`，不污染用户命令自建文件）。
 6. **`bash -n` 语法预检（新增，有意偏离）**：内置 bash 直接把命令交给 bash 运行，语法错误由
    bash 自己报（stderr + 退出码 2）；本插件的命令嵌在 wrapper 脚本里跑，若不预检，解析失败会
    表现为「窗口秒死 + 错误不可见 + 哨兵永不出现」。预检失败时文案对齐内置（stderr 正文 +
@@ -216,8 +223,9 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
       当作未设置。可加 `resolveTimeoutMs` 等价校验并返回对应 isError 文案。
 - [ ] **`details` 结构与内置不同**（§4）：内置暴露 `{ truncation, fullOutputPath }`，本插件用
       `{ exitCode, outputFile, truncated, durationMs }`。若有下游依赖内置 details 形状，需再对齐。
-- [ ] **跨 `/reload` 不恢复 job 表**：reload 前启动的任务完成时不再自动通知（任务仍在 tmux 里跑，
-      可 `bg action=list` 或 tmux 手动查）。可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
+- [ ] **跨 `/reload` 不恢复 job 表**：reload 前启动的任务完成时不再自动通知（reason=="reload" 时
+      `cleanup` 只删 scriptDir、保留 `.out`，任务仍在 tmux 里跑、日志仍在，可 `bg action=list` 或
+      tmux 手动查）。可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
 - [ ] **后台 job 的窗口死亡检测**：前台循环已检测（§7.7），但转后台/`background:true` 后只靠
       哨兵文件——被外部 `kill-window` 的后台任务不会发完成通知，job 表残留计数（经本插件
       `bg action=kill` 的会正确标记 done）。可在 watcher 侧加周期性存活巡检。

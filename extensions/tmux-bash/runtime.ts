@@ -20,14 +20,16 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	unlinkSync,
 	watch,
 	writeFileSync,
 	type FSWatcher,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, WINDOW_OPTIONS, frameBgNotify, type TmuxBashOptions } from "./config.js";
 import {
@@ -122,15 +124,16 @@ __tmux=${shellQuote(params.tmuxBinary)}
 __window_id=$("$__tmux" display-message -p -t "\${TMUX_PANE:-}" '#{window_id}' 2>/dev/null || printf '@0')
 __exit_file="$__run_dir/$__id.$__window_id"
 __out_file="$__exit_file.out"
-: > "$__out_file"
+# 收紧内部文件权限（0o600），且只在子 shell 里临时改 umask——不影响下面用户命令自己创建的文件。
+( umask 077; : > "$__out_file" )
 printf '$ %s\\n' ${shellQuote(params.displayCommand)}
 ${params.envExports}
 (
 ${params.command}
 ) 2>&1 | tee -a "$__out_file"
 __rc=\${PIPESTATUS[0]}
-# 先写 .tmp 再 mv，保证 fs.watch 看到的是完整的哨兵文件（原子出现）。
-printf '%s\\n' "$__rc" > "$__exit_file.tmp"
+# 先写 .tmp 再 mv，保证 fs.watch 看到的是完整的哨兵文件（原子出现）；同样局部 umask 收紧权限，mv 会保留 0o600。
+( umask 077; printf '%s\\n' "$__rc" > "$__exit_file.tmp" )
 mv -f "$__exit_file.tmp" "$__exit_file"
 # 命令结束后保持窗口存活、可 attach（autoClose 关闭时才真正有意义）。
 exec "\${SHELL:-/bin/bash}" -l 2>/dev/null || exec bash -l
@@ -147,7 +150,8 @@ function writeScript(state: RuntimeState, id: string, command: string, displayCo
 		displayCommand,
 		envExports: formatEnvExports(state),
 	});
-	writeFileSync(scriptPath, script, { mode: 0o755 });
+	// 脚本里内联了导出的环境变量（可能含密钥），且只需 owner 执行/预检读取 → 0o700，不给 group/other。
+	writeFileSync(scriptPath, script, { mode: 0o700 });
 	return scriptPath;
 }
 
@@ -561,21 +565,83 @@ export function listWindowsForSession(state: RuntimeState) {
 	return listTaskWindows(state.options, state.piSessionId);
 }
 
-// 会话结束/reload 时清理：关掉 watcher 和定时器，清空 job 表。
+// 会话结束/reload 时清理：关掉 watcher 和定时器，清空 job 表，并回收磁盘上的临时产物。
 // 注意：故意不杀 tmux 窗口/会话——后台任务应当在 pi 退出后继续存活。
-export function cleanup(state: RuntimeState): void {
+//
+// 磁盘回收策略（前提：正常使用下后台任务生命周期含于 pi 进程生命周期内）：
+//   1) 当前 runDir：
+//        · reason === "quit"（pi 真正退出）→ 整个删掉（含 .out），因为进程一走任务即结束。
+//        · 其它（reload/new/resume/fork，pi 进程仍在）→ 只删 scriptDir、保留 .out（可能还有
+//          后台任务在写 / 用户想 attach 复看）；该旧 runDir 会在后续某次 shutdown 作为
+//          「本进程遗留的旧 runDir」被回收。
+//   2) 其它 runDir（历史会话产物），按目录名里的创建 pid 判定：
+//        · pid 已不存在 → 那个 pi 实例早退出了，残骸，删。
+//        · pid === 本进程 pid → 本进程之前会话遗留、已孤立的旧 runDir，删。
+//        · pid 属于另一个存活的 pi 实例 → 保留，避免误删并存实例的产物。
+//        · 目录名解析不出 pid（异常/旧格式）→ 保守跳过，不删。
+export function cleanup(state: RuntimeState, reason?: string): void {
 	state.shuttingDown = true;
 	state.watcher?.close();
 	state.watcher = null;
 	for (const t of state.pendingTimers) clearTimeout(t);
 	state.pendingTimers.clear();
 	state.jobs.clear();
-	// runDir 里的 .out 是任务输出，保留；脚本目录可清。
-	if (state.scriptDir && existsSync(state.scriptDir)) {
-		try {
-			rmSync(state.scriptDir, { recursive: true, force: true });
-		} catch {
-			/* ignore */
+
+	const currentName = state.runDir ? basename(state.runDir) : null;
+
+	// 1) 当前 runDir。
+	if (state.runDir && existsSync(state.runDir)) {
+		if (reason === "quit") {
+			rmDirQuiet(state.runDir);
+		} else if (state.scriptDir && existsSync(state.scriptDir)) {
+			rmDirQuiet(state.scriptDir); // 保留 .out，仅清脚本目录
 		}
+	}
+
+	// 2) 回收历史会话产物。
+	let entries: string[];
+	try {
+		entries = readdirSync(state.options.outputDir);
+	} catch {
+		return; // 根目录还不存在，无可回收
+	}
+	for (const name of entries) {
+		if (name === currentName) continue; // 当前 runDir 已在上面处理
+		const full = join(state.options.outputDir, name);
+		try {
+			if (!statSync(full).isDirectory()) continue;
+		} catch {
+			continue;
+		}
+		const pid = parseRunDirPid(name);
+		if (Number.isNaN(pid)) continue; // 解析不出 pid，保守跳过
+		if (!pidAlive(pid) || pid === process.pid) rmDirQuiet(full);
+	}
+}
+
+function rmDirQuiet(dir: string): void {
+	try {
+		rmSync(dir, { recursive: true, force: true });
+	} catch {
+		/* ignore */
+	}
+}
+
+// runDir 目录名格式：<base64url(sessionId)>-<pid>-<hex>。base64url 可能含 '-'，故从后往前取：
+// 末段是随机 hex，倒数第二段才是创建它的 pi 进程 pid。解析不出返回 NaN。
+function parseRunDirPid(name: string): number {
+	const parts = name.split("-");
+	if (parts.length < 3) return NaN;
+	const pid = Number(parts[parts.length - 2]);
+	return Number.isInteger(pid) && pid > 0 ? pid : NaN;
+}
+
+// 判断某 pid 是否仍有存活进程（kill 0 探测；EPERM = 进程在但无权限，视为存活）。
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
