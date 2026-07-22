@@ -16,6 +16,8 @@ export interface TmuxWindow {
 	jobId?: string;
 	outputFile?: string;
 	command?: string;
+	exitCode?: number;
+	finishedAt?: number; // unix 秒
 }
 
 // 运行 tmux 子命令，失败（非零退出）时返回 null，不抛异常。
@@ -121,6 +123,8 @@ const WINDOW_FORMAT = [
 	`#{${WINDOW_OPTIONS.jobId}}`,
 	`#{${WINDOW_OPTIONS.outputFile}}`,
 	`#{${WINDOW_OPTIONS.command}}`,
+	`#{${WINDOW_OPTIONS.exitCode}}`,
+	`#{${WINDOW_OPTIONS.finishedAt}}`,
 ].join("\t");
 
 // 列出会话内所有窗口。只有带 jobId 标签的才是本插件创建的任务窗口；
@@ -131,8 +135,17 @@ export function listTaskWindows(opts: TmuxBashOptions, piSession?: string): Tmux
 	return raw
 		.split("\n")
 		.map((line): TmuxWindow => {
-			const [id = "", name = "", session = "", started = "", jobId = "", out = "", cmd = ""] =
-				line.split("\t");
+			const [
+				id = "",
+				name = "",
+				session = "",
+				started = "",
+				jobId = "",
+				out = "",
+				cmd = "",
+				exit = "",
+				finished = "",
+			] = line.split("\t");
 			return {
 				id,
 				name,
@@ -141,6 +154,8 @@ export function listTaskWindows(opts: TmuxBashOptions, piSession?: string): Tmux
 				jobId: jobId || undefined,
 				outputFile: out || undefined,
 				command: cmd || undefined,
+				exitCode: exit ? Number(exit) : undefined,
+				finishedAt: finished ? Number(finished) : undefined,
 			};
 		})
 		.filter((w) => w.jobId) // 只保留任务窗口，滤掉占位 shell 窗口

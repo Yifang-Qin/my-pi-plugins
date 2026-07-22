@@ -2,7 +2,8 @@
 
 用 tmux 后台化**覆盖 pi 内置 `bash` 工具**：命令始终在 detached 的 tmux 窗口里跑，execute
 前台同步等待并「流式转发」输出；未在前台等待窗口（默认 120s）内结束则**自动转后台**（不杀命令），
-完成后经 followUp 通知模型。另附一个 `bg` 工具管理这些后台任务。
+完成后经 steer 通知模型（若 Agent 正忙，则在当前 assistant 消息的工具全部结束后、下一次 LLM
+调用前投递）。另附一个 `bg` 工具管理这些后台任务。
 
 > 进程交给 tmux server 持有：pi 运行期间的 `/reload`、切换会话、意外崩溃都不会中断后台任务
 > （也不占 Node 事件循环）。正常退出（quit）时插件会回收本会话的磁盘产物——**后台任务的受管
@@ -17,10 +18,14 @@
 | `bash { command }`（默认） | 前台流式等待；跑满前台窗口（默认 120s）仍未结束则**自动转后台**（不杀），完成后自动通知 |
 | `bash { command, timeout: N }` | 保留内置「硬超时」语义：到点**硬杀**命令，退出码 124，**不转后台** |
 | `bash { command, background: true }` | **立即分离**，不等待（dev server / watcher / 长构建等），完成后自动通知 |
-| `bg { action, window, lines }` | 管理后台任务：`list` 列出、`logs` 读尾部输出（快照，不阻塞）、`kill` 按 `window_id` 终止 |
+| `bg { action, window, lines }` | 管理后台任务：`list` 列出运行中及本 runtime 已完成/已终止任务并显示状态、`logs` 读尾部输出（快照，不阻塞）、`kill` 按 `window_id` 终止 |
 
 - 命令完成（无论自动转后台还是 `background:true`）会收到一条 `⏻ background bash` 消息
   （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。
+- TUI footer 会显示 `bg: N running`；后台任务自然完成时由 watcher 立即刷新计数，不必等下一次
+  `bash` / `bg` 工具调用，也不受完成消息的 steer 投递时机影响。
+- `bg action=list` 优先列出活跃任务，并附最近完成/终止状态；内存最多保留 100 条终态历史，单次
+  最多输出 50 条任务（命令摘要与总输出均截断），避免任务历史无限撑大上下文和 session。
 - 结果末尾附**彩色状态行**（`✓ done · 1.2s` / `✗ exit 1` / `✗ timeout` / `✗ aborted` /
   `⧉ running in background`，合并自原独立扩展 `bash-status-line`）。
 - **`bash -n` 语法预检**：建窗口前先对 wrapper 脚本做语法校验，失败立即以 `✗ exit 2`
@@ -45,11 +50,13 @@
   - 完成检测走 `fs.watch(runDir)` 监听哨兵文件；
   - 日志读取优先读 `.out`，读不到再 `tmux capture-pane` 兜底；
   - 用 `tee -a` + `${PIPESTATUS[0]}` 拿到准确退出码。
-- **完成通知走官方 API**：`pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`，
-  等 Agent 空闲再投递并唤醒，无需模型轮询。通知内容包一层 `<background-task-notification>`
-  自描述框（协议在 `../shared/bg-notify.ts` 的 `makeBgNotifyFramer`，与 afang-subagent 共享；
-  `config.ts` 只定制引言文案），防止被降级成 `role:"user"` 后被模型误当成用户新指令；UI 渲染时
-  用 `stripBgNotifyFrame` 剥掉框。
+- **完成通知走官方 API**：`pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`。
+  Agent 空闲时立即唤醒；Agent 正忙时，通知在当前 assistant 消息的全部工具调用结束后、下一次 LLM
+  调用前投递，不会中断正在执行的工具，也不会像 followUp 那样因模型持续 `sleep` / `bg` 轮询而
+  长期饥饿。通知内容包一层 `<background-task-notification>` 自描述框（协议在
+  `../shared/bg-notify.ts` 的 `makeBgNotifyFramer`，与 afang-subagent 共享；`config.ts` 只定制引言
+  文案），防止被降级成 `role:"user"` 后被模型误当成用户新指令；UI 渲染时用
+  `stripBgNotifyFrame` 剥掉框。
 - **工作目录用 `ctx.cwd`**：不强制在 git 仓库内。
 - **tmux 调用全用 `execFileSync` 数组参数**：不拼 shell 字符串，从根上避开引号/空格问题。
 
@@ -127,7 +134,9 @@ exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 
   返回退出码 124；跑满前台窗口 → 登记 job 转后台（先登记再复查哨兵，消除切换瞬间完成的
   漏通知竞态）。
 - **后台路径**：Node 侧生成脚本 → 建窗口拿到 `@id` → 打窗口标签登记 job →
-  `fs.watch(runDir)` 等哨兵文件出现 → 读退出码 + `.out` → `pi.sendMessage` 唤醒模型。
+  `fs.watch(runDir)` 等哨兵文件出现 → 读退出码 + `.out` → 记录 `completed + exitCode` →
+  `pi.sendMessage` 以 steer 唤醒模型。完成记录保留在当前 runtime 的 job 表中，因此默认 autoClose
+  关闭 tmux 窗口后，`bg action=list` 仍会列出最终状态；`bg action=logs window=@id` 仍可读取日志。
 
 ## 已知限制 / TODO
 

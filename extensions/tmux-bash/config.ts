@@ -62,6 +62,8 @@ export const WINDOW_OPTIONS = {
 	jobId: "@pi_bg_id",
 	outputFile: "@pi_bg_out",
 	command: "@pi_bg_cmd",
+	exitCode: "@pi_bg_exit",
+	finishedAt: "@pi_bg_finished",
 } as const;
 
 // 完成通知消息的 customType（配合 registerMessageRenderer）。

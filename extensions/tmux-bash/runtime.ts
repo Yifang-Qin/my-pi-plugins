@@ -6,7 +6,7 @@
 //   - 每个任务写一个 wrapper .sh：tee 输出到 .out 文件，用 ${PIPESTATUS[0]} 取真实
 //     退出码，写入「退出码哨兵文件」，最后 exec $SHELL -l 让窗口在命令结束后仍可 attach。
 //   - 「是否完成」= 哨兵文件是否出现；用 fs.watch(runDir) 监听，完成后通过
-//     pi.sendMessage(followUp + triggerTurn) 唤醒模型。
+//     pi.sendMessage(steer + triggerTurn) 唤醒模型。
 //   - 建窗口前先用 bash -n 对 wrapper 脚本做语法预检：解析不过的命令（典型如 macOS
 //     系统 bash 3.2 对 $(…) 内 heredoc 撚号的误判）立即以 isError 返回，不会变成
 //     「窗口秒死但前台空等 120s 后误转后台」的僵尸任务。
@@ -41,15 +41,22 @@ import {
 	setWindowOptions,
 	capturePane,
 	windowExists,
+	type TmuxWindow,
 } from "./tmux.js";
+
+type JobStatus = "running" | "completed" | "killed";
+const MAX_RETAINED_FINISHED_JOBS = 100;
 
 interface Job {
 	id: string; // 我们生成的短 id（hex）
 	windowId: string; // tmux #{window_id}
+	name: string;
 	command: string;
 	outputFile: string; // runDir/<id>.<windowId>.out
 	startedAt: number; // Date.now()
-	done: boolean;
+	status: JobStatus;
+	exitCode?: number;
+	finishedAt?: number; // Date.now()
 }
 
 export interface RuntimeState {
@@ -243,7 +250,8 @@ export function startBackgroundCommand(
 		// 抛错交给 index.ts 的 catch → 「Failed to execute command: …」（isError）。
 		throw new Error(`bash -n pre-check failed; the command was never started:\n${syntaxError}`);
 	}
-	const windowId = newWindow(options, windowNameFor(command, name), cwd, scriptPath);
+	const windowName = windowNameFor(command, name);
+	const windowId = newWindow(options, windowName, cwd, scriptPath);
 	const outputFile = join(state.runDir!, `${id}.${windowId}.out`);
 
 	setWindowOptions(options, windowId, {
@@ -254,7 +262,15 @@ export function startBackgroundCommand(
 		[WINDOW_OPTIONS.command]: displayCommand,
 	});
 
-	state.jobs.set(id, { id, windowId, command: displayCommand, outputFile, startedAt: Date.now(), done: false });
+	state.jobs.set(id, {
+		id,
+		windowId,
+		name: windowName,
+		command: displayCommand,
+		outputFile,
+		startedAt: Date.now(),
+		status: "running",
+	});
 	return { jobId: id, windowId, outputFile, attach: attachHint(options, windowId) };
 }
 
@@ -349,7 +365,8 @@ export async function runForegroundBash(
 			isError: true,
 		};
 	}
-	const windowId = newWindow(options, windowNameFor(params.command, undefined), params.cwd, scriptPath);
+	const windowName = windowNameFor(params.command, undefined);
+	const windowId = newWindow(options, windowName, params.cwd, scriptPath);
 	const outputFile = join(state.runDir!, `${id}.${windowId}.out`);
 	const exitFile = join(state.runDir!, `${id}.${windowId}`);
 
@@ -440,12 +457,20 @@ export async function runForegroundBash(
 		// 未显式 timeout 且超过前台等待窗口：自动转后台（不杀），登记 job 供 watcher 通知。
 		if (hardTimeoutMs == null && elapsed >= options.foregroundTimeoutMs) {
 			// 先登记再复查哨兵文件，消除「刚好在切换瞬间完成」导致漏发通知的竞态。
-			state.jobs.set(id, { id, windowId, command: displayCommand, outputFile, startedAt, done: false });
+			state.jobs.set(id, {
+				id,
+				windowId,
+				name: windowName,
+				command: displayCommand,
+				outputFile,
+				startedAt,
+				status: "running",
+			});
 			if (existsSync(exitFile)) {
 				const exitCode = readExitCode(exitFile);
 				if (!Number.isNaN(exitCode)) {
-					const job = state.jobs.get(id);
-					if (job) job.done = true;
+					// 恰在切换点完成，仍按前台结果返回；不要把它留进「后台任务历史」。
+					state.jobs.delete(id);
 					return finishInline(exitCode);
 				}
 			}
@@ -486,7 +511,11 @@ export function readJobLogs(
 }
 
 // 启动完成监听：watch runDir，哨兵文件出现即读退出码 + .out，发完成通知唤醒模型。
-export function startWatcher(state: RuntimeState, pi: ExtensionAPI): void {
+export function startWatcher(
+	state: RuntimeState,
+	pi: ExtensionAPI,
+	onJobsChanged?: () => void,
+): void {
 	if (state.watcher || !state.runDir) return;
 	state.watcher = watch(state.runDir, (_event, filename) => {
 		if (!filename) return;
@@ -496,21 +525,27 @@ export function startWatcher(state: RuntimeState, pi: ExtensionAPI): void {
 		if (dot <= 0) return;
 		const id = name.slice(0, dot);
 		const job = state.jobs.get(id);
-		if (!job || job.done) return;
+		if (!job || job.status !== "running") return;
 		const exitPath = join(state.runDir!, name);
 		if (!existsSync(exitPath)) return;
 		// 稍等一拍确保 .out 写盘完成，再处理。
 		const timer = setTimeout(() => {
 			state.pendingTimers.delete(timer);
-			handleCompletion(state, pi, id, exitPath);
+			handleCompletion(state, pi, id, exitPath, onJobsChanged);
 		}, 40);
 		state.pendingTimers.add(timer);
 	});
 }
 
-function handleCompletion(state: RuntimeState, pi: ExtensionAPI, id: string, exitPath: string): void {
+function handleCompletion(
+	state: RuntimeState,
+	pi: ExtensionAPI,
+	id: string,
+	exitPath: string,
+	onJobsChanged?: () => void,
+): void {
 	const job = state.jobs.get(id);
-	if (!job || job.done || state.shuttingDown) return;
+	if (!job || job.status !== "running" || state.shuttingDown) return;
 	if (!existsSync(exitPath)) return;
 
 	let exitCode = NaN;
@@ -519,7 +554,21 @@ function handleCompletion(state: RuntimeState, pi: ExtensionAPI, id: string, exi
 	} catch {
 		return;
 	}
-	job.done = true;
+	job.status = "completed";
+	job.exitCode = exitCode;
+	job.finishedAt = Date.now();
+	// 状态先落地再通知 UI：即使 steer 尚在等待当前工具批次结束，footer 也应立即反映真实运行数。
+	// UI 刷新失败不能阻断终态标签、日志读取与完成消息投递。
+	try {
+		onJobsChanged?.();
+	} catch {
+		/* ignore UI refresh errors */
+	}
+	// autoClose=false 或 reload 后，内存历史/哨兵可能消失；把终态也写进 tmux 标签，窗口仍在时可恢复。
+	setWindowOptions(state.options, job.windowId, {
+		[WINDOW_OPTIONS.exitCode]: String(exitCode),
+		[WINDOW_OPTIONS.finishedAt]: String(Math.floor(job.finishedAt / 1000)),
+	});
 
 	const { text, truncated } = readJobLogs(state, job.windowId, job.outputFile, state.options.maxLines);
 	const durSec = ((Date.now() - job.startedAt) / 1000).toFixed(1);
@@ -552,13 +601,138 @@ function handleCompletion(state: RuntimeState, pi: ExtensionAPI, id: string, exi
 				durationMs: Date.now() - job.startedAt,
 			},
 		},
-		{ deliverAs: "followUp", triggerTurn: true },
+		// steer：若 Agent 正在跑工具，则在当前 assistant 消息的全部工具结束后、下一次 LLM 调用前投递；
+		// 避免 followUp 因模型持续 sleep/bg 轮询而永远等不到 Agent 收尾。
+		{ deliverAs: "steer", triggerTurn: true },
 	);
+	pruneFinishedJobs(state);
+}
+
+function pruneFinishedJobs(state: RuntimeState): void {
+	const finished = [...state.jobs.values()]
+		.filter((job) => job.status !== "running")
+		.sort((a, b) => (a.finishedAt ?? a.startedAt) - (b.finishedAt ?? b.startedAt));
+	for (const job of finished.slice(0, Math.max(0, finished.length - MAX_RETAINED_FINISHED_JOBS))) {
+		state.jobs.delete(job.id);
+	}
+}
+
+// bg list/kill 的 fs.watch 兜底：若哨兵已经存在但 watcher 尚未处理（或漏事件），同步完成状态、
+// autoClose 并发送 steer。返回本次补处理的任务数。
+export function reconcileCompletedJobs(state: RuntimeState, pi: ExtensionAPI): number {
+	let completed = 0;
+	for (const job of [...state.jobs.values()]) {
+		if (job.status !== "running" || !job.outputFile.endsWith(".out")) continue;
+		const exitPath = job.outputFile.slice(0, -4);
+		if (!existsSync(exitPath)) continue;
+		handleCompletion(state, pi, job.id, exitPath);
+		if (state.jobs.get(job.id)?.status === "completed") completed++;
+	}
+	return completed;
+}
+
+export function markJobKilled(state: RuntimeState, windowId: string): boolean {
+	const job = [...state.jobs.values()].find((candidate) => candidate.windowId === windowId);
+	if (!job || job.status !== "running") return false;
+	job.status = "killed";
+	job.finishedAt = Date.now();
+	pruneFinishedJobs(state);
+	return true;
 }
 
 // 当前 pi 会话仍在运行的任务数（供状态栏显示）。
 export function runningCount(state: RuntimeState): number {
-	return [...state.jobs.values()].filter((j) => !j.done).length;
+	return [...state.jobs.values()].filter((j) => j.status === "running").length;
+}
+
+export type BackgroundJobStatus = JobStatus | "missing";
+
+export interface BackgroundJobInfo {
+	jobId?: string;
+	windowId: string;
+	name: string;
+	command: string;
+	outputFile?: string;
+	startedAt?: number; // Date.now() 毫秒
+	finishedAt?: number; // Date.now() 毫秒
+	status: BackgroundJobStatus;
+	exitCode?: number;
+}
+
+// 从残留的退出码哨兵恢复 reload 前任务的完成状态。正常 watcher 已处理的任务会删除哨兵，
+// 但它们仍在 state.jobs 中；这里只服务「窗口标签还在、内存 job 表已丢」的 reload 场景。
+function readWindowCompletion(outputFile: string | undefined): { exitCode: number; finishedAt?: number } | null {
+	if (!outputFile?.endsWith(".out")) return null;
+	const exitFile = outputFile.slice(0, -4);
+	if (!existsSync(exitFile)) return null;
+	const exitCode = readExitCode(exitFile);
+	if (Number.isNaN(exitCode)) return null;
+	try {
+		return { exitCode, finishedAt: statSync(exitFile).mtimeMs };
+	} catch {
+		return { exitCode };
+	}
+}
+
+function readTaggedWindowCompletion(window: TmuxWindow | undefined): { exitCode: number; finishedAt?: number } | null {
+	if (window?.exitCode === undefined || !Number.isFinite(window.exitCode)) return null;
+	return {
+		exitCode: window.exitCode,
+		finishedAt: window.finishedAt === undefined ? undefined : window.finishedAt * 1000,
+	};
+}
+
+// 列出当前 pi 会话已知的后台任务：运行中任务来自 tmux 窗口，已完成/已 kill 的任务保留在
+// state.jobs 中，因此即使 autoClose 已关闭窗口，bg list 仍能显示最终状态。
+export function listJobsForSession(state: RuntimeState): BackgroundJobInfo[] {
+	const windows = listTaskWindows(state.options, state.piSessionId);
+	const windowById = new Map(windows.map((w) => [w.id, w]));
+	const result: BackgroundJobInfo[] = [];
+
+	for (const job of state.jobs.values()) {
+		const window = windowById.get(job.windowId);
+		windowById.delete(job.windowId);
+		// fs.watch 的 40ms 处理窗口内（或偶发漏事件时），bg list 也可直接从哨兵识别完成；
+		// 这里只影响快照，不修改 job.status，以免抢先阻止 watcher 正常发送 steer 通知。
+		const recoveredCompletion =
+			job.status === "running"
+				? readTaggedWindowCompletion(window) ?? readWindowCompletion(job.outputFile)
+				: null;
+		result.push({
+			jobId: job.id,
+			windowId: job.windowId,
+			name: window?.name ?? job.name,
+			command: window?.command ?? job.command,
+			outputFile: window?.outputFile ?? job.outputFile,
+			startedAt: job.startedAt,
+			finishedAt: job.finishedAt ?? recoveredCompletion?.finishedAt,
+			status:
+				recoveredCompletion !== null
+					? "completed"
+					: job.status === "running" && !window
+						? "missing"
+						: job.status,
+			exitCode: job.exitCode ?? recoveredCompletion?.exitCode,
+		});
+	}
+
+	// reload 后窗口仍在，但新 runtime 的 state.jobs 不含旧任务；优先借残留哨兵识别已完成状态。
+	for (const window of windowById.values()) {
+		const completion = readTaggedWindowCompletion(window) ?? readWindowCompletion(window.outputFile);
+		result.push({
+			jobId: window.jobId,
+			windowId: window.id,
+			name: window.name,
+			command: window.command ?? "",
+			outputFile: window.outputFile,
+			startedAt: window.startedAt === undefined ? undefined : window.startedAt * 1000,
+			finishedAt: completion?.finishedAt,
+			status: completion ? "completed" : "running",
+			exitCode: completion?.exitCode,
+		});
+	}
+
+	return result.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
 }
 
 export function listWindowsForSession(state: RuntimeState) {

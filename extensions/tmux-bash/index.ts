@@ -2,7 +2,7 @@
 //
 //   - 覆盖内置 bash（同名 registerTool 完全替换）：命令始终在 detached tmux 窗口里跑，
 //     execute 前台同步等待并「流式转发」输出；未显式 timeout 时等 PI_TMUX_BASH_FOREGROUND_TIMEOUT
-//     秒（默认 120s）超时「自动转后台」（不杀命令），完成后经 followUp 自动通知模型；
+//     秒（默认 120s）超时「自动转后台」（不杀命令），完成后经 steer 自动通知模型；
 //     显式 timeout 时保留内置「硬超时杀死（退出码 124）」语义，不转后台。
 //   - background:true 立即后台，不等待（取代旧的 bg_start，用于 dev server / watcher 等）。
 //   - 新增 bg 管理工具（action=list/logs/kill）管理转后台/显式后台的任务。
@@ -13,13 +13,16 @@
 
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateLine, truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
 import {
 	cleanup,
 	createState,
+	listJobsForSession,
 	listWindowsForSession,
+	markJobKilled,
 	readJobLogs,
+	reconcileCompletedJobs,
 	resetRunDir,
 	runForegroundBash,
 	runningCount,
@@ -30,6 +33,8 @@ import {
 import { killWindow, tmuxAvailable } from "./tmux.js";
 
 const STATUS_KEY = "tmux-bash";
+const MAX_BG_LIST_JOBS = 50;
+const MAX_BG_COMMAND_CHARS = 300;
 // 从内置 bash 的非零退出文案里回捞退出码（合并自原 bash-status-line 扩展）。
 const EXIT_CODE_PATTERN = /Command exited with code (\d+)/;
 
@@ -80,12 +85,19 @@ function reply(text: string, details: unknown = null, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
 }
 
-function fmtAge(startedAtSec: number | undefined): string {
-	if (!startedAtSec) return "?";
-	const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAtSec));
+function fmtDuration(startedAt: number | undefined, finishedAt?: number): string {
+	if (!startedAt) return "?";
+	const s = Math.max(0, Math.floor(((finishedAt ?? Date.now()) - startedAt) / 1000));
 	if (s < 60) return `${s}s`;
 	if (s < 3600) return `${Math.floor(s / 60)}m`;
 	return `${Math.floor(s / 3600)}h`;
+}
+
+function fmtJobStatus(job: { status: string; exitCode?: number }): string {
+	if (job.status === "completed") return `completed exit ${job.exitCode ?? "?"}`;
+	if (job.status === "killed") return "killed";
+	if (job.status === "missing") return "window missing";
+	return "running";
 }
 
 function updateStatus(state: RuntimeState, ctx: { hasUI: boolean; ui: { setStatus: (k: string, v?: string) => void } }): void {
@@ -110,7 +122,7 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		resetRunDir(state, ctx.sessionManager.getSessionId());
-		startWatcher(state, pi);
+		startWatcher(state, pi, () => updateStatus(state, ctx));
 		updateStatus(state, ctx);
 	});
 
@@ -276,12 +288,41 @@ export default function (pi: ExtensionAPI): void {
 			if (!tmuxAvailable(state.options)) return reply("tmux is unavailable.", null, true);
 
 			if (params.action === "list") {
-				const windows = listWindowsForSession(state);
-				if (windows.length === 0) return reply("No background jobs running in this session.");
-				const lines = windows.map(
-					(w) => `${w.id}  [${fmtAge(w.startedAt)}]  ${w.name}  $ ${w.command ?? ""}`.trimEnd(),
-				);
-				return reply(lines.join("\n"), { windows });
+				reconcileCompletedJobs(state, pi);
+				updateStatus(state, ctx);
+				const allJobs = listJobsForSession(state);
+				if (allJobs.length === 0) return reply("No background jobs recorded in this session.");
+				const activeJobs = allJobs.filter((job) => job.status === "running" || job.status === "missing");
+				const finishedJobs = allJobs
+					.filter((job) => job.status !== "running" && job.status !== "missing")
+					.sort((a, b) => (a.finishedAt ?? a.startedAt ?? 0) - (b.finishedAt ?? b.startedAt ?? 0));
+				const selectedJobs =
+					activeJobs.length >= MAX_BG_LIST_JOBS
+						? activeJobs.slice(-MAX_BG_LIST_JOBS)
+						: [...activeJobs, ...finishedJobs.slice(-(MAX_BG_LIST_JOBS - activeJobs.length))].sort(
+								(a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0),
+							);
+				const omittedJobs = Math.max(0, allJobs.length - selectedJobs.length);
+				const jobs = selectedJobs.map((job) => ({
+					...job,
+					command: truncateLine(job.command, MAX_BG_COMMAND_CHARS).text,
+				}));
+				const lines = jobs.map((job) => {
+					const status = fmtJobStatus(job);
+					const duration = fmtDuration(job.startedAt, job.finishedAt);
+					return `${job.windowId}  [${status} · ${duration}]  ${job.name}  $ ${job.command}`.trimEnd();
+				});
+				if (omittedJobs > 0) lines.unshift(`[${omittedJobs} older background jobs omitted]`);
+				const snapshot = truncateTail(lines.join("\n"), {
+					maxLines: state.options.maxLines,
+					maxBytes: state.options.maxBytes,
+				});
+				const footer = snapshot.truncated ? "\n\n[background job list truncated]" : "";
+				return reply(`${snapshot.content}${footer}`, {
+					jobs,
+					totalJobs: allJobs.length,
+					truncated: snapshot.truncated || omittedJobs > 0,
+				});
 			}
 
 			if (!params.window) {
@@ -298,10 +339,19 @@ export default function (pi: ExtensionAPI): void {
 				return reply(`${text}${footer}`, { window: params.window, truncated, fullPath });
 			}
 
-			// action === "kill"
+			// action === "kill"。先后各对一次哨兵，避免「命令已完成、40ms watcher 尚未处理」时误标 killed。
+			reconcileCompletedJobs(state, pi);
 			const ok = killWindow(state.options, params.window);
-			const job = [...state.jobs.values()].find((j) => j.windowId === params.window);
-			if (job) job.done = true;
+			reconcileCompletedJobs(state, pi);
+			const job = [...state.jobs.values()].find((candidate) => candidate.windowId === params.window);
+			if (job?.status === "completed") {
+				updateStatus(state, ctx);
+				const text = ok
+					? `Background job in window ${params.window} had already completed; closed its retained tmux window.`
+					: `Background job in window ${params.window} had already completed (exit ${job.exitCode ?? "?"}).`;
+				return reply(text, { window: params.window, status: job.status, exitCode: job.exitCode });
+			}
+			if (ok) markJobKilled(state, params.window);
 			updateStatus(state, ctx);
 			return ok
 				? reply(`Killed background job in window ${params.window}.`, { window: params.window })

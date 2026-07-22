@@ -179,15 +179,19 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
 这是相对内置 bash **有意为之**的行为差异，也是本插件存在的理由：
 
 1. **`background:true`（新增参数）**：立即在后台 tmux 窗口启动、立刻返回 `windowId`，不等待；
-   完成时经 `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })` 自动通知模型。
+   完成时经 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })` 自动通知模型：若 Agent
+   正忙，在当前 assistant 消息的工具调用全部结束后、下一次 LLM 调用前投递。
    适合 dev server / watcher / 长构建。
 2. **未设 `timeout` = 前台等待 + 自动转后台**：前台同步等 `PI_TMUX_BASH_FOREGROUND_TIMEOUT`
    秒（默认 120s，`config.ts` 的 `foregroundTimeoutMs`）。命令在此窗口内结束 → 返回最终结果
    （形状对齐内置，见 §4/§5/§6）；超过等待窗口仍未结束 → **不杀**，登记为后台 job 交给
-   `fs.watch` 监听，返回一条「moved to background」提示，完成后 followUp 通知。**模型无需轮询。**
+   `fs.watch` 监听，返回一条「moved to background」提示，完成后 steer 通知。**模型无需轮询。**
 3. **设 `timeout` = 硬杀，退出码 124，不转后台**（见 §6）。
-4. **`bg` 管理工具（新增）**：`action=list/logs/kill` 管理「自动转后台 / `background:true`」的任务
-   （合并了早期 skeleton 的 `bg_start/bg_logs/bg_list/bg_kill`）。
+4. **`bg` 管理工具（新增）**：`action=list/logs/kill` 管理「自动转后台 / `background:true`」的任务。
+   `list` 合并 tmux 活窗口与当前 runtime 的 job 历史，显示 `running` / `completed exit N` / `killed` /
+   `window missing`；因此默认 autoClose 关闭已完成窗口后，最终状态与日志仍可查询。终态历史最多
+   保留 100 条，单次列表最多输出 50 条并优先活跃任务（合并了早期 skeleton 的
+   `bg_start/bg_logs/bg_list/bg_kill`）。
 5. **进程生命周期与产物回收**：命令交给 tmux server 持有，`session_shutdown` 故意不杀窗口/会话
    （避免粗暴中断）——pi 运行期间的 `/reload` / 切换会话 / 意外崩溃不中断任务。但 `cleanup`
    会按 `SessionShutdownEvent.reason`（`quit`/`reload`/`new`/`resume`/`fork`）**回收磁盘产物**：
