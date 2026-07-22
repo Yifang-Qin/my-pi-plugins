@@ -18,12 +18,13 @@
 | `bash { command }`（默认） | 前台流式等待；跑满前台窗口（默认 120s）仍未结束则**自动转后台**（不杀），完成后自动通知 |
 | `bash { command, timeout: N }` | 保留内置「硬超时」语义：到点**硬杀**命令，退出码 124，**不转后台** |
 | `bash { command, background: true }` | **立即分离**，不等待（dev server / watcher / 长构建等），完成后自动通知 |
-| `bg { action, window, lines }` | 管理后台任务：`list` 列出运行中及本 runtime 已完成/已终止任务并显示状态、`logs` 读尾部输出（快照，不阻塞）、`kill` 按 `window_id` 终止 |
+| `bg { action, window, lines }` | 管理后台任务：`list` 列出运行中及本 runtime 已完成/已终止任务并显示状态、`logs` 按需读取尾部输出（快照，不阻塞，禁止用作轮询等待）、`kill` 按 `window_id` 终止 |
 
 - 命令完成（无论自动转后台还是 `background:true`）会收到一条 `⏻ background bash` 消息
   （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。
-- 工具的静态 prompt guideline 与转后台后的返回消息都会明确告诉模型：可以继续工作或正常结束当前
-  turn，无需等待或轮询；若任务在会话仍活动、Agent 已空闲时完成，通知会自动拉起新 turn。
+- 工具描述、静态 prompt guideline 与转后台后的返回消息都会明确告诉模型：后台化后**禁止**通过
+  `bash sleep`、轮询循环或反复调用 `bg list/logs` 等待完成；只能继续与该任务无关的有效工作，否则应
+  立即结束当前 turn。任务完成后，通知会在会话空闲时自动拉起新 turn。
 - TUI footer 会显示 `bg: N running`；后台任务自然完成时由 watcher 立即刷新计数，不必等下一次
   `bash` / `bg` 工具调用，也不受完成消息的 steer 投递时机影响。
 - `bg action=list` 优先列出活跃任务，并附最近完成/终止状态；内存最多保留 100 条终态历史，单次

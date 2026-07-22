@@ -54,7 +54,7 @@ const BashParams = Type.Object({
 	background: Type.Optional(
 		Type.Boolean({
 			description:
-				"Start immediately in the background and return at once (do not wait). Use for dev servers, watchers, or tasks you explicitly want detached. A completion message is delivered automatically when it finishes.",
+				"Start immediately in the background and return at once. Use for dev servers, watchers, or tasks you explicitly want detached. Do not wait or poll after starting it; completion is delivered automatically.",
 		}),
 	),
 });
@@ -77,9 +77,10 @@ const BASH_DESCRIPTION =
 	"Execute a shell command in the current working directory. Returns stdout and stderr (merged), " +
 	"truncated to the last 2000 lines / 50KB (full output saved to a temp file when truncated). " +
 	"Output streams live while the command runs. If it does not finish within the foreground wait window " +
-	"(default 120s), it is automatically moved to a background tmux window and keeps running — a completion " +
-	"message is delivered automatically when it finishes, so do NOT poll for it. Set timeout to enforce a hard " +
-	"kill at the deadline instead (exit code 124, no background handoff). Set background:true to detach immediately.";
+	"(default 120s), it is automatically moved to a background tmux window and keeps running. Completion is " +
+	"delivered automatically. Once backgrounded, do NOT wait for it or check merely to detect completion: never " +
+	"call bash with sleep/polling loops or repeatedly call bg list/logs. Set timeout to enforce a hard kill at the " +
+	"deadline instead (exit code 124, no background handoff). Set background:true to detach immediately.";
 
 function reply(text: string, details: unknown = null, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
@@ -138,11 +139,11 @@ export default function (pi: ExtensionAPI): void {
 		label: "bash",
 		description: BASH_DESCRIPTION,
 		promptGuidelines: [
-			"Use bash for shell commands; a long command auto-moves to the background after ~120s and notifies on completion — do not poll for it.",
+			"Use bash for shell commands; a long command auto-moves to the background after ~120s and notifies on completion — never wait or poll for it.",
 			"Set bash timeout only when you want a hard kill at the deadline (exit code 124), not a background handoff.",
 			"Set bash background:true to detach immediately (dev servers, watchers, long builds).",
-			"After bash starts a background job, continue other work or end your turn normally. Do not wait or poll: if the job finishes while this session is active and you are idle, its completion notification automatically triggers a new turn.",
-			"Use bg (action=list/logs/kill) to inspect or stop background jobs started by bash.",
+			"Once bash reports a background job, NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished. Continue only with independent useful work; otherwise end your turn immediately. Its completion notification will automatically trigger a new turn when the session is idle.",
+			"Use bg list/logs only for deliberate inspection, never as a waiting strategy; use bg kill to stop a background job.",
 		],
 		parameters: BashParams,
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -159,9 +160,9 @@ export default function (pi: ExtensionAPI): void {
 								type: "text" as const,
 								text: [
 									`Started background job ${r.jobId} in tmux window ${r.windowId}.`,
-									"Continue other work or end your turn normally; do not wait or poll.",
-									"If it finishes while this session is active and you are idle, the completion message will automatically trigger a new turn.",
-									`Peek: bg action=logs window=${r.windowId} · Stop: bg action=kill window=${r.windowId}`,
+									"The command is already detached. Do not wait for it: NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished.",
+									"Continue only with independent useful work; otherwise end your turn now. Completion is delivered automatically and will trigger a new turn when the session is idle.",
+									`For deliberate manual inspection only (not polling): bg action=logs window=${r.windowId} · Stop: bg action=kill window=${r.windowId}`,
 									`Attach: ${r.attach}`,
 								].join("\n"),
 							},
@@ -278,12 +279,12 @@ export default function (pi: ExtensionAPI): void {
 		label: "Background jobs",
 		description:
 			"Manage background bash jobs (those auto-moved to background after the foreground wait, or started with " +
-			"bash background:true). action=list shows running jobs; action=logs peeks the TAIL (most recent lines) of " +
-			"one job's output (snapshot, never blocks) — read the full-log path it prints for the complete log; " +
-			"action=kill stops a job by window id.",
-		promptSnippet: "Manage background bash jobs: list running, peek logs, or kill by window id",
+			"bash background:true). action=list shows running jobs; action=logs deliberately inspects the TAIL (most " +
+			"recent lines) of one job's output (snapshot, never blocks) — never use list/logs repeatedly to wait for " +
+			"completion; read the full-log path it prints for the complete log. action=kill stops a job by window id.",
+		promptSnippet: "Manage background bash jobs: deliberately inspect status/logs, or kill by window id; never poll",
 		promptGuidelines: [
-			"Use bg action=list to see background jobs, action=logs window=@id to peek output, action=kill window=@id to stop one.",
+			"Use bg action=list or action=logs only for deliberate inspection, never repeatedly to wait for completion; use bg action=kill window=@id to stop one.",
 		],
 		parameters: BgParams,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
