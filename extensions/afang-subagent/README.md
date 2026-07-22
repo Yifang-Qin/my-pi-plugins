@@ -8,7 +8,7 @@
 
 - [x] 后台 / 异步执行（`background: true` fire-and-forget，主 agent 不阻塞；完成时
       `sendMessage + triggerTurn + steer` 通知，防抖合并；结果落盘 `~/.pi/agent/subagent-results/`）
-- [x] 递归深度护栏（`PI_SUBAGENT_DEPTH`，默认最多两层嵌套，见下方「与官方版的差异」）
+- [x] 递归深度护栏（`PI_SUBAGENT_DEPTH`，默认只允许主会话委派一层，见下方「与官方版的差异」）
 - [ ] 子 agent session 持久化与恢复（多轮追问同一子 agent）
 - [ ] 运行中 steering（中途向子 agent 追加指令）
 - [ ] workflow 的代码侧编排（DAG / 状态机，不依赖 prompt 模板）
@@ -36,11 +36,11 @@
 ## 与官方版的差异
 
 - **递归深度护栏（`PI_SUBAGENT_DEPTH`）**：spawn 子 pi 时注入 `PI_SUBAGENT_DEPTH = 当前深度 + 1`
-  （主 session 深度 0）；达到上限（默认 2，可用 `PI_SUBAGENT_MAX_DEPTH` 覆盖）的子进程**不再注册**
+  （主 session 深度 0）；达到上限（默认 1，可用 `PI_SUBAGENT_MAX_DEPTH` 覆盖）的子进程**不再注册**
   `subagent` / `subagent_tasks` 工具，模型看不见工具即无法继续嵌套。默认效果：主 session →
-  subagent（深度 1，仍可再派）→ 孙辈 subagent（深度 2，无 subagent 工具）。倒数第一层的工具描述
-  会附加提示，告知模型其子 agent 无法继续委派，避免写出依赖更深嵌套的任务。此前唯一的闸门是
-  `--tools` 白名单（worker 未限制工具，可无限递归）。
+  subagent（深度 1，无 subagent 工具），因此 subagent 不可再派下一层。主 session 的工具描述会附加
+  提示，告知模型其子 agent 无法继续委派，避免写出依赖嵌套委派的任务。此前唯一的闸门是 `--tools`
+  白名单（worker 未限制工具，可无限递归）。
 - agent 未指定 `model` 时继承主会话当前模型（官方版不指定则回退 pi 默认模型）
 - **内建 agent 注册进工具描述（system prompt 常驻可见）**：注册时扫描扩展自带 `agents/*.md`，
   把名字 + description 写入 `subagent` 工具描述，模型冷启动即可"看菜下单"；描述随 `/reload`

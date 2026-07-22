@@ -43,7 +43,7 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 // 递归深度护栏：主 session 深度 0，每 spawn 一层子 pi 就把 PI_SUBAGENT_DEPTH +1 传下去。
 // 达到上限的子进程干脆不注册 subagent / subagent_tasks 工具（模型看不见，天然无法再派）。
-// 默认上限 2：主 session(0) 派的 subagent(1) 最多再派一层(2)；可用 PI_SUBAGENT_MAX_DEPTH 覆盖。
+// 默认上限 1：主 session(0) 可派 subagent(1)，但 subagent 不可再派；可用 PI_SUBAGENT_MAX_DEPTH 覆盖。
 function parseIntEnv(name: string, fallback: number): number {
 	const raw = process.env[name];
 	if (!raw) return fallback;
@@ -51,7 +51,7 @@ function parseIntEnv(name: string, fallback: number): number {
 	return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 const SUBAGENT_DEPTH = parseIntEnv("PI_SUBAGENT_DEPTH", 0);
-const SUBAGENT_MAX_DEPTH = Math.max(1, parseIntEnv("PI_SUBAGENT_MAX_DEPTH", 2));
+const SUBAGENT_MAX_DEPTH = Math.max(1, parseIntEnv("PI_SUBAGENT_MAX_DEPTH", 1));
 const SUBAGENT_DEPTH_EXHAUSTED = SUBAGENT_DEPTH >= SUBAGENT_MAX_DEPTH;
 
 // 子进程环境：spawn 时现算（而非模块加载时快照），保证继承当前 process.env 的最新状态。
