@@ -33,6 +33,10 @@ const STATUS_KEY = "tmux-bash";
 // 从内置 bash 的非零退出文案里回捞退出码（合并自原 bash-status-line 扩展）。
 const EXIT_CODE_PATTERN = /Command exited with code (\d+)/;
 
+// renderCall/renderResult 之间共享、跨重绘持久的渲染态（= tool-execution 的 rendererState）：
+// 前台运行中的实时计时器，对齐内置 bash 的 "Elapsed X.Xs" 活计时。
+type TimerState = { startedAt?: number; interval?: ReturnType<typeof setInterval> };
+
 // 内置 bash 形状（command + timeout）保持不变，仅新增 background 开关。见 BUILTIN-BASH-REFERENCE.md §2/§7。
 const BashParams = Type.Object({
 	command: Type.String({ description: "The shell command to execute" }),
@@ -168,6 +172,9 @@ export default function (pi: ExtensionAPI): void {
 		},
 
 		renderCall(args, theme, context) {
+			// 执行一开始就打点，供 renderResult 的实时计时器读取（对齐内置 bash：executionStarted 时记 startedAt）。
+			const st = context?.state as TimerState | undefined;
+			if (st && context?.executionStarted && st.startedAt === undefined) st.startedAt = Date.now();
 			const command = args?.command ?? "";
 			const lines = command.split("\n");
 			const maxLines = context?.expanded ? Infinity : 3;
@@ -181,14 +188,29 @@ export default function (pi: ExtensionAPI): void {
 
 		renderResult(result, options, theme, context) {
 			const output = result.content?.[0]?.type === "text" ? result.content[0].text : "";
-			// 运行中（流式）：只显示 Running + 尾部预览，不加状态行。
+			const st = context?.state as TimerState | undefined;
+			// 运行中（流式）：预览在上、Running · X.Xs 实时计时行在下——与完成后的 ✓ done 状态行同一个位置。
 			if (options?.isPartial) {
-				let t = theme.fg("muted", "Running");
-				const preview = output.trim();
-				if (preview) {
-					t += "\n" + preview.split("\n").slice(-5).map((l) => theme.fg("dim", l)).join("\n");
+				// 起一个每秒重绘的活计时器，让 Running · X.Xs 跟着涨（对齐内置 bash 的 setInterval → invalidate）。
+				if (st && st.startedAt !== undefined && !st.interval && context?.invalidate) {
+					st.interval = setInterval(() => context.invalidate(), 1000);
 				}
-				return new Text(t, 0, 0);
+				const elapsed =
+					st?.startedAt !== undefined ? ` · ${Math.floor((Date.now() - st.startedAt) / 1000)}s` : "";
+				const preview = output.trim();
+				const previewBody = preview
+					? preview.split("\n").slice(-5).map((l) => theme.fg("dim", l)).join("\n")
+					: "";
+				const runningLine = theme.fg("muted", `Running${elapsed}`);
+				const wrapper = new Container();
+				if (previewBody) wrapper.addChild(new Text(previewBody, 0, 0));
+				wrapper.addChild(new Text(previewBody ? `\n${runningLine}` : runningLine, 0, 0));
+				return wrapper;
+			}
+			// 已结束（含 error / 转后台）：停掉活计时器；最终总耗时仍由下方状态行用 details.durationMs 显示。
+			if (st?.interval) {
+				clearInterval(st.interval);
+				st.interval = undefined;
 			}
 
 			// 输出主体（15 行折叠 / expanded 全展开）。

@@ -208,6 +208,17 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    `Command's tmux window … disappeared without recording an exit code …`，`details.exitCode: -1`
    （约定值，区别于 124/130）；检测到死亡后先留 200ms 复查哨兵，消除「刚写完哨兵就关窗」的
    竞态。内置 bash 无对应场景（Node 自持子进程，进程死亡即 close 事件）。
+8. **运行中实时计时器（渲染层，对齐内置 `renderResult`）**：内置 bash 的 `renderResult` 在
+   `isPartial` 时会 `setInterval(() => context.invalidate(), 1000)` 每秒重绘，底部显示活计时
+   `Elapsed X.Xs`、完成后变 `Took X.Xs`（计时点由 `renderCall` 在 `executionStarted` 打的
+   `state.startedAt`）。因本插件用同名 `registerTool` 完全替换 bash（含 `renderCall`/`renderResult`），
+   内置那套计时器被整体遮蔽（见 `tool-execution.ts` 的 `renderResult ?? builtInToolDefinition.renderResult`），
+   故在本插件 `renderResult` 里重新实现：`renderCall` 于 `executionStarted` 打点 `context.state.startedAt`；
+   `isPartial` 分支起每秒 `invalidate` 的活计时器，在**预览下方**显示 `Running · Ns`；结束 / error /
+   转后台时 `clearInterval` 收尾。有意的差异：① 运行中用**整数秒**（`Math.floor`，避免一位小数悬垂的
+   观感），完成后的总耗时改用 `details.durationMs`（runtime 实测，非渲染侧时钟）拼进末尾状态行
+   `✓ done · X.Xs`（保留一位小数）；② 文案用本插件状态行风格 `Running` / `✓ done`，而非内置的
+   `Elapsed` / `Took`；③ 运行中与完成后的状态行**同一个位置**（预览在上、状态行在下，两分支结构对称）。
 
 竞态处理：自动转后台的切换点先 `state.jobs.set(...)` 登记再复查哨兵文件，消除「恰在切换瞬间
 完成」导致 `fs.watch` 漏发通知的窗口（见 `runForegroundBash`）。
