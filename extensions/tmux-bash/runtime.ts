@@ -481,7 +481,8 @@ export async function runForegroundBash(
 						type: "text",
 						text: [
 							`Command still running after ${waitSec}s — moved to background as job ${id} (tmux window ${windowId}).`,
-							`A completion message will arrive when it finishes; continue other work — do NOT poll for it.`,
+							"Continue other work or end your turn normally; do not wait or poll.",
+							"If it finishes while this session is active and you are idle, the completion message will automatically trigger a new turn.",
 							`Peek: bg action=logs window=${windowId} · Stop: bg action=kill window=${windowId}`,
 							`Attach: ${attachHint(options, windowId)}`,
 						].join("\n"),

@@ -4,8 +4,9 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
+ * Supports four execution modes:
  *   - Single: { agent: "name", task: "..." }
+ *   - Background: { agent: "name", task: "...", background: true }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
@@ -499,9 +500,10 @@ const SubagentParams = Type.Object({
 //
 // A background subagent is spawned detached from the tool call: the tool
 // returns a task id immediately, and when the child process exits we inject a
-// custom message (sendMessage + triggerTurn, deliverAs "followUp") so the main
-// agent picks up the result without blocking. Full results are also written to
-// ~/.pi/agent/subagent-results/ so they survive compaction and /reload.
+// custom message (sendMessage + triggerTurn, deliverAs "steer") so the main
+// agent picks up the result before its next LLM call without blocking. Full
+// results are also written to ~/.pi/agent/subagent-results/ so they survive
+// compaction and /reload.
 // ────────────────────────────────────────────────────────────────────────────
 
 const BG_NOTIFY_CUSTOM_TYPE = "afang-subagent-notify";
@@ -651,7 +653,9 @@ function flushBgNotify(): void {
 	try {
 		piApi.sendMessage(
 			{ customType: BG_NOTIFY_CUSTOM_TYPE, content: frameBgNotify(content), display: true, details: { taskIds: items.map((t) => t.id) } },
-			{ triggerTurn: true, deliverAs: "followUp" },
+			// 与 tmux-bash 对齐：当前工具批次结束后、下一次 LLM 调用前投递，避免 followUp
+			// 因主 Agent 持续调用工具而长期饥饿。
+			{ triggerTurn: true, deliverAs: "steer" },
 		);
 	} catch {
 		/* session may be shutting down */
@@ -967,6 +971,9 @@ export default function (pi: ExtensionAPI) {
 					]
 				: []),
 		].join("\n"),
+		promptGuidelines: [
+			"After subagent starts a background task, continue other work or end your turn normally. Do not wait or poll: if the task finishes while this session is active and you are idle, its completion notification automatically triggers a new turn.",
+		],
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -1083,7 +1090,12 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Started background ${started.id} (agent: ${started.agentName}). You will be notified when it completes; no need to poll. Use subagent_tasks {action:"status"|"result"|"cancel", id:"${started.id}"} to manage it.`,
+							text: [
+								`Started background ${started.id} (agent: ${started.agentName}).`,
+								"Continue other work or end your turn normally; do not wait or poll.",
+								"If it finishes while this session is active and you are idle, the completion notification will automatically trigger a new turn.",
+								`Use subagent_tasks {action:"status"|"result"|"cancel", id:"${started.id}"} to manage it.`,
+							].join("\n"),
 						},
 					],
 					details: { ...makeDetails("background")([]), bgTaskId: started.id },

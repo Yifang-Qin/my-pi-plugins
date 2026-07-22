@@ -7,7 +7,7 @@
 ## 路线图（待开发）
 
 - [x] 后台 / 异步执行（`background: true` fire-and-forget，主 agent 不阻塞；完成时
-      `sendMessage + triggerTurn + followUp` 通知，防抖合并；结果落盘 `~/.pi/agent/subagent-results/`）
+      `sendMessage + triggerTurn + steer` 通知，防抖合并；结果落盘 `~/.pi/agent/subagent-results/`）
 - [x] 递归深度护栏（`PI_SUBAGENT_DEPTH`，默认最多两层嵌套，见下方「与官方版的差异」）
 - [ ] 子 agent session 持久化与恢复（多轮追问同一子 agent）
 - [ ] 运行中 steering（中途向子 agent 追加指令）
@@ -19,7 +19,10 @@
 
 - `subagent` 工具新增 `background: true`（仅 single 模式）：立即返回 `task-N`，子进程异步运行
 - 完成通知：custom message（`afang-subagent-notify`），只放 ~2KB preview + 结果文件路径，
-  400ms 防抖窗口合并多任务完成，避免通知风暴
+  400ms 防抖窗口合并多任务完成，避免通知风暴；通过 `deliverAs: "steer"` 在当前 assistant 消息的
+  工具批次结束后、下一次 LLM 调用前投递（空闲时立即唤醒），避免 `followUp` 因主 agent 持续调用
+  工具而长期饥饿。工具的静态 prompt guideline 与后台启动返回都会明确告诉模型：可以正常结束当前
+  turn，无需等待或轮询；若任务在会话仍活动、Agent 已空闲时完成，通知会自动拉起新 turn
 - 结果落盘：报告属于项目知识 → 优先写**任务工作目录**下的 `.pi/subagent-results/`，文件名带时间戳
   防跨会话 task id 冲突，主 agent 后续用相对路径即可 read
 - 文件名含语义 slug：`<agent名>-<topic>` 拼接（topic 可选），
@@ -140,7 +143,8 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | List | `{}` (no mode params) | Lists available agents for the scope (name, source, description) |
-| Single | `{ agent, task }` | One agent, one task |
+| Single | `{ agent, task }` | One agent, one task; waits synchronously for the result |
+| Background | `{ agent, task, background: true, topic? }` | Asynchronous single-agent run; returns `task-N` immediately and sends a steer completion notification |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 

@@ -141,6 +141,7 @@ export default function (pi: ExtensionAPI): void {
 			"Use bash for shell commands; a long command auto-moves to the background after ~120s and notifies on completion — do not poll for it.",
 			"Set bash timeout only when you want a hard kill at the deadline (exit code 124), not a background handoff.",
 			"Set bash background:true to detach immediately (dev servers, watchers, long builds).",
+			"After bash starts a background job, continue other work or end your turn normally. Do not wait or poll: if the job finishes while this session is active and you are idle, its completion notification automatically triggers a new turn.",
 			"Use bg (action=list/logs/kill) to inspect or stop background jobs started by bash.",
 		],
 		parameters: BashParams,
@@ -158,7 +159,8 @@ export default function (pi: ExtensionAPI): void {
 								type: "text" as const,
 								text: [
 									`Started background job ${r.jobId} in tmux window ${r.windowId}.`,
-									`A completion message will arrive when it finishes; continue other work.`,
+									"Continue other work or end your turn normally; do not wait or poll.",
+									"If it finishes while this session is active and you are idle, the completion message will automatically trigger a new turn.",
 									`Peek: bg action=logs window=${r.windowId} · Stop: bg action=kill window=${r.windowId}`,
 									`Attach: ${r.attach}`,
 								].join("\n"),
