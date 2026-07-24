@@ -19,14 +19,21 @@
 | `bash { command, timeout: N }` | 保留内置「硬超时」语义：到点**硬杀**命令，退出码 124，**不转后台** |
 | `bash { command, background: true }` | **立即分离**，不等待（dev server / watcher / 长构建等），完成后自动通知 |
 | `bg { action, window, lines }` | 管理后台任务：`list` 列出运行中及本 runtime 已完成/已终止任务并显示状态、`logs` 按需读取尾部输出（快照，不阻塞，禁止用作轮询等待）、`kill` 按 `window_id` 终止 |
+| `/bg`（斜杠命令） | **面向用户**的交互 overlay 面板：列出本会话后台任务，`↑↓` 选择、`Enter` 看输出（可滚动/跟随尾部）、`x` kill（内联 `y/n` 确认）、`Esc` 退出；每秒自刷新（详见下方「用户侧交互面板」） |
 
 - 命令完成（无论自动转后台还是 `background:true`）会收到一条 `⏻ background bash` 消息
-  （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。
+  （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。**TUI 里该消息折叠显示**（头部状态行
+  + 尾部最新输出 + `… +N 行`），避免大输出刷屏；选中该消息**展开**即可看全文。折叠只影响 TUI 展示，
+  发给 LLM 的 `content` 不变（仍按 `maxLines/maxBytes` 截断）。
 - 工具描述、静态 prompt guideline 与转后台后的返回消息都会明确告诉模型：后台化后**禁止**通过
   `bash sleep`、轮询循环或反复调用 `bg list/logs` 等待完成；只能继续与该任务无关的有效工作，否则应
   立即结束当前 turn。任务完成后，通知会在会话空闲时自动拉起新 turn。
 - TUI footer 会显示 `bg: N running`；后台任务自然完成时由 watcher 立即刷新计数，不必等下一次
-  `bash` / `bg` 工具调用，也不受完成消息的 steer 投递时机影响。
+  `bash` / `bg` 工具调用，也不受完成消息的 steer 投递时机影响。计数以 `listJobsForSession`（tmux
+  权威源）为准，与 `/bg` 面板一致：**含 reload 后从 tmux 标签恢复的后台任务**（旧的只数内存表
+  `state.jobs` 在 reload 后会漏数）；**不计入正在执行的前台命令**——前台窗口执行期间不打
+  tmux 标签，仅当它超时转后台时才打标签（否则 `/bg` 会列出、footer 会多计、用户还能误杀
+  在跑的前台命令）。`/bg` 面板打开时每秒同步刷新该计数，杀任务后立即更新。
 - `bg action=list` 优先列出活跃任务，并附最近完成/终止状态；内存最多保留 100 条终态历史，单次
   最多输出 50 条任务（命令摘要与总输出均截断），避免任务历史无限撑大上下文和 session。
 - 结果末尾附**彩色状态行**（`✓ done · 1.2s` / `✗ exit 1` / `✗ timeout` / `✗ aborted` /
@@ -38,6 +45,60 @@
 - **窗口死亡检测**：前台等待期间约每秒探测一次 tmux 窗口存活；窗口未写退出码哨兵就
   消失（wrapper 崩溃 / 被外部 `kill-window` / tmux server 挂掉）时立即报错返回
   （`details.exitCode: -1`），而不是空等 120s 后把死任务误转后台。
+
+## 用户侧交互面板：`/bg`
+
+上面的 `bg` **工具**是给模型用的；`/bg` **斜杠命令**是给**用户**用的交互面板，用完即走
+（临时唤起的 overlay 组件，不是常驻悬浮窗）。二者共用同一套 runtime helper
+（`listJobsForSession` / `readJobLogs` / `killWindow`+`markJobKilled` /
+`reconcileCompletedJobs`），行为与 `bg` 工具一致，只多包一层键盘交互与绘制（组件实现见
+`bg-panel.ts`，共享的格式化辅助在 `format.ts`）。
+
+交互（自绘 overlay，`ctx.ui.custom`）：
+
+1. `/bg` → 弹出**任务列表**：每行 `窗口id  ● running   3m   $ 命令`
+   （运行中排前，图标按状态着色：`● running` / `✓ completed`(exit 0 绿 / 非 0 红) /
+   `✗ killed` / `⚠ missing`）。
+2. **列表视图**键位：
+   - `↑` / `↓`：移动选择；
+   - `Enter`：查看选中任务的输出（进入输出视图）；
+   - `x`：请求 kill 选中任务 → 底部内联 `y/n` 二次确认，`y` 确认、`n`/`Esc` 取消；
+   - `Esc` / `q`：退出面板。
+3. **输出视图**键位：
+   - `↑` / `↓` / `PgUp` / `PgDn` / `Home` / `End`：滚动（默认**跟随尾部**，向上滚动即脱离跟随、
+     `End` 恢复跟随）；
+   - `x`：kill **当前正在查看**的任务（同样 `y/n` 内联确认）；
+   - `Esc` / `q`：返回列表。
+4. 面板**每秒自刷新**：运行中任务的耗时实时增长、状态 `running→completed` 自动更新、输出视图
+   跟随尾部。刷新纯展示、无副作用（`listJobsForSession` 只读；完成通知仍由 runtime 的
+   `fs.watch` watcher 独立发送）；只有 `x` kill 这类用户动作才 `reconcile` + 改状态。
+
+> 只在 TUI（`ctx.hasUI`）下可用；无 tmux 时 `notify` 提示。当前会话无后台任务时列表显示
+> 「（当前会话没有后台任务）」占位。kill 走内联 `y/n` 确认避免误杀；已结束的任务只能看输出、
+> `x` 会提示无需 kill。
+
+### kill 的两类通知
+
+用户在 `/bg` 面板里 kill 一个任务后，会产生**两层**通知：
+
+1. **TUI 通知**：面板内标题行即时反馈（`已 kill @xxx`），同时发一条 `ctx.ui.notify`
+   （持久 toast，**关掉面板后仍可见**）。消息以 `killWindow` 结果为准并处理竞争：成功 →
+   `已 kill @xxx`；杀之前刚好自然完成 → `任务 @xxx 已完成（exit N），无需 kill`；窗口不存在 →
+   `窗口 @xxx 已不存在`。
+2. **给 assistant 的消息**：因为这是**用户手动** kill（assistant 并不知道），面板会经
+   `notifyUserKilled` 给 assistant 注入一条通知（复用完成通知的 `⏻ background bash` 渲染），
+   **正文明确写「TERMINATED BY THE USER」**，并附命令与被杀前的尾部输出。时机：
+   - **assistant 在 turn 内（streaming）** → `deliverAs: "steer"`：在当前 assistant 消息的工具
+     调用全部执行完、下一次 LLM 调用前注入，不打断在途工具；
+   - **已是 user turn（idle）** → `deliverAs: "nextTurn"`：静默挂到下次用户 prompt 一起带上，
+     **不主动打断 / 唤醒 assistant**；
+   - **永不 `triggerTurn`**——kill 是用户意图动作，不该因 UI 清理让 assistant 突然开口（对比
+     自然完成 `handleCompletion` 用 `steer + triggerTurn`，因为那是 assistant 可能在等的结果）。
+   - **去重**：仅在「确实杀掉一个运行中任务」时发；若任务其实刚自然完成，`handleCompletion`
+     已发过完成通知，kill 不再重复。
+
+> `bg` **工具**的 kill（assistant 自己调用）**不**发这条消息——它从工具返回值已经知道结果，
+> 再发会冗余。只有 `/bg` **面板**的用户 kill 才通知 assistant。
 
 ## 为什么这么设计
 

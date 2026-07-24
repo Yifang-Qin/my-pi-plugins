@@ -370,14 +370,9 @@ export async function runForegroundBash(
 	const outputFile = join(state.runDir!, `${id}.${windowId}.out`);
 	const exitFile = join(state.runDir!, `${id}.${windowId}`);
 
-	setWindowOptions(options, windowId, {
-		[WINDOW_OPTIONS.piSession]: state.piSessionId,
-		[WINDOW_OPTIONS.startedAt]: String(Math.floor(Date.now() / 1000)),
-		[WINDOW_OPTIONS.jobId]: id,
-		[WINDOW_OPTIONS.outputFile]: outputFile,
-		[WINDOW_OPTIONS.command]: displayCommand,
-	});
-
+	// 注意：前台窗口此时【不打标签】——正在跑的前台命令不应被 listTaskWindows 计入（否则 /bg
+	// 会列出、footer 会计数、用户还能误杀正在执行的前台命令）。仅当它真正「转后台」时
+	// 才打标签（见下方自动转后台分支）。
 	const startedAt = Date.now();
 	const hardTimeoutMs =
 		params.timeoutSec != null && Number.isFinite(params.timeoutSec) && params.timeoutSec > 0
@@ -474,6 +469,15 @@ export async function runForegroundBash(
 					return finishInline(exitCode);
 				}
 			}
+			// 真正转后台了 → 现在才给窗口打标签（startedAt 用创建时刻，保证耗时显示正确；
+			// 到此前的前台执行期间窗口无标签，不会被 list/count）。
+			setWindowOptions(options, windowId, {
+				[WINDOW_OPTIONS.piSession]: state.piSessionId,
+				[WINDOW_OPTIONS.startedAt]: String(Math.floor(startedAt / 1000)),
+				[WINDOW_OPTIONS.jobId]: id,
+				[WINDOW_OPTIONS.outputFile]: outputFile,
+				[WINDOW_OPTIONS.command]: displayCommand,
+			});
 			const waitSec = Math.round(options.foregroundTimeoutMs / 1000);
 			return {
 				content: [
@@ -639,6 +643,56 @@ export function markJobKilled(state: RuntimeState, windowId: string): boolean {
 	job.finishedAt = Date.now();
 	pruneFinishedJobs(state);
 	return true;
+}
+
+export interface JobLogSnapshot {
+	text: string;
+	truncated: boolean;
+	fullPath?: string;
+}
+
+// 用户从 /bg 面板手动 kill 一个仍在运行的任务时，给 assistant 发一条通知（含尾部输出），
+// 正文里明确写「是用户杀的」。时机：turn 内 steer / idle nextTurn，**永不 triggerTurn**——
+// kill 是用户的意图动作，不该主动唤醒 assistant 说话（对比自然完成 handleCompletion 用
+// steer + triggerTurn，因为那是 assistant 可能在等的后台结果）。
+// 去重：仅由调用方在「确实杀掉一个 running 任务」时调用；若任务其实刚自然完成，handleCompletion
+// 已发过完成通知，这里不会被触及。
+// 输出（logs）由调用方在【杀窗口之前】读好传入（趁窗口还活着，capture-pane 兜底可用，
+// .out 即使被 reload 回收也不至于丢）。
+export function notifyUserKilled(
+	state: RuntimeState,
+	pi: ExtensionAPI,
+	info: BackgroundJobInfo,
+	streaming: boolean,
+	logs: JobLogSnapshot,
+): void {
+	if (state.shuttingDown) return;
+	const { text, truncated, fullPath } = logs;
+	const durSec = info.startedAt ? ((Date.now() - info.startedAt) / 1000).toFixed(1) : "?";
+	const header =
+		`Background job ${info.jobId ?? "?"} (${info.windowId}) was TERMINATED BY THE USER from the /bg panel ` +
+		`after ${durSec}s. The user manually killed it — this is not an error, not a crash, and not something ` +
+		`to retry or resume unless the user asks.`;
+	const footer = truncated && fullPath ? `\n\n[output truncated; full log: ${fullPath}]` : "";
+	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${text}${footer}`);
+	pi.sendMessage(
+		{
+			customType: COMPLETION_CUSTOM_TYPE,
+			content,
+			display: true,
+			details: {
+				jobId: info.jobId,
+				windowId: info.windowId,
+				killedByUser: true,
+				command: info.command,
+				outputFile: info.outputFile,
+				durationMs: info.startedAt ? Date.now() - info.startedAt : undefined,
+			},
+		},
+		// turn 内 steer（当前消息工具跑完、下次 LLM 调用前注入）；idle 时 nextTurn（随下个用户
+		// prompt 带上，不打断、不触发）。两种都不 triggerTurn。
+		{ deliverAs: streaming ? "steer" : "nextTurn" },
+	);
 }
 
 // 当前 pi 会话仍在运行的任务数（供状态栏显示）。

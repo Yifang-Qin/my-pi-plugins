@@ -15,6 +15,8 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { truncateLine, truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
+import { fmtDuration, fmtJobStatus } from "./format.js";
+import { openBgPanel } from "./bg-panel.js";
 import {
 	cleanup,
 	createState,
@@ -25,7 +27,6 @@ import {
 	reconcileCompletedJobs,
 	resetRunDir,
 	runForegroundBash,
-	runningCount,
 	startBackgroundCommand,
 	startWatcher,
 	type RuntimeState,
@@ -35,6 +36,10 @@ import { killWindow, tmuxAvailable } from "./tmux.js";
 const STATUS_KEY = "tmux-bash";
 const MAX_BG_LIST_JOBS = 50;
 const MAX_BG_COMMAND_CHARS = 300;
+// 完成/kill 通知在 TUI 历史里的折叠阈值（折叠时只显头部状态行 + 尾部最新输出，
+// 可展开看全文）。发给 LLM 的 content 不受影响，仍按 maxLines/maxBytes 截断。
+const COMPLETION_FOLD_HEAD = 4;
+const COMPLETION_FOLD_TAIL = 10;
 // 从内置 bash 的非零退出文案里回捞退出码（合并自原 bash-status-line 扩展）。
 const EXIT_CODE_PATTERN = /Command exited with code (\d+)/;
 
@@ -86,39 +91,45 @@ function reply(text: string, details: unknown = null, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
 }
 
-function fmtDuration(startedAt: number | undefined, finishedAt?: number): string {
-	if (!startedAt) return "?";
-	const s = Math.max(0, Math.floor(((finishedAt ?? Date.now()) - startedAt) / 1000));
-	if (s < 60) return `${s}s`;
-	if (s < 3600) return `${Math.floor(s / 60)}m`;
-	return `${Math.floor(s / 3600)}h`;
-}
+type StatusCtx = { hasUI: boolean; ui: { setStatus: (k: string, v?: string) => void } };
 
-function fmtJobStatus(job: { status: string; exitCode?: number }): string {
-	if (job.status === "completed") return `completed exit ${job.exitCode ?? "?"}`;
-	if (job.status === "killed") return "killed";
-	if (job.status === "missing") return "window missing";
-	return "running";
-}
-
-function updateStatus(state: RuntimeState, ctx: { hasUI: boolean; ui: { setStatus: (k: string, v?: string) => void } }): void {
+// 直接把运行中数写到 footer 状态栏（供面板实时刷新复用，避免重复统计）。
+function setBgStatus(ctx: StatusCtx, running: number): void {
 	if (!ctx.hasUI) return;
-	const n = runningCount(state);
-	ctx.ui.setStatus(STATUS_KEY, n > 0 ? `bg: ${n} running` : undefined);
+	ctx.ui.setStatus(STATUS_KEY, running > 0 ? `bg: ${running} running` : undefined);
+}
+
+// 统计运行中任务数：用 listJobsForSession（tmux 权威源，含 reload 后恢复的任务、按哨兵反映完成），
+// 与 /bg 面板一致；旧的 runningCount(state.jobs) 在 reload 后会漏掉恢复的任务而偏少。
+function updateStatus(state: RuntimeState, ctx: StatusCtx): void {
+	setBgStatus(ctx, listJobsForSession(state).filter((j) => j.status === "running").length);
 }
 
 export default function (pi: ExtensionAPI): void {
 	const state = createState(loadOptions());
 
-	// 完成通知的自定义渲染。
-	pi.registerMessageRenderer(COMPLETION_CUSTOM_TYPE, (message, _options, theme) => {
+	// 完成 / 用户 kill 通知的自定义渲染：大输出任务折叠显示（头部 + 尾部），避免刷屏消息历史；
+	// options.expanded 时展开全文（与工具结果一致的交互）。
+	pi.registerMessageRenderer(COMPLETION_CUSTOM_TYPE, (message, options, theme) => {
 		const raw =
 			typeof message.content === "string"
 				? message.content
 				: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
-		// 注入时加的「系统通知框」只给模型看，UI 里剔掉。
-		const text = stripBgNotifyFrame(raw);
-		return new Text(`${theme.fg("accent", "⏻ background bash")}\n${theme.fg("toolOutput", text)}`, 0, 0);
+		// 注入时加的「系统通知框」只给模型看，UI 里剔掉；再去掉尾部空行避免多余空行。
+		const text = stripBgNotifyFrame(raw).replace(/\s+$/, "");
+		const label = theme.fg("accent", "⏻ background bash");
+		const lines = text.split("\n");
+		const foldable = lines.length > COMPLETION_FOLD_HEAD + COMPLETION_FOLD_TAIL + 2;
+		let body: string;
+		if (options.expanded || !foldable) {
+			body = lines.map((l) => theme.fg("toolOutput", l)).join("\n");
+		} else {
+			const head = lines.slice(0, COMPLETION_FOLD_HEAD).map((l) => theme.fg("toolOutput", l));
+			const tail = lines.slice(-COMPLETION_FOLD_TAIL).map((l) => theme.fg("toolOutput", l));
+			const omitted = lines.length - COMPLETION_FOLD_HEAD - COMPLETION_FOLD_TAIL;
+			body = [...head, theme.fg("muted", `  … +${omitted} 行（展开查看全部）`), ...tail].join("\n");
+		}
+		return new Text(`${label}\n${body}`, 0, 0);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -359,6 +370,21 @@ export default function (pi: ExtensionAPI): void {
 			return ok
 				? reply(`Killed background job in window ${params.window}.`, { window: params.window })
 				: reply(`No such tmux window: ${params.window} (already finished or closed).`, null, true);
+		},
+	});
+
+	// —— /bg 面向用户的交互面板（overlay：列表 → Enter 看输出 / x kill）—— //
+	// 组件实现见 bg-panel.ts；与模型用的 `bg` 工具共用同一套 runtime helper。
+	pi.registerCommand("bg", {
+		description: "查看/管理后台 bash 任务（列表、看输出、kill）",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+			if (!tmuxAvailable(state.options)) {
+				ctx.ui.notify("tmux 不可用：请安装 tmux 并确保在 PATH 中。", "error");
+				return;
+			}
+			await openBgPanel(pi, state, ctx, (n) => setBgStatus(ctx, n));
+			updateStatus(state, ctx);
 		},
 	});
 }
