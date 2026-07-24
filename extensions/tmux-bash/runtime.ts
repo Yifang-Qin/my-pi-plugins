@@ -112,6 +112,33 @@ function formatEnvExports(state: RuntimeState): string {
 		.join("\n");
 }
 
+// —— session 元数据注入（对齐 0.82.0 内置 bash 的 Bash Tool Session Environment）—— //
+//
+// 0.82.0 起 pi 内置 bash / createBashTool() 会在每条命令启动时注入这批 PI_* 变量，描述当前
+// session/model 状态。我们用 registerTool 完全覆盖了内置 bash，走自己的 wrapper 脚本，不会自动
+// 获得它们，需在此手动对齐。值在 execute 时从 ctx 现取（见 index.ts buildSessionEnv），因此切换
+// 模型/思考级别后下一条命令即生效，与内置语义一致。
+const SESSION_ENV_KEYS = [
+	"PI_SESSION_ID",
+	"PI_SESSION_FILE",
+	"PI_PROVIDER",
+	"PI_MODEL",
+	"PI_REASONING_LEVEL",
+] as const;
+export type SessionEnv = Partial<Record<(typeof SESSION_ENV_KEYS)[number], string | undefined>>;
+
+// 生成这批受管变量的 export/unset 行。追加在 formatEnvExports 之后 → 覆盖 process.env 里可能
+// 残留的父 session stale 值（尤其 afang-subagent spawn 的子 pi 会继承父 env）。值缺失时（如
+// ephemeral session 无 session file，或未选定模型）显式 unset，对齐内置「removes inherited
+// values so nested Pi processes do not expose stale parent-session metadata」的语义。
+export function formatSessionEnvExports(sessionEnv: SessionEnv | undefined): string {
+	if (!sessionEnv) return "";
+	return SESSION_ENV_KEYS.map((key) => {
+		const value = sessionEnv[key];
+		return value !== undefined && value !== "" ? `export ${key}=${shellQuote(value)}` : `unset ${key}`;
+	}).join("\n");
+}
+
 // 生成一次性 wrapper 脚本的字符串（纯函数，便于单测 / bash -n 校验）。
 // 哨兵文件命名：<id>.<window_id>（id 在前，便于 watcher 按 id 前缀匹配）；
 // 对应输出文件 <id>.<window_id>.out。脚本内部用 display-message 解析自己的
@@ -147,7 +174,13 @@ exec "\${SHELL:-/bin/bash}" -l 2>/dev/null || exec bash -l
 `;
 }
 
-function writeScript(state: RuntimeState, id: string, command: string, displayCommand: string): string {
+function writeScript(
+	state: RuntimeState,
+	id: string,
+	command: string,
+	displayCommand: string,
+	sessionEnv?: SessionEnv,
+): string {
 	const scriptPath = join(state.scriptDir!, `${id}.sh`);
 	const script = buildWrapperScript({
 		runDir: state.runDir!,
@@ -155,7 +188,8 @@ function writeScript(state: RuntimeState, id: string, command: string, displayCo
 		id,
 		command,
 		displayCommand,
-		envExports: formatEnvExports(state),
+		// session 元数据放在 process.env 导出之后，覆盖任何 stale 继承值。
+		envExports: [formatEnvExports(state), formatSessionEnvExports(sessionEnv)].filter(Boolean).join("\n"),
 	});
 	// 脚本里内联了导出的环境变量（可能含密钥），且只需 owner 执行/预检读取 → 0o700，不给 group/other。
 	writeFileSync(scriptPath, script, { mode: 0o700 });
@@ -238,13 +272,14 @@ export function startBackgroundCommand(
 	name: string | undefined,
 	cwd: string,
 	_origin?: string, // “background”（显式后台）/ “foreground-timeout”（自动转后台），仅供调用方语义标记。
+	sessionEnv?: SessionEnv,
 ): StartResult {
 	const { options } = state;
 	ensureSession(options, cwd);
 
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = command.replace(/\s+/g, " ").trim();
-	const scriptPath = writeScript(state, id, command, displayCommand);
+	const scriptPath = writeScript(state, id, command, displayCommand, sessionEnv);
 	const syntaxError = checkBashSyntax(scriptPath, command);
 	if (syntaxError) {
 		// 抛错交给 index.ts 的 catch → 「Failed to execute command: …」（isError）。
@@ -342,6 +377,7 @@ export async function runForegroundBash(
 		timeoutSec?: number;
 		signal?: AbortSignal;
 		onUpdate?: (partial: ToolTextResult) => void;
+		sessionEnv?: SessionEnv;
 	},
 ): Promise<ToolTextResult> {
 	const { options } = state;
@@ -349,7 +385,8 @@ export async function runForegroundBash(
 
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = params.command.replace(/\s+/g, " ").trim();
-	const scriptPath = writeScript(state, id, params.command, displayCommand);
+	// 前台窗口与「自动转后台」复用同一 wrapper 脚本（同 id），故 session 元数据在此一次性写入即可。
+	const scriptPath = writeScript(state, id, params.command, displayCommand, params.sessionEnv);
 	const syntaxError = checkBashSyntax(scriptPath, params.command);
 	if (syntaxError) {
 		// 对齐内置 bash 行为：语法错误 = stderr 正文 + 「Command exited with code 2」（bash 对

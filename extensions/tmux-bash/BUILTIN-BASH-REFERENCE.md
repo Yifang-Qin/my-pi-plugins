@@ -223,6 +223,21 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    观感），完成后的总耗时改用 `details.durationMs`（runtime 实测，非渲染侧时钟）拼进末尾状态行
    `✓ done · X.Xs`（保留一位小数）；② 文案用本插件状态行风格 `Running` / `✓ done`，而非内置的
    `Elapsed` / `Took`；③ 运行中与完成后的状态行**同一个位置**（预览在上、状态行在下，两分支结构对称）。
+9. **session 元数据注入（对齐 0.82.0 Bash Tool Session Environment）**：0.82.0 起 pi 内置 bash /
+   `createBashTool()` 会在**每条命令启动时**注入一批描述当前 session/model 的 `PI_*` 变量：
+   `PI_SESSION_ID` / `PI_SESSION_FILE` / `PI_PROVIDER` / `PI_MODEL` / `PI_REASONING_LEVEL`（只注入
+   LLM 可调用的 bash 工具，不注入用户 `!`/`!!` 命令）。本插件用 `registerTool` 完全覆盖了内置
+   bash、走自己的 wrapper 脚本（不走 `createBashTool`），不会自动获得这些变量，故手动对齐：
+   `index.ts buildSessionEnv(ctx)` 在 `execute` 时从 `ctx` 现取（`ctx.sessionManager.getSessionId()` /
+   `getSessionFile()`、`ctx.model?.provider` / `ctx.model?.id`、`ctx.thinkingLevel`），经 `runForegroundBash` /
+   `startBackgroundCommand` → `writeScript` → `runtime.ts formatSessionEnvExports` 追加到 wrapper 脚本的
+   `formatEnvExports`（process.env 全量导出）**之后**——后置 export 保证覆盖 process.env 里可能残留的
+   父 session stale 值（尤其 afang-subagent spawn 的子 pi 会继承父 env）。值缺失时（ephemeral session
+   无 session file / 未选定模型）显式 `unset`，对齐内置「removes inherited values so nested Pi
+   processes do not expose stale parent-session metadata」的语义。因值在每次 `execute` 现取、wrapper
+   脚本一次性生成，切换模型/思考级别后下一条命令即生效（与内置一致；转后台任务复用同一 wrapper，
+   env 在启动时固化，符合语义）。注：`PI_REASONING_LEVEL` 取 `ctx.thinkingLevel`（最接近的可取值，
+   不含 `off`），与内置「effective reasoning level」在极端情况下可能略有出入。
 
 竞态处理：自动转后台的切换点先 `state.jobs.set(...)` 登记再复查哨兵文件，消除「恰在切换瞬间
 完成」导致 `fs.watch` 漏发通知的窗口（见 `runForegroundBash`）。

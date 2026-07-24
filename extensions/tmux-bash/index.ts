@@ -13,7 +13,7 @@
 
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { truncateLine, truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import { openBgPanel } from "./bg-panel.js";
@@ -30,6 +30,7 @@ import {
 	startBackgroundCommand,
 	startWatcher,
 	type RuntimeState,
+	type SessionEnv,
 } from "./runtime.js";
 import { killWindow, tmuxAvailable } from "./tmux.js";
 
@@ -105,6 +106,19 @@ function updateStatus(state: RuntimeState, ctx: StatusCtx): void {
 	setBgStatus(ctx, listJobsForSession(state).filter((j) => j.status === "running").length);
 }
 
+// 组装 0.82.0 的 Bash Tool Session Environment（PI_* session 元数据），交给 wrapper 脚本注入。
+// 与内置 bash 一致：值在每条命令启动时从 ctx 现取，切换模型/思考级别后下一条命令即生效；
+// ephemeral session 无 session file、未选定模型时留空（wrapper 会 unset，不透传 stale 继承值）。
+function buildSessionEnv(ctx: ExtensionContext): SessionEnv {
+	return {
+		PI_SESSION_ID: ctx.sessionManager.getSessionId(),
+		PI_SESSION_FILE: ctx.sessionManager.getSessionFile(),
+		PI_PROVIDER: ctx.model?.provider,
+		PI_MODEL: ctx.model?.id,
+		PI_REASONING_LEVEL: ctx.thinkingLevel,
+	};
+}
+
 export default function (pi: ExtensionAPI): void {
 	const state = createState(loadOptions());
 
@@ -163,7 +177,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			try {
 				if (params.background) {
-					const r = startBackgroundCommand(state, params.command, undefined, ctx.cwd, "background");
+					const r = startBackgroundCommand(state, params.command, undefined, ctx.cwd, "background", buildSessionEnv(ctx));
 					updateStatus(state, ctx);
 					return {
 						content: [
@@ -188,6 +202,7 @@ export default function (pi: ExtensionAPI): void {
 					timeoutSec: params.timeout,
 					signal,
 					onUpdate,
+					sessionEnv: buildSessionEnv(ctx),
 				});
 				updateStatus(state, ctx);
 				return result;

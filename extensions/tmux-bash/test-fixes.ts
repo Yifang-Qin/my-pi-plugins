@@ -19,6 +19,7 @@ import {
 	checkBashSyntax,
 	cleanup,
 	createState,
+	formatSessionEnvExports,
 	listJobsForSession,
 	reconcileCompletedJobs,
 	resetRunDir,
@@ -68,6 +69,38 @@ check("报错行号相对原始命令（-c 而非脚本路径）", badErr?.inclu
 check("附带 bash 版本注记", badErr?.includes("[checked with") ?? false);
 const goodErr = checkBashSyntax(makeWrapper(GOOD_COMMAND, "good"), GOOD_COMMAND);
 check("好命令放行", goodErr === null, goodErr ?? undefined);
+
+// —— 测试 1b：formatSessionEnvExports（对齐 0.82.0 Bash Tool Session Environment）——
+{
+	const full = formatSessionEnvExports({
+		PI_SESSION_ID: "s1",
+		PI_SESSION_FILE: "/tmp/s1.jsonl",
+		PI_PROVIDER: "anthropic",
+		PI_MODEL: "claude",
+		PI_REASONING_LEVEL: "high",
+	});
+	check(
+		"session env → 5 个变量全部 export",
+		full.includes("export PI_SESSION_ID='s1'") &&
+			full.includes("export PI_SESSION_FILE='/tmp/s1.jsonl'") &&
+			full.includes("export PI_PROVIDER='anthropic'") &&
+			full.includes("export PI_MODEL='claude'") &&
+			full.includes("export PI_REASONING_LEVEL='high'"),
+		full,
+	);
+	const partial = formatSessionEnvExports({ PI_SESSION_ID: "s2", PI_SESSION_FILE: undefined });
+	check(
+		"session env → 缺失值显式 unset（对齐 removes inherited）",
+		partial.includes("export PI_SESSION_ID='s2'") && partial.includes("unset PI_SESSION_FILE"),
+		partial,
+	);
+	check("session env → 空入参返回空串", formatSessionEnvExports(undefined) === "");
+	// session env 追加在 process.env 导出之后 → 后置 export 覆盖 stale 值（顺序验证）
+	const composed = ["export PI_MODEL='stale'", formatSessionEnvExports({ PI_MODEL: "fresh" })]
+		.filter(Boolean)
+		.join("\n");
+	check("session env → 后置覆盖 stale（fresh 在 stale 之后）", composed.lastIndexOf("fresh") > composed.indexOf("stale"));
+}
 
 // —— 测试 2/3：runForegroundBash 集成 —— //
 const state = createState(loadOptions());
