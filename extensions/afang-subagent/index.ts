@@ -24,6 +24,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	getAgentDir,
 	getMarkdownTheme,
 	withFileMutationQueue,
@@ -32,6 +33,20 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { makeBgNotifyFramer } from "../shared/bg-notify.js";
 import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents, discoverBuiltinAgents } from "./agents.ts";
+import { openSubagentPanel } from "./subagent-panel.ts";
+import {
+	type BgStatus,
+	type DisplayItem,
+	formatToolCall,
+	formatUsageStats,
+	getDisplayItems,
+	getFinalOutput,
+	getResultOutput,
+	isFailedResult,
+	type SingleResult,
+	type SubagentPanelTask,
+	truncateParallelOutput,
+} from "./render-helpers.ts";
 
 // 扩展自带的 workflow prompt 模板目录（prompts/*.md），通过 resources_discover 自包含地注册。
 const BUILTIN_PROMPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "prompts");
@@ -39,7 +54,6 @@ const BUILTIN_PROMPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 // 递归深度护栏：主 session 深度 0，每 spawn 一层子 pi 就把 PI_SUBAGENT_DEPTH +1 传下去。
 // 达到上限的子进程干脆不注册 subagent / subagent_tasks 工具（模型看不见，天然无法再派）。
@@ -59,186 +73,12 @@ function childEnv(): NodeJS.ProcessEnv {
 	return { ...process.env, PI_SUBAGENT_DEPTH: String(SUBAGENT_DEPTH + 1) };
 }
 
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	}
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
-): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
-}
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
-interface SingleResult {
-	agent: string;
-	agentSource: AgentSource | "unknown";
-	task: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
-}
-
 interface SubagentDetails {
 	mode: "single" | "parallel" | "chain" | "background";
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 	bgTaskId?: string;
-}
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-}
-
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
-}
-
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -299,6 +139,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	onLiveResult?: (r: SingleResult) => void,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -334,6 +175,9 @@ async function runSingleAgent(
 		model: agent.model,
 		step,
 	};
+
+	// 把 live 结果引用交给调用方（runTrackedAgent），供 registry / 面板实时读取流式轨迹。
+	onLiveResult?.(currentResult);
 
 	const emitUpdate = () => {
 		if (onUpdate) {
@@ -436,7 +280,11 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (wasAborted) {
+			currentResult.stopReason = "aborted";
+			if (!currentResult.errorMessage) currentResult.errorMessage = "Cancelled";
+			throw new Error("Subagent was aborted");
+		}
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -451,6 +299,66 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+	}
+}
+
+// 前台三种模式（single/parallel/chain）的统一入口：为每个 child 建独立 AbortController、登记进
+// liveTasks registry、把父级（工具）signal 链上去（父 abort → 全体 child abort，保留 Esc 全杀），
+// 并把「被 abort」收敛成一条 cancelled 结果返回（而非抛出）——这样 parallel 里单杀一个 child
+// 不会连坐炋掉整批 Promise.all。
+async function runTrackedAgent(
+	kind: LiveKind,
+	groupId: string,
+	step: number | undefined,
+	defaultCwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	cwd: string | undefined,
+	parentSignal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+	makeDetails: (results: SingleResult[]) => SubagentDetails,
+): Promise<SingleResult> {
+	const controller = new AbortController();
+	const onParentAbort = () => controller.abort();
+	if (parentSignal) {
+		if (parentSignal.aborted) controller.abort();
+		else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+	}
+	const live = registerLiveTask(kind, groupId, step, agentName, task, cwd ?? defaultCwd, () => controller.abort());
+	try {
+		const result = await runSingleAgent(
+			defaultCwd,
+			agents,
+			agentName,
+			task,
+			cwd,
+			step,
+			controller.signal,
+			onUpdate,
+			makeDetails,
+			(r) => {
+				live.result = r;
+			},
+		);
+		live.result = result;
+		// killLiveTask 可能已把 status 置 cancelled（面板/工具单杀）；否则按结果定 completed/failed。
+		if (live.status === "running") live.status = isFailedResult(result) ? "failed" : "completed";
+		return result;
+	} catch {
+		// runSingleAgent 在被 abort 时抛出：把当前（可能含部分流式内容的）结果收敛成 cancelled。
+		const base = live.result;
+		const cancelled: SingleResult = {
+			...base,
+			exitCode: base.exitCode > 0 ? base.exitCode : 130,
+			stopReason: "aborted",
+			errorMessage: base.errorMessage || "Cancelled",
+		};
+		live.result = cancelled;
+		live.status = "cancelled";
+		return cancelled;
+	} finally {
+		if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
 	}
 }
 
@@ -519,8 +427,6 @@ const BG_NOTIFY_DEBOUNCE_MS = 400;
 const BG_NOTIFY_PREVIEW_CHARS = 2000;
 const BG_RESULT_INLINE_CAP = 10 * 1024;
 
-type BgStatus = "running" | "completed" | "failed" | "cancelled";
-
 interface BgTask {
 	id: string;
 	agentName: string;
@@ -538,6 +444,147 @@ interface BgTask {
 
 const bgTasks = new Map<string, BgTask>();
 let bgNextId = 1;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Live (foreground) task registry
+//
+// 前台 single/parallel/chain 的每个子 agent 也登记进这个模块级 registry，让 /subagent 面板与
+// subagent_tasks 工具能在 execute() 之外「看见」并「单独 kill」它们。每个 child 持有自己的
+// AbortController（见 runTrackedAgent），故可单杀而不影响同批其余任务。
+//
+// 与 bgTasks 的区别：前台任务由正在 await 的工具调用聚合返回结果，完成后不写结果文件、不发完成
+// 通知（结果已在工具输出里）；kill 一个 child 只会让它那条聚合结果显示为 aborted。
+// ────────────────────────────────────────────────────────────────────────────
+
+type LiveKind = "single" | "parallel" | "chain";
+
+interface LiveTask {
+	id: string;
+	kind: LiveKind;
+	groupId: string; // 同一次工具调用共享（= toolCallId），便于分组/清理
+	step?: number; // parallel 的序号 / chain 的步序（1-based）
+	agentName: string;
+	task: string;
+	cwd: string;
+	startedAtMs: number;
+	status: BgStatus;
+	result: SingleResult; // live 引用：随子进程流式更新，面板 1s 读一次即见最新轨迹
+	abort: () => void; // 单杀开关（abort 自己的 AbortController）
+}
+
+const liveTasks = new Map<string, LiveTask>();
+
+function makePlaceholderResult(agentName: string, task: string): SingleResult {
+	return {
+		agent: agentName,
+		agentSource: "unknown",
+		task,
+		exitCode: -1,
+		messages: [],
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+}
+
+function registerLiveTask(
+	kind: LiveKind,
+	groupId: string,
+	step: number | undefined,
+	agentName: string,
+	task: string,
+	cwd: string,
+	abort: () => void,
+): LiveTask {
+	const id = `task-${bgNextId++}`;
+	const t: LiveTask = {
+		id,
+		kind,
+		groupId,
+		step,
+		agentName,
+		task,
+		cwd,
+		startedAtMs: Date.now(),
+		status: "running",
+		result: makePlaceholderResult(agentName, task),
+		abort,
+	};
+	liveTasks.set(id, t);
+	return t;
+}
+
+// 新一轮工具调用开始前清掉已结束的前台任务，避免 registry 无限增长；仍在跑的保留。
+function pruneFinishedLiveTasks(): void {
+	for (const [id, t] of liveTasks) if (t.status !== "running") liveTasks.delete(id);
+}
+
+function killLiveTask(t: LiveTask): void {
+	if (t.status !== "running") return;
+	t.status = "cancelled";
+	t.result.stopReason = "aborted";
+	if (!t.result.errorMessage) t.result.errorMessage = "Cancelled by user";
+	try {
+		t.abort();
+	} catch {
+		/* ignore */
+	}
+}
+
+function killAllLiveTasks(): void {
+	for (const t of liveTasks.values()) if (t.status === "running") killLiveTask(t);
+}
+
+// —— 面板 / 工具共用的统一视图（合并前台 live + 后台 bg 任务）——
+
+export function snapshotSubagentTasks(): SubagentPanelTask[] {
+	const out: SubagentPanelTask[] = [];
+	for (const t of liveTasks.values()) {
+		out.push({
+			id: t.id,
+			kind: t.kind,
+			agentName: t.agentName,
+			agentSource: t.result.agentSource,
+			task: t.task,
+			status: t.status,
+			startedAtMs: t.startedAtMs,
+			result: t.result,
+			killable: t.status === "running",
+		});
+	}
+	for (const t of bgTasks.values()) {
+		out.push({
+			id: t.id,
+			kind: "background",
+			agentName: t.agentName,
+			agentSource: t.agentSource,
+			topic: t.topic,
+			task: t.task,
+			status: t.status,
+			startedAtMs: t.startedAtMs,
+			result: t.result,
+			resultFile: t.resultFile,
+			killable: t.status === "running",
+		});
+	}
+	return out;
+}
+
+// 面板/命令用的统一 kill 入口（先查前台 live，再查后台 bg）。
+export function killSubagentTask(id: string): "killed" | "not-running" | "unknown" {
+	const live = liveTasks.get(id);
+	if (live) {
+		if (live.status !== "running") return "not-running";
+		killLiveTask(live);
+		return "killed";
+	}
+	const bg = bgTasks.get(id);
+	if (bg) {
+		if (bg.status !== "running") return "not-running";
+		killBgTask(bg);
+		return "killed";
+	}
+	return "unknown";
+}
 let piApi: ExtensionAPI | null = null;
 const pendingBgNotify: BgTask[] = [];
 let bgNotifyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -877,9 +924,43 @@ export default function (pi: ExtensionAPI) {
 		return new Text(theme.fg("accent", "⏻ background subagent") + "\n" + theme.fg("toolOutput", text), 0, 0);
 	});
 
-	pi.on("session_shutdown", () => killAllBgTasks());
-	pi.on("session_before_switch", () => killAllBgTasks());
-	pi.on("session_before_fork", () => killAllBgTasks());
+	pi.on("session_shutdown", () => {
+		killAllBgTasks();
+		killAllLiveTasks();
+		liveTasks.clear();
+	});
+	pi.on("session_before_switch", () => {
+		killAllBgTasks();
+		killAllLiveTasks();
+		liveTasks.clear();
+	});
+	pi.on("session_before_fork", () => {
+		killAllBgTasks();
+		killAllLiveTasks();
+		liveTasks.clear();
+	});
+
+	// —— /subagent（别名 /sa）面向用户的交互面板（overlay：列表 → Enter 看轨迹 / x kill）——
+	// 组件实现见 subagent-panel.ts；与模型用的 subagent_tasks 工具共用同一套 registry。
+	// 命令在流式期间也能立即执行，故并行还在同步跑的当口也能开面板单杀某个 child。
+	const SA_STATUS_KEY = "afang-subagent";
+	const openPanel = async (_args: string, ctx: ExtensionCommandContext) => {
+		if (!ctx.hasUI) return;
+		await openSubagentPanel(ctx, {
+			snapshot: snapshotSubagentTasks,
+			kill: killSubagentTask,
+			setRunningCount: (n) => ctx.ui.setStatus(SA_STATUS_KEY, n > 0 ? `sa: ${n} running` : undefined),
+		});
+		ctx.ui.setStatus(SA_STATUS_KEY, undefined);
+	};
+	pi.registerCommand("subagent", {
+		description: "查看/管理 subagent 任务（parallel/chain/background 的轨迹与终止）",
+		handler: openPanel,
+	});
+	pi.registerCommand("sa", {
+		description: "查看/管理 subagent 任务（/subagent 的简写）",
+		handler: openPanel,
+	});
 
 	// 递归深度护栏：到达上限的子进程不注册 subagent / subagent_tasks，模型看不到工具即无法再派。
 	// 深度经 spawn 时注入的 PI_SUBAGENT_DEPTH 逐层 +1 传递（见 childEnv）。
@@ -889,7 +970,8 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_tasks",
 		label: "Subagent Tasks",
 		description:
-			"Manage background subagent tasks: list all tasks, check status, fetch a full result, or cancel a running task.",
+			"Manage subagent tasks — both background tasks and in-flight parallel/chain/single children: " +
+			"list all, check status, fetch a full result, or cancel/kill a running one by id.",
 		parameters: BgTasksParams,
 
 		async execute(_toolCallId, params) {
@@ -898,28 +980,36 @@ export default function (pi: ExtensionAPI) {
 				details: null,
 				...(isError ? { isError: true } : {}),
 			});
-			const find = (id?: string): BgTask | undefined => (id ? bgTasks.get(id) : undefined);
+			const fmtElapsed = (startedAtMs: number) => `${((Date.now() - startedAtMs) / 1000).toFixed(1)}s`;
+			// 统一视图：前台 live（parallel/chain/single）+ 后台 bg 任务。
+			const all = snapshotSubagentTasks();
+			const find = (id?: string) => (id ? all.find((x) => x.id === id) : undefined);
 
 			if (params.action === "list") {
-				if (bgTasks.size === 0) return reply("No background tasks.");
-				const lines = [...bgTasks.values()].map((t) => {
+				if (all.length === 0) return reply("No subagent tasks.");
+				const lines = all.map((t) => {
 					const preview = t.task.length > 60 ? `${t.task.slice(0, 60)}...` : t.task;
-					return `${t.id} [${t.status}] ${t.agentName}${t.topic ? ` (${t.topic})` : ""} — ${bgElapsed(t)} — ${preview}`;
+					const label =
+						t.kind === "background"
+							? `${t.agentName}${t.topic ? ` (${t.topic})` : ""}`
+							: `${t.agentName} [${t.kind}]`;
+					return `${t.id} [${t.status}] ${label} — ${fmtElapsed(t.startedAtMs)} — ${preview}`;
 				});
 				return reply(lines.join("\n"));
 			}
 
 			const t = find(params.id);
 			if (!t) {
-				const known = [...bgTasks.keys()].join(", ") || "none";
+				const known = all.map((x) => x.id).join(", ") || "none";
 				return reply(`Unknown task id: "${params.id ?? ""}". Known tasks: ${known}`, true);
 			}
 
 			if (params.action === "status") {
+				const kindNote = t.kind === "background" ? "" : `, ${t.kind}`;
 				const lines = [
-					`${t.id} (${t.agentName}, ${t.agentSource}) — ${t.status}`,
+					`${t.id} (${t.agentName}, ${t.agentSource}${kindNote}) — ${t.status}`,
 					...(t.topic ? [`Topic: ${t.topic}`] : []),
-					`Elapsed: ${bgElapsed(t)} | Turns so far: ${t.result.usage.turns}`,
+					`Elapsed: ${fmtElapsed(t.startedAtMs)} | Turns so far: ${t.result.usage.turns}`,
 					`Task: ${t.task}`,
 				];
 				if (t.resultFile) lines.push(`Result file: ${t.resultFile}`);
@@ -930,7 +1020,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "result") {
 				if (t.status === "running") {
 					return reply(
-						`${t.id} still running (${bgElapsed(t)}, ${t.result.usage.turns} turns so far). Try again later or cancel it.`,
+						`${t.id} still running (${fmtElapsed(t.startedAtMs)}, ${t.result.usage.turns} turns so far). Try again later or cancel it.`,
 					);
 				}
 				let output = getResultOutput(t.result);
@@ -946,8 +1036,8 @@ export default function (pi: ExtensionAPI) {
 			if (t.status !== "running") {
 				return reply(`${t.id} is not running (status: ${t.status}).`);
 			}
-			killBgTask(t);
-			return reply(`Cancelled ${t.id}.`);
+			const r = killSubagentTask(t.id);
+			return reply(r === "killed" ? `Cancelled ${t.id}.` : `${t.id} is not running.`);
 		},
 	});
 
@@ -976,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
@@ -1102,6 +1192,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			pruneFinishedLiveTasks();
+
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
 				let previousOutput = "";
@@ -1125,13 +1217,15 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-					const result = await runSingleAgent(
+					const result = await runTrackedAgent(
+						"chain",
+						toolCallId,
+						i + 1,
 						ctx.cwd,
 						agents,
 						step.agent,
 						taskWithContext,
 						step.cwd,
-						i + 1,
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
@@ -1197,13 +1291,15 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
+					const result = await runTrackedAgent(
+						"parallel",
+						toolCallId,
+						index + 1,
 						ctx.cwd,
 						agents,
 						t.agent,
 						t.task,
 						t.cwd,
-						undefined,
 						signal,
 						// Per-task update callback
 						(partial) => {
@@ -1239,13 +1335,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
+				const result = await runTrackedAgent(
+					"single",
+					toolCallId,
+					undefined,
 					ctx.cwd,
 					agents,
 					params.agent,
 					params.task,
 					params.cwd,
-					undefined,
 					signal,
 					onUpdate,
 					makeDetails("single"),

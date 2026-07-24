@@ -14,6 +14,7 @@
 - [ ] workflow 的代码侧编排（DAG / 状态机，不依赖 prompt 模板）
 - [x] artifacts 落盘管理（后台任务结果自动写 `<任务cwd>/.pi/subagent-results/<时间戳>-<task-id>.md`，
       写不进去时回退全局 `~/.pi/agent/subagent-results/`；建议在项目 .gitignore 里忽略该目录）
+- [x] 前台并行/chain/single 任务的运行时监控与单独终止（`/subagent` 面板 + per-child AbortController，见下方专节）
 
 ## 后台模式设计要点
 
@@ -32,6 +33,38 @@
 - 上限 4 个并发后台任务，超出显式拒绝（不排队）
 - 生命周期：`session_shutdown` / `session_before_switch` / `session_before_fork` 杀全部子进程；
   `/reload` 通过 globalThis PID 注册表清理上一实例遗留的子进程；Esc 中断主 run 不影响后台任务
+
+## 前台任务监控与单杀（`/subagent` 面板）
+
+并行 / chain / single 三种前台模式是**同步**跑在一次工具调用里的：过去只能靠 Esc 整体中断
+（一次杀光同批全部子 agent），既看不到「每个子 agent 各自的完成轨迹」，也无法「只掐掉其中一个」。
+现在补上了这套抓手（方案 A：保同步语义 + 共享 registry + 面板）：
+
+- **模块级 registry**（`liveTasks`）：每个前台子 agent 在 spawn 时就登记，带独立 `task-N` id、
+  状态、以及指向子进程流式结果的 live 引用——因此在 `execute()` 之外也能被「看见」。
+- **per-child AbortController**（`runTrackedAgent`）：每个子 agent 持有自己的中断开关，父级（工具）
+  signal 链接到全体（保留 Esc = 全杀）；单杀某一个只 abort 它自己，同批其余继续跑。并行 worker 把
+  「被 abort」收敛成一条 `cancelled` 结果返回而非抛出，故单杀不会连坐炸掉整批 `Promise.all`。
+- **`/subagent`（别名 `/sa`）面板**：overlay 交互，与 tmux-bash 的 `/bg` 面板同构——
+  - 列表视图：↑↓ 选择，Enter 看某个子 agent 的**完成轨迹**（工具调用时间线 + 文本 + 用量），
+    `x` 单杀（内联 y/n 确认），Esc/q 退出；每秒自刷新，运行中耗时/轮次实时增长。
+  - 轨迹视图：↑↓/PgUp/PgDn/Home/End 滚动（默认跟随尾部），`x` 杀当前查看的任务，Esc/q 返回。
+  - 前台 live 任务与后台 background 任务的**统一视图**（`kind` 列区分 parallel/chain/single/bg）。
+  - 因为扩展命令在流式期间也能立即触发，**并行还在同步跑的当口也能开面板挑一个杀掉**。
+- **`subagent_tasks` 工具同步扩容**：`list / status / result / cancel` 现在同时覆盖前台 live 任务
+  与后台任务，模型自己也能查状态、单独 cancel 某个并行子任务。
+
+前台任务被 kill **不额外通知** assistant：它那条聚合结果会在正在 await 的工具输出里显示为
+`aborted`，模型自然看得到（与后台任务 kill 需要独立通知不同）。registry 在每次新工具调用前清理
+已结束项、并在 session 切换/退出时清空，不会无限增长。
+
+> **`/reload` 双实例坑（务必遵守）**：pi 的 `/reload` 用 cache-busting query 重新 import 扩展入口
+> （`index.ts?v=<时间戳>`），于是 `index.ts` 会出现「带 query 的实例 A」。若面板再
+> `import ... from "./index.ts"`（无 query），运行时会解析出「无 query 的实例 B」，两个实例各有
+> 独立的 `liveTasks`/`bgTasks`——工具往 A 登记、面板读 B 的空表，表现为「面板永远显示没有运行中的
+> subagent」。因此：**面板绝不 import `index.ts`**。无状态的纯函数/类型放 `render-helpers.ts`
+> （只被相对 import、无可变状态，双实例也无害）；有状态的 `snapshot`/`kill` 由 `index.ts` 的命令
+> handler 以**依赖注入**方式把闭包传给 `openSubagentPanel`，保证面板读到的永远是 pi 入口那个实例。
 
 ## 与官方版的差异
 
@@ -63,6 +96,8 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
+- **Live monitoring & per-child kill**: `/subagent` (`/sa`) overlay panel to watch each foreground
+  child's trajectory and kill individuals without aborting the whole batch (see 前台任务监控与单杀)
 
 ## Structure
 
@@ -70,6 +105,8 @@ Delegate tasks to specialized subagents with isolated context windows.
 subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
+├── subagent-panel.ts    # /subagent (/sa) 用户面板：列表 → 轨迹 → 单杀
+├── render-helpers.ts    # 无状态纯 helper/类型（面板与 index 共享，避开 /reload 双实例，见下）
 ├── agents.ts            # Agent discovery logic
 ├── agents/              # Built-in agent definitions (auto-discovered, self-contained)
 │   ├── scout.md         # Fast recon, returns compressed context
@@ -224,7 +261,8 @@ Built-in agents (bundled in `agents/`, overridable by same-name user/project age
 
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
-- **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
+- **stopReason "aborted"**: 中断子进程；single/chain 直接报错，parallel 收敛为该子任务 cancelled
+  （不连累同批其余）。可来自 Esc 全杀，或 `/subagent` 面板 / `subagent_tasks cancel` 的单杀
 - **Chain mode**: Stops at first failing step, reports which step failed
 
 ## Limitations
