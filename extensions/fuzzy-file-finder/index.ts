@@ -146,18 +146,56 @@ export default function (pi: ExtensionAPI): void {
 		// (a cold cache would shell out to fd while the user is already typing).
 		void getFiles(ctx.cwd);
 
+		// Editor position captured the moment the finder opens on a bare "@".
+		// See insertMention() for why we can't just paste when it closes.
+		type InsertAt = { lines: string[]; cursorLine: number; cursorCol: number };
+
+		// Splice the finder's pick into the editor *at the "@"* — not wherever the
+		// cursor happens to be after the finder closes.
+		//
+		// Why not just ctx.ui.pasteToEditor(mention.slice(1))? pi's ctx.ui.custom()
+		// (editor-slot mode) restores the editor on close via editor.setText(saved),
+		// and setText() forces the caret to the END of the buffer. pasteToEditor()
+		// inserts at the caret, so a mid-sentence "@" would glue the path onto the
+		// tail of the line ("hello @worldsrc/foo.ts") instead of splicing it after
+		// the "@" ("hello @src/foo.ts world"). It only *looked* right at end-of-input
+		// because there the restored end-caret coincides with the "@".
+		//
+		// So we ignore the post-restore caret entirely and rebuild the line from the
+		// position we captured when the finder opened (the editor was frozen behind
+		// the finder in between, so that snapshot is still authoritative), then
+		// setEditorText() the whole buffer. The "@" that triggered us already sits at
+		// cursorCol-1, so we splice only the tail (mention without its leading "@")
+		// right after it and keep whatever text followed the caret.
+		//
+		// Caveat: the extension UI API exposes no caret control (only
+		// setEditorText/pasteToEditor/getEditorText), and setEditorText also lands
+		// the caret at the end. Text is now always correct; the caret sits at end of
+		// input (exactly right for the common end-of-line case, tolerable mid-line).
+		const insertMention = (mention: string, at: InsertAt | null): void => {
+			const tail = mention.slice(1);
+			if (!at) {
+				ctx.ui.pasteToEditor(tail);
+				return;
+			}
+			const line = at.lines[at.cursorLine] ?? "";
+			const newLine = line.slice(0, at.cursorCol) + tail + line.slice(at.cursorCol);
+			const newLines = [...at.lines];
+			newLines[at.cursorLine] = newLine;
+			ctx.ui.setEditorText(newLines.join("\n"));
+		};
+
 		let finderBusy = false;
-		const openFinder = (): void => {
+		const openFinder = (at: InsertAt | null): void => {
 			if (finderBusy) return;
 			finderBusy = true;
 			void (async () => {
 				try {
 					const mention = await pickFile(ctx);
-					// The "@" is already in the buffer (the keystroke that triggered us),
-					// so append only the tail: "path " for files, "dir/" for directories.
-					// Cancelled -> leave the bare "@" (also the escape hatch for typing an
-					// email/decorator, or falling back to the inline fuzzy dropdown).
-					if (mention) ctx.ui.pasteToEditor(mention.slice(1));
+					// Splice the tail ("path "/"dir/") after the triggering "@". Cancelled
+					// -> leave the bare "@" (escape hatch for an email/decorator, or the
+					// inline fuzzy dropdown).
+					if (mention) insertMention(mention, at);
 				} finally {
 					finderBusy = false;
 				}
@@ -177,8 +215,11 @@ export default function (pi: ExtensionAPI): void {
 					}
 
 					// Bare "@": open the finder; empty items dismiss the inline dropdown.
+					// Snapshot the editor now (lines + caret) so we can splice the pick in
+					// at the "@" — by the time the finder closes the caret has been reset
+					// to end-of-buffer (see insertMention).
 					if (query.trim() === "") {
-						if (!finderBusy) openFinder();
+						if (!finderBusy) openFinder({ lines: [...lines], cursorLine, cursorCol });
 						return { items: [], prefix: "@" };
 					}
 
