@@ -13,6 +13,8 @@
 
 import * as os from "node:os";
 import type { Message } from "@earendil-works/pi-ai";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import { toSafeLines, toSingleLine } from "../shared/terminal-text.js";
 import type { AgentSource } from "./agents.ts";
 
 // 并行模式下每个子任务返回给父模型的输出上限（超出截断，完整结果仍在 tool details 里）。
@@ -63,6 +65,12 @@ export type DisplayItem =
 	| { type: "text"; text: string }
 	| { type: "toolCall"; name: string; args: Record<string, any> };
 
+// —— 单行化：实现见 ../shared/terminal-text.ts —— //
+
+// 单行化 helper 已上提到 ../shared/terminal-text.ts（与 tmux-bash 的 /bg 面板共用同一份实现），
+// 这里 re-export 保持本模块对外接口不变。为什么必须单行化——见那个文件的头注释。
+export { toSafeLines, toSingleLine };
+
 export function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -96,10 +104,25 @@ export function formatUsageStats(
 	return parts.join(" ");
 }
 
+// 工具调用预览里「参数部分」的默认可见宽度上限（聊天里的历史行为；面板会按 overlay 实宽覆盖）。
+export const DEFAULT_TOOL_ARG_WIDTH = 60;
+
+// 对外入口：结果一律单行化（bash 的 heredoc / grep 的多行 pattern 等都可能带真换行）。
+// maxWidth = 参数预览允许的可见列宽（不是字符数），调用方按自己的容器宽度传，实现自适应截断。
 export function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
 	themeFg: (color: any, text: string) => string,
+	maxWidth: number = DEFAULT_TOOL_ARG_WIDTH,
+): string {
+	return toSingleLine(formatToolCallInner(toolName, args, themeFg, Math.max(12, Math.floor(maxWidth))));
+}
+
+function formatToolCallInner(
+	toolName: string,
+	args: Record<string, unknown>,
+	themeFg: (color: any, text: string) => string,
+	maxWidth: number,
 ): string {
 	const shortenPath = (p: string) => {
 		const home = os.homedir();
@@ -108,8 +131,9 @@ export function formatToolCall(
 
 	switch (toolName) {
 		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+			// 先单行化再按可见列宽截断：否则窗口里可能落进多个换行（宽度算 0），预览行会撑破面板。
+			const command = toSingleLine((args.command as string) || "...");
+			const preview = truncateToWidth(command, maxWidth, "…");
 			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
 		}
 		case "read": {
@@ -158,7 +182,7 @@ export function formatToolCall(
 		}
 		default: {
 			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
+			const preview = truncateToWidth(argsStr, Math.max(12, maxWidth - 10), "…");
 			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
 		}
 	}

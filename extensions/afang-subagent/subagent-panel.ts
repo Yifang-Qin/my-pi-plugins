@@ -25,6 +25,8 @@ import {
 	getDisplayItems,
 	isFailedResult,
 	type SubagentPanelTask,
+	toSafeLines,
+	toSingleLine,
 } from "./render-helpers.ts";
 
 // index.ts 通过依赖注入把「读取 pi 入口那个实例的状态」的闭包传进来。为什么不直接
@@ -87,11 +89,19 @@ function sortTasks(tasks: SubagentPanelTask[]): SubagentPanelTask[] {
 }
 
 // 把某任务的子进程轨迹拍平成「已上色」的行数组（供输出视图滚动展示）。
-function trajectoryLines(t: SubagentPanelTask, th: Theme): string[] {
+// 不变式：数组里每个元素都必须是「单行」——不含裸 \n/\r，否则 overlay 会错位（见 render-helpers 的 toSingleLine）。
+// innerW = overlay 可用列宽；工具调用预览据此自适应截断（旧实现硬编码 60 字符，在宽终端下白白浪费半屏）。
+function trajectoryLines(t: SubagentPanelTask, th: Theme, innerW: number): string[] {
 	const lines: string[] = [];
-	const topic = t.topic ? th.fg("muted", ` (${t.topic})`) : "";
+	// 预算 = 内宽 − row() 左侧 1 空格 − "→ " 前缀 − "$ " 之类的命令前缀余量。
+	const callWidth = Math.max(20, innerW - 6);
+	const topic = t.topic ? th.fg("muted", ` (${toSingleLine(t.topic)})`) : "";
 	lines.push(th.fg("muted", "Agent: ") + th.fg("accent", t.agentName) + topic + th.fg("muted", ` · ${t.agentSource}`));
-	lines.push(th.fg("muted", "Task: ") + th.fg("dim", t.task));
+	// task 常常是多行 prompt：逐行展开（首行带 "Task: " 前缀，续行缩进对齐）。
+	const taskLines = toSafeLines(t.task.trimEnd());
+	taskLines.forEach((l, i) => {
+		lines.push(i === 0 ? th.fg("muted", "Task: ") + th.fg("dim", l) : th.fg("dim", `      ${l}`));
+	});
 	lines.push("");
 
 	const items = getDisplayItems(t.result.messages);
@@ -100,17 +110,20 @@ function trajectoryLines(t: SubagentPanelTask, th: Theme): string[] {
 	} else {
 		for (const item of items) {
 			if (item.type === "toolCall") {
-				lines.push(th.fg("muted", "→ ") + formatToolCall(item.name, item.args, th.fg.bind(th)));
+				lines.push(th.fg("muted", "→ ") + formatToolCall(item.name, item.args, th.fg.bind(th), callWidth));
 			} else {
 				const text = item.text.trimEnd();
-				if (text) for (const l of text.split("\n")) lines.push(th.fg("toolOutput", l));
+				if (text) for (const l of toSafeLines(text)) lines.push(th.fg("toolOutput", l));
 			}
 		}
 	}
 
 	if (isFailedResult(t.result) && t.result.errorMessage) {
 		lines.push("");
-		lines.push(th.fg("error", `Error: ${t.result.errorMessage}`));
+		// errorMessage 可能是多行堆栈。
+		toSafeLines(t.result.errorMessage.trimEnd()).forEach((l, i) => {
+			lines.push(th.fg("error", i === 0 ? `Error: ${l}` : `       ${l}`));
+		});
 	}
 	const usage = formatUsageStats(t.result.usage, t.result.model);
 	if (usage) {
@@ -141,6 +154,7 @@ class SubagentPanel implements Component {
 	private outputScroll = 0;
 	private outputFollow = true;
 	private lastBodyRows = 10;
+	private lastInnerW = 100; // render() 回填的真实内宽；轨迹行的截断预算随它自适应。
 
 	private confirmKillId: string | null = null; // 非空 = 正在等 y/n 确认
 	private notice = "";
@@ -186,12 +200,13 @@ class SubagentPanel implements Component {
 	private reloadOutput(): void {
 		const t = this.outputTask();
 		if (!t) return;
-		this.outputLines = trajectoryLines(t, this.theme);
+		this.outputLines = trajectoryLines(t, this.theme, this.lastInnerW);
 	}
 
 	private openOutput(t: SubagentPanelTask): void {
 		this.outputId = t.id;
-		const preview = t.task.length > TASK_PREVIEW_CHARS ? `${t.task.slice(0, TASK_PREVIEW_CHARS)}…` : t.task;
+		const raw = toSingleLine(t.task);
+		const preview = raw.length > TASK_PREVIEW_CHARS ? `${raw.slice(0, TASK_PREVIEW_CHARS)}…` : raw;
 		this.outputTitle = `${t.id} · ${t.agentName} · ${preview}`;
 		this.outputScroll = 0;
 		this.outputFollow = true;
@@ -332,9 +347,15 @@ class SubagentPanel implements Component {
 		const th = this.theme;
 		const bodyRows = this.bodyRows();
 		this.lastBodyRows = bodyRows;
+		// 终端宽度变化（或首次渲染）时按新内宽重算轨迹行，让预览截断长度跟着面板走。
+		if (innerW !== this.lastInnerW) {
+			this.lastInnerW = innerW;
+			if (this.view === "output") this.reloadOutput();
+		}
 
 		const pad = (s: string, len: number) => s + " ".repeat(Math.max(0, len - visibleWidth(s)));
-		const fit = (s: string) => truncateToWidth(s, innerW);
+		// fit 里统一过一遍 toSingleLine：最后一道防线，任何漏网的裸换行/控制符都不会破坏 overlay 行契约。
+		const fit = (s: string) => truncateToWidth(toSingleLine(s), innerW);
 		const row = (content: string) => th.fg("border", "│") + pad(fit(content), innerW) + th.fg("border", "│");
 		const top = th.fg("border", `╭${"─".repeat(innerW)}╮`);
 		const bottom = th.fg("border", `╰${"─".repeat(innerW)}╯`);
@@ -391,7 +412,7 @@ class SubagentPanel implements Component {
 		// 定宽头部（prefix + id + 图标 + kind + agent + turns + dur），task 铺满剩余。
 		const headPlain = `${prefixRaw}${pad2(t.id, 8)} ${iconRaw} ${pad2(kindLabel(t), 9)} ${pad2(t.agentName, 14)} ${pad2(turns, 4)} ${pad2(dur, 6)}  `;
 		const taskBudget = Math.max(4, innerW - visibleWidth(headPlain));
-		const taskText = truncateToWidth(t.task, taskBudget);
+		const taskText = truncateToWidth(toSingleLine(t.task), taskBudget);
 		const prefix = selected ? th.fg("accent", prefixRaw) : prefixRaw;
 		const icon = th.fg(statusColor(t), iconRaw);
 		const taskStyled = selected ? th.fg("text", taskText) : th.fg("dim", taskText);
@@ -432,7 +453,7 @@ class SubagentPanel implements Component {
 		const content = this.confirmKillId
 			? ` ${th.fg("error", `⚠ kill ${this.confirmKillId} ?`)}  ${th.fg("accent", "y")} 确认 · ${th.fg("accent", "n")} 取消`
 			: ` ${hint}`;
-		return th.fg("border", "│") + padVisible(truncateToWidth(content, innerW), innerW) + th.fg("border", "│");
+		return th.fg("border", "│") + padVisible(truncateToWidth(toSingleLine(content), innerW), innerW) + th.fg("border", "│");
 	}
 
 	private listHint(th: Theme): string {

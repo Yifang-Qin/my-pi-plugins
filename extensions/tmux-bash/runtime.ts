@@ -32,6 +32,7 @@ import {
 import { basename, join } from "node:path";
 import { truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, WINDOW_OPTIONS, frameBgNotify, type TmuxBashOptions } from "./config.js";
+import { applyCarriageReturns, stripAnsi } from "../shared/terminal-text.js";
 import {
 	attachHint,
 	ensureSession,
@@ -548,6 +549,10 @@ export function readJobLogs(
 	if (outputFile && existsSync(outputFile)) raw = readFileSync(outputFile, "utf-8");
 	if (raw === null) raw = capturePane(state.options, windowId, lines);
 
+	// 先按终端语义处理行内回车覆盖（进度条）再截断：否则一个进度条会以几十份重复快照
+	// 占满屏幕/上下文（且 \r 在 overlay 里会把光标拉回列 0 造成错位）。行数统计也因此才准。
+	raw = raw.split("\n").map(applyCarriageReturns).join("\n");
+
 	const t = truncateTail(raw, { maxLines: lines, maxBytes: state.options.maxBytes });
 	return { text: t.content || "(no output)", truncated: t.truncated, fullPath: outputFile };
 }
@@ -617,8 +622,8 @@ function handleCompletion(
 	const status = exitCode === 0 ? "exited 0" : `exited ${exitCode}`;
 	const header = `Background job ${job.id} (${job.windowId}) ${status} after ${durSec}s\n$ ${job.command}`;
 	const footer = truncated ? `\n\n[output truncated; full log: ${job.outputFile}]` : "";
-	// 加上「系统通知框」：此消息会被 pi 降级成 role:"user"，不加框模型会误当成用户新指令。
-	const content = frameBgNotify(`${header}\n\n${text}${footer}`);
+	// 给模型看的文本剥掉 ANSI（颜色转义在上下文里只是噪音）；面板那边仍保留 SGR。
+	const content = frameBgNotify(`${header}\n\n${stripAnsi(text)}${footer}`);
 
 	// 清理哨兵文件；按配置关闭窗口。
 	try {
@@ -711,7 +716,7 @@ export function notifyUserKilled(
 		`after ${durSec}s. The user manually killed it — this is not an error, not a crash, and not something ` +
 		`to retry or resume unless the user asks.`;
 	const footer = truncated && fullPath ? `\n\n[output truncated; full log: ${fullPath}]` : "";
-	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${text}${footer}`);
+	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${stripAnsi(text)}${footer}`);
 	pi.sendMessage(
 		{
 			customType: COMPLETION_CUSTOM_TYPE,

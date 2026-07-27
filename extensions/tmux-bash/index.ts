@@ -14,6 +14,7 @@
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { toSingleLine, stripAnsi } from "../shared/terminal-text.js";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import { openBgPanel } from "./bg-panel.js";
@@ -334,7 +335,8 @@ export default function (pi: ExtensionAPI): void {
 				const omittedJobs = Math.max(0, allJobs.length - selectedJobs.length);
 				const jobs = selectedJobs.map((job) => ({
 					...job,
-					command: truncateLine(job.command, MAX_BG_COMMAND_CHARS).text,
+					// 先单行化：多行 heredoc 命令会把「一行一个 job」的列表格式撞成多行，模型难以解析。
+					command: truncateLine(toSingleLine(job.command), MAX_BG_COMMAND_CHARS).text,
 				}));
 				const lines = jobs.map((job) => {
 					const status = fmtJobStatus(job);
@@ -365,7 +367,8 @@ export default function (pi: ExtensionAPI): void {
 					job?.outputFile ?? listWindowsForSession(state).find((w) => w.id === params.window)?.outputFile;
 				const { text, truncated, fullPath } = readJobLogs(state, params.window, outputFile, lines);
 				const footer = truncated && fullPath ? `\n\n[output truncated; full log: ${fullPath}]` : "";
-				return reply(`${text}${footer}`, { window: params.window, truncated, fullPath });
+				// 模型侧日志剥掉 ANSI（CR 覆盖已在 readJobLogs 里做过）。
+				return reply(`${stripAnsi(text)}${footer}`, { window: params.window, truncated, fullPath });
 			}
 
 			// action === "kill"。先后各对一次哨兵，避免「命令已完成、40ms watcher 尚未处理」时误标 killed。

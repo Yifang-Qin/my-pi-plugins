@@ -13,9 +13,9 @@
 // killWindow+markJobKilled / reconcileCompletedJobs），只多包一层键盘交互与绘制。
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { truncateLine } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { sanitizeTerminalOutput, toSingleLine } from "../shared/terminal-text.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import {
 	listJobsForSession,
@@ -30,7 +30,6 @@ import {
 import { killWindow } from "./tmux.js";
 
 const REFRESH_MS = 1000;
-const CMD_CHARS = 100;
 const PANEL_WIDTH_PCT = 0.9;
 const PANEL_HEIGHT_PCT = 0.85;
 const MIN_BODY_ROWS = 3;
@@ -63,7 +62,7 @@ class BgPanel implements Component {
 
 	// 输出视图状态。
 	private outputWindowId: string | null = null;
-	private outputTitle = "";
+	private outputCommand = ""; // 已单行化的命令；标题在 render 时按实际内宽拼装（而非硬截 100 字符）。
 	private outputLines: string[] = [];
 	private outputTruncated = false;
 	private outputFullPath?: string;
@@ -128,14 +127,15 @@ class BgPanel implements Component {
 			job?.outputFile,
 			this.state.options.maxLines,
 		);
-		this.outputLines = (text || "(no output)").split("\n");
+		this.outputLines = sanitizeTerminalOutput(text || "(no output)");
 		this.outputTruncated = truncated;
 		this.outputFullPath = fullPath;
 	}
 
 	private openOutput(job: BackgroundJobInfo): void {
 		this.outputWindowId = job.windowId;
-		this.outputTitle = `${job.windowId} · ${truncateLine(job.command || "(shell)", CMD_CHARS).text}`;
+		// 命令可能是多行 heredoc：先压成单行，否则标题行会把 overlay 顶部撞歪。
+		this.outputCommand = toSingleLine(job.command || "(shell)");
 		this.outputScroll = 0;
 		this.outputFollow = true;
 		this.reloadOutput();
@@ -298,7 +298,9 @@ class BgPanel implements Component {
 		this.lastBodyRows = bodyRows;
 
 		const pad = (s: string, len: number) => s + " ".repeat(Math.max(0, len - visibleWidth(s)));
-		const fit = (s: string) => truncateToWidth(s, innerW);
+		// fit 里统一过一遍 toSingleLine：最后一道防线，任何漏网的裸换行/控制符都不会破坏
+		// 「一行字符串 = 一个物理行」的 overlay 契约（见 ../shared/terminal-text.ts）。
+		const fit = (s: string) => truncateToWidth(toSingleLine(s), innerW);
 		const row = (content: string) => th.fg("border", "│") + pad(fit(content), innerW) + th.fg("border", "│");
 		const top = th.fg("border", `╭${"─".repeat(innerW)}╮`);
 		const bottom = th.fg("border", `╰${"─".repeat(innerW)}╯`);
@@ -371,7 +373,8 @@ class BgPanel implements Component {
 		// 预算（visibleWidth 忽略 ANSI），与下方 styled 拼串宽度一致 → 总宽 ≤ innerW，row() 只需补白。
 		const headPlain = `${prefixRaw}${job.windowId}  ${iconRaw} ${pad2(status, 18)} ${pad2(dur, 5)}  $ `;
 		const cmdBudget = Math.max(4, innerW - visibleWidth(headPlain));
-		const cmd = truncateToWidth(job.command || "(shell)", cmdBudget);
+		// 多行命令（heredoc / for 循环）必须先单行化：\n 宽度算 0，会直接穿过 truncateToWidth。
+		const cmd = truncateToWidth(toSingleLine(job.command || "(shell)"), cmdBudget);
 		const prefix = selected ? th.fg("accent", prefixRaw) : prefixRaw;
 		const icon = th.fg(iconColor, iconRaw);
 		const cmdStyled = selected ? th.fg("text", cmd) : th.fg("dim", cmd);
@@ -389,7 +392,11 @@ class BgPanel implements Component {
 	): string[] {
 		const job = this.outputJob();
 		const statusText = job ? fmtJobStatus(job) : "已结束";
-		const titleText = ` ${th.fg("accent", "输出")} ${th.fg("muted", this.outputTitle)}  ${th.fg("muted", `[${statusText}]`)}`;
+		// 标题长度自适应：先算固定部分（id + 状态）占宽，剩下的全给命令预览。
+		const headPlain = ` 输出 ${this.outputWindowId ?? ""} ·   [${statusText}]`;
+		const cmdBudget = Math.max(8, innerW - visibleWidth(headPlain));
+		const cmdPreview = truncateToWidth(this.outputCommand, cmdBudget, "…");
+		const titleText = ` ${th.fg("accent", "输出")} ${th.fg("muted", `${this.outputWindowId ?? ""} · ${cmdPreview}`)}  ${th.fg("muted", `[${statusText}]`)}`;
 		const lines: string[] = [top, row(titleText), sep];
 
 		// 跟随尾部时把 scroll 钉到底部。
@@ -411,7 +418,7 @@ class BgPanel implements Component {
 		const content = this.confirmKillWindow
 			? ` ${th.fg("error", `⚠ kill ${this.confirmKillWindow} ?`)}  ${th.fg("accent", "y")} 确认 · ${th.fg("accent", "n")} 取消`
 			: ` ${hint}`;
-		return th.fg("border", "│") + padVisible(truncateToWidth(content, innerW), innerW) + th.fg("border", "│");
+		return th.fg("border", "│") + padVisible(truncateToWidth(toSingleLine(content), innerW), innerW) + th.fg("border", "│");
 	}
 
 	private listHint(th: Theme): string {
