@@ -32,7 +32,7 @@ import {
 import { basename, join } from "node:path";
 import { truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { COMPLETION_CUSTOM_TYPE, WINDOW_OPTIONS, frameBgNotify, type TmuxBashOptions } from "./config.js";
-import { applyCarriageReturns, stripAnsi } from "../shared/terminal-text.js";
+import { applyCarriageReturns, collapseCarriageReturns, stripAnsi } from "../shared/terminal-text.js";
 import {
 	attachHint,
 	ensureSession,
@@ -328,6 +328,22 @@ function readOutputFile(outputFile: string): string {
 	}
 }
 
+// 前台 bash 的 TUI/模型快照清洗：原始 .out 保留终端输出语义，进入 pi renderer 前则把
+// 回车覆盖 + EL 擦除折叠成最终行，并去掉会移动光标/改变终端状态的 ANSI。必须在 truncateTail
+// 之前做，否则 pi-tui 0.81+ 会把 CR 当作物理换行、把 \x1b[nA 这类光标移动当零宽穿透，
+// 导致进度条快照膨胀成多行、且违反「1 字符串 = 1 物理行」契约。
+//
+// 顺序要点（踩过的坑）：必须先 collapse 再 stripAnsi。collapse 需要看见 \x1b[K（EL）才能
+// 正确折叠 docker/npm/pip 的 `\r\x1b[K` 收缩进度条；若先 stripAnsi 把 EL 删了，就会残留旧尾巴
+// 算出乱码（如 `Doneloading 45%…`）。collapse 已丢弃光标移动 CSI、并顺带剥掉非 SGR 噪声，
+// 末尾再 stripAnsi 把 SGR 颜色也去掉（对齐内置 bash getTextOutput 的纯文本语义，省 token）。
+export function normalizeForegroundOutput(raw: string): string {
+	return raw
+		.split(/\r\n|\n/)
+		.map((line) => stripAnsi(collapseCarriageReturns(line)))
+		.join("\n");
+}
+
 // 组装最终结果，尽量对齐内置 bash 的 content/details/isError/错误文案。
 // statusOverride 非空（超时/中断）时作为错误状态行拼到输出末尾。
 function buildFinalResult(
@@ -337,7 +353,7 @@ function buildFinalResult(
 	durationMs: number,
 	statusOverride?: string,
 ): ToolTextResult {
-	const t = truncateTail(readOutputFile(outputFile), {
+	const t = truncateTail(normalizeForegroundOutput(readOutputFile(outputFile)), {
 		maxLines: state.options.maxLines,
 		maxBytes: state.options.maxBytes,
 	});
@@ -439,7 +455,10 @@ export async function runForegroundBash(
 			const current = readOutputFile(outputFile);
 			if (current !== lastEmitted) {
 				lastEmitted = current;
-				const t = truncateTail(current, { maxLines: options.maxLines, maxBytes: options.maxBytes });
+				const t = truncateTail(normalizeForegroundOutput(current), {
+					maxLines: options.maxLines,
+					maxBytes: options.maxBytes,
+				});
 				params.onUpdate({ content: [{ type: "text", text: t.content }], details: undefined });
 			}
 		}

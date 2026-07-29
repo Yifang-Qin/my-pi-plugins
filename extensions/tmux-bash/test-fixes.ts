@@ -1,7 +1,8 @@
 // tmux-bash 关键行为的功能测试（bun 运行）：
 //   1. bash -n 语法预检：坏命令（heredoc 撇号，bash 3.2 解析器炸）被拦截、好命令放行
 //   2. 前台循环窗口死亡检测：窗口未写哨兵被外部 kill 时，快速以 isError 返回
-//   3. 后台完成通知走 steer，自然完成会刷新 TUI 状态，且 autoClose 后 bg list 仍保留 completed + exitCode
+//   3. 前台输出边界标准化：CR 进度条折叠为最终行，危险 ANSI 不穿透到 TUI
+//   4. 后台完成通知走 steer，自然完成会刷新 TUI 状态，且 autoClose 后 bg list 仍保留 completed + exitCode
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
 // 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/{pi-coding-agent,pi-tui}
 // 软链接到全局安装（node_modules 已 gitignore）：
@@ -13,6 +14,7 @@ import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { collapseCarriageReturns } from "../shared/terminal-text.ts";
 import { loadOptions } from "./config.ts";
 import {
 	buildWrapperScript,
@@ -21,6 +23,7 @@ import {
 	createState,
 	formatSessionEnvExports,
 	listJobsForSession,
+	normalizeForegroundOutput,
 	reconcileCompletedJobs,
 	resetRunDir,
 	runForegroundBash,
@@ -100,6 +103,36 @@ check("好命令放行", goodErr === null, goodErr ?? undefined);
 		.filter(Boolean)
 		.join("\n");
 	check("session env → 后置覆盖 stale（fresh 在 stale 之后）", composed.lastIndexOf("fresh") > composed.indexOf("stale"));
+}
+
+// —— 测试 1c：前台输出边界标准化（CR + EL + 光标移动 ANSI）—— //
+{
+	const progress = normalizeForegroundOutput("\x1b[31m0%\x1b[0m\r\x1b[32m100%\x1b[0m\n");
+	check("前台输出 → CR 覆盖折叠为最终行", progress === "100%\n", JSON.stringify(progress));
+
+	// docker/npm/pip 最常见的 `\r\x1b[K`（EL 擦到行尾）收缩进度条：只应保留新内容，不能残留旧尾巴
+	const shrink = normalizeForegroundOutput("Downloading 45% [######    ] 12.3MB/s\r\x1b[KDone\n");
+	check("前台输出 → \\r\\x1b[K 收缩进度条只留最终态", shrink === "Done\n", JSON.stringify(shrink));
+
+	const multiShrink = normalizeForegroundOutput("\r\x1b[K  0% |          |\r\x1b[K100% |##########|\r\x1b[KOK\n");
+	check("前台输出 → 多次 EL 收缩取最后一帧", multiShrink === "OK\n", JSON.stringify(multiShrink));
+
+	const rewritten = normalizeForegroundOutput("line-a\nline-b\n\x1b[1A\x1b[2Krewritten\n");
+	check(
+		"前台输出 → 删除会移动光标的 ANSI（\\x1b[1A）",
+		rewritten === "line-a\nline-b\nrewritten\n",
+		JSON.stringify(rewritten),
+	);
+
+	// collapseCarriageReturns 单测：给 /bg 面板用的路径必须保留 SGR 颜色
+	const colored = collapseCarriageReturns("\x1b[31mERR bar\x1b[0m\r\x1b[K\x1b[32mOK\x1b[0m");
+	check(
+		"collapse → EL 收缩后仍保留 SGR 颜色（面板路径）",
+		colored.includes("OK") && !colored.includes("ERR") && colored.includes("\x1b[32m"),
+		JSON.stringify(colored),
+	);
+	const keepTail = collapseCarriageReturns("aaaaaaaa\rbb");
+	check("collapse → 纯覆盖(无 EL)保留旧尾巴", keepTail === "bbaaaaaa", JSON.stringify(keepTail));
 }
 
 // —— 测试 2/3：runForegroundBash 集成 —— //

@@ -14,7 +14,7 @@
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { toSingleLine, stripAnsi } from "../shared/terminal-text.js";
+import { toSingleLine, stripAnsi, collapseCarriageReturns } from "../shared/terminal-text.js";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import { openBgPanel } from "./bg-panel.js";
@@ -218,7 +218,9 @@ export default function (pi: ExtensionAPI): void {
 			const st = context?.state as TimerState | undefined;
 			if (st && context?.executionStarted && st.startedAt === undefined) st.startedAt = Date.now();
 			const command = args?.command ?? "";
-			const lines = command.split("\n");
+			// 防御带：命令回显是模型作者文本，没过 normalizeForegroundOutput。万一带了裸 \r / 光标移动
+			// 序列，会毁掉 pi-tui「1 字符串 = 1 物理行」契约；逐行 collapse（保 SGR）后应仍是单行。
+			const lines = command.split("\n").map((l) => collapseCarriageReturns(l));
 			const maxLines = context?.expanded ? Infinity : 3;
 			const shown = lines.slice(0, maxLines);
 			let text = theme.fg("toolTitle", theme.bold("$ "));
