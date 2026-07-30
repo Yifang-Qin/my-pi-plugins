@@ -21,10 +21,12 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import {
 	type BgStatus,
 	formatToolCall,
+	formatHarnessActivity,
 	formatUsageStats,
 	getDisplayItems,
 	isFailedResult,
 	type SubagentPanelTask,
+	stripNonSgrAnsi,
 	toSafeLines,
 	toSingleLine,
 } from "./render-helpers.ts";
@@ -124,6 +126,20 @@ function trajectoryLines(t: SubagentPanelTask, th: Theme, innerW: number): strin
 		toSafeLines(t.result.errorMessage.trimEnd()).forEach((l, i) => {
 			lines.push(th.fg("error", i === 0 ? `Error: ${l}` : `       ${l}`));
 		});
+	}
+	if ((t.result.harnessActivity?.length ?? 0) > 0) {
+		lines.push("");
+		lines.push(th.fg("muted", "Harness activity:"));
+		for (const activity of t.result.harnessActivity ?? []) {
+			const failed =
+				(activity.type === "compaction_end" &&
+					(activity.aborted || Boolean(activity.errorMessage) || !activity.hadResult)) ||
+				(activity.type === "auto_retry_end" && !activity.success);
+			const color = failed ? "error" : activity.type.endsWith("_end") ? "success" : "warning";
+			for (const line of toSafeLines(stripNonSgrAnsi(formatHarnessActivity(activity)))) {
+				lines.push(th.fg("muted", "↻ ") + th.fg(color, line));
+			}
+		}
 	}
 	const usage = formatUsageStats(t.result.usage, t.result.model);
 	if (usage) {

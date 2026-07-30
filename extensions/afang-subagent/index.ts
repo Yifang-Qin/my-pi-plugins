@@ -19,7 +19,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
@@ -33,11 +32,14 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { makeBgNotifyFramer } from "../shared/bg-notify.js";
 import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents, discoverBuiltinAgents } from "./agents.ts";
+import { processChildEvent } from "./child-events.ts";
 import { openSubagentPanel } from "./subagent-panel.ts";
 import {
 	type BgStatus,
 	type DisplayItem,
 	formatToolCall,
+	formatHarnessActivity,
+	formatHarnessStats,
 	formatUsageStats,
 	getDisplayItems,
 	getFinalOutput,
@@ -45,6 +47,8 @@ import {
 	isFailedResult,
 	type SingleResult,
 	type SubagentPanelTask,
+	stripNonSgrAnsi,
+	toSafeLines,
 	truncateParallelOutput,
 } from "./render-helpers.ts";
 
@@ -217,33 +221,7 @@ async function runSingleAgent(
 				} catch {
 					return;
 				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
+				if (processChildEvent(currentResult, event)) emitUpdate();
 			};
 
 			proc.stdout.on("data", (data) => {
@@ -666,6 +644,10 @@ function writeBgResultFileTo(t: BgTask, dir: string): void {
 		`- Usage: ${formatUsageStats(t.result.usage, t.result.model) || "n/a"}`,
 	];
 	if (t.result.errorMessage) lines.push(`- Error: ${t.result.errorMessage}`);
+	if ((t.result.harnessActivity?.length ?? 0) > 0) {
+		lines.push("", "## Harness Activity", "");
+		for (const activity of t.result.harnessActivity ?? []) lines.push(`- ${formatHarnessActivity(activity)}`);
+	}
 	lines.push("", "## Task", "", t.task, "", "## Output", "", getResultOutput(t.result));
 	fs.writeFileSync(file, lines.join("\n"), { encoding: "utf-8" });
 	t.resultFile = file;
@@ -678,10 +660,12 @@ function formatBgCompletion(t: BgTask): string {
 			? `${output.slice(0, BG_NOTIFY_PREVIEW_CHARS)}\n…[truncated]`
 			: output;
 	const usage = formatUsageStats(t.result.usage, t.result.model);
+	const harness = formatHarnessStats(t.result);
 	return [
 		`**${t.id}** (${t.agentName}${t.topic ? ` — ${t.topic}` : ""}) — ${t.status}`,
 		preview.trim() || "(no output)",
 		usage,
+		harness ? `Harness: ${harness}` : "",
 		t.resultFile
 			? `Full result: subagent_tasks {action:"result", id:"${t.id}"} or read ${t.resultFile}`
 			: `Full result: subagent_tasks {action:"result", id:"${t.id}"}`,
@@ -828,28 +812,7 @@ function startBackgroundTask(
 					} catch {
 						return;
 					}
-					if (event.type === "message_end" && event.message) {
-						const msg = event.message as Message;
-						t.result.messages.push(msg);
-						if (msg.role === "assistant") {
-							t.result.usage.turns++;
-							const usage = msg.usage;
-							if (usage) {
-								t.result.usage.input += usage.input || 0;
-								t.result.usage.output += usage.output || 0;
-								t.result.usage.cacheRead += usage.cacheRead || 0;
-								t.result.usage.cacheWrite += usage.cacheWrite || 0;
-								t.result.usage.cost += usage.cost?.total || 0;
-								t.result.usage.contextTokens = usage.totalTokens || 0;
-							}
-							if (!t.result.model && msg.model) t.result.model = msg.model;
-							if (msg.stopReason) t.result.stopReason = msg.stopReason;
-							if (msg.errorMessage) t.result.errorMessage = msg.errorMessage;
-						}
-					}
-					if (event.type === "tool_result_end" && event.message) {
-						t.result.messages.push(event.message as Message);
-					}
+					processChildEvent(t.result, event);
 				};
 
 				proc.stdout.on("data", (data) => {
@@ -1013,6 +976,12 @@ export default function (pi: ExtensionAPI) {
 					`Task: ${t.task}`,
 				];
 				if (t.resultFile) lines.push(`Result file: ${t.resultFile}`);
+				if ((t.result.harnessActivity?.length ?? 0) > 0) {
+					lines.push("Harness activity:");
+					for (const activity of (t.result.harnessActivity ?? []).slice(-6)) {
+						lines.push(`- ${formatHarnessActivity(activity)}`);
+					}
+				}
 				if (t.status === "failed" && t.result.errorMessage) lines.push(`Error: ${t.result.errorMessage}`);
 				return reply(lines.join("\n"));
 			}
@@ -1029,7 +998,11 @@ export default function (pi: ExtensionAPI) {
 					output = `${output.slice(0, BG_RESULT_INLINE_CAP)}\n\n[truncated]`;
 					note = t.resultFile ? `\n\nFull result: read ${t.resultFile}` : "";
 				}
-				return reply(`${t.id} — ${t.status}\n\n${output}${note}`);
+				const harness =
+					(t.result.harnessActivity?.length ?? 0) > 0
+						? `\n\nHarness activity:\n${(t.result.harnessActivity ?? []).map((activity) => `- ${formatHarnessActivity(activity)}`).join("\n")}`
+						: "";
+				return reply(`${t.id} — ${t.status}\n\n${output}${harness}${note}`);
 			}
 
 			// cancel
@@ -1450,6 +1423,17 @@ export default function (pi: ExtensionAPI) {
 				return text.trimEnd();
 			};
 
+			const appendHarnessActivity = (container: Container, r: SingleResult) => {
+				if ((r.harnessActivity?.length ?? 0) === 0) return;
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Harness ───"), 0, 0));
+				for (const activity of r.harnessActivity ?? []) {
+					for (const line of toSafeLines(stripNonSgrAnsi(formatHarnessActivity(activity)))) {
+						container.addChild(new Text(theme.fg("muted", "↻ ") + theme.fg("warning", line), 0, 0));
+					}
+				}
+			};
+
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
 				const isError = isFailedResult(r);
@@ -1487,6 +1471,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
+					appendHarnessActivity(container, r);
 					const usageStr = formatUsageStats(r.usage, r.model);
 					if (usageStr) {
 						container.addChild(new Spacer(1));
@@ -1503,6 +1488,8 @@ export default function (pi: ExtensionAPI) {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
+				const harnessStats = formatHarnessStats(r);
+				if (harnessStats) text += `\n${theme.fg("warning", `↻ ${harnessStats}`)}`;
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
@@ -1572,6 +1559,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
+						appendHarnessActivity(container, r);
 						const stepUsage = formatUsageStats(r.usage, r.model);
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
@@ -1596,6 +1584,8 @@ export default function (pi: ExtensionAPI) {
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					const harnessStats = formatHarnessStats(r);
+					if (harnessStats) text += `\n${theme.fg("warning", `↻ ${harnessStats}`)}`;
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
 				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
@@ -1657,6 +1647,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
+						appendHarnessActivity(container, r);
 						const taskUsage = formatUsageStats(r.usage, r.model);
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
@@ -1683,6 +1674,8 @@ export default function (pi: ExtensionAPI) {
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					const harnessStats = formatHarnessStats(r);
+					if (harnessStats) text += `\n${theme.fg("warning", `↻ ${harnessStats}`)}`;
 				}
 				if (!isRunning) {
 					const usageStr = formatUsageStats(aggregateUsage(details.results));

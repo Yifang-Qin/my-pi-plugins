@@ -14,7 +14,7 @@
 import * as os from "node:os";
 import type { Message } from "@earendil-works/pi-ai";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { toSafeLines, toSingleLine } from "../shared/terminal-text.js";
+import { stripNonSgrAnsi, toSafeLines, toSingleLine } from "../shared/terminal-text.js";
 import type { AgentSource } from "./agents.ts";
 
 // 并行模式下每个子任务返回给父模型的输出上限（超出截断，完整结果仍在 tool details 里）。
@@ -30,6 +30,50 @@ export interface UsageStats {
 	turns: number;
 }
 
+export type CompactionReason = "manual" | "threshold" | "overflow";
+export type SummarizationSource = "compaction" | "branchSummary";
+
+// 子 pi 的 AgentSession harness 生命周期事件。只保存诊断需要的小字段，不把 summary 等大内容
+// 重复塞进 tool details。顺序与 child JSON 流一致，供 /subagent 轨迹和失败结果展示。
+export type HarnessActivity =
+	| { type: "compaction_start"; atMs: number; reason: CompactionReason }
+	| {
+			type: "compaction_end";
+			atMs: number;
+			reason: CompactionReason;
+			aborted: boolean;
+			willRetry: boolean;
+			tokensBefore?: number;
+			estimatedTokensAfter?: number;
+			errorMessage?: string;
+			hadResult: boolean;
+		}
+	| {
+			type: "auto_retry_start";
+			atMs: number;
+			attempt?: number;
+			maxAttempts?: number;
+			delayMs?: number;
+			errorMessage?: string;
+		}
+	| { type: "auto_retry_end"; atMs: number; attempt?: number; success: boolean; finalError?: string }
+	| {
+			type: "summarization_retry_scheduled";
+			atMs: number;
+			source?: SummarizationSource;
+			reason?: CompactionReason;
+			attempt?: number;
+			maxAttempts?: number;
+			delayMs?: number;
+			errorMessage?: string;
+		}
+	| {
+			type: "summarization_retry_attempt_start" | "summarization_retry_finished";
+			atMs: number;
+			source?: SummarizationSource;
+			reason?: CompactionReason;
+		};
+
 export interface SingleResult {
 	agent: string;
 	agentSource: AgentSource | "unknown";
@@ -42,6 +86,7 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	harnessActivity?: HarnessActivity[];
 }
 
 export type BgStatus = "running" | "completed" | "failed" | "cancelled";
@@ -69,13 +114,92 @@ export type DisplayItem =
 
 // 单行化 helper 已上提到 ../shared/terminal-text.ts（与 tmux-bash 的 /bg 面板共用同一份实现），
 // 这里 re-export 保持本模块对外接口不变。为什么必须单行化——见那个文件的头注释。
-export { toSafeLines, toSingleLine };
+export { stripNonSgrAnsi, toSafeLines, toSingleLine };
 
 export function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
 	if (count < 1000000) return `${Math.round(count / 1000)}k`;
 	return `${(count / 1000000).toFixed(1)}M`;
+}
+
+function attemptLabel(attempt?: number, maxAttempts?: number): string {
+	if (attempt === undefined) return "";
+	return maxAttempts === undefined ? ` ${attempt}` : ` ${attempt}/${maxAttempts}`;
+}
+
+function retrySourceLabel(source?: SummarizationSource, reason?: CompactionReason): string {
+	const scope = source === "branchSummary" ? "branch summary" : source === "compaction" ? "compaction" : "summary";
+	return reason ? `${scope}/${reason}` : scope;
+}
+
+export function formatHarnessActivity(activity: HarnessActivity): string {
+	switch (activity.type) {
+		case "compaction_start":
+			return `compact ${activity.reason} started`;
+		case "compaction_end": {
+			if (activity.aborted) return `compact ${activity.reason} aborted`;
+			if (activity.errorMessage) return `compact ${activity.reason} failed: ${activity.errorMessage}`;
+			if (!activity.hadResult) return `compact ${activity.reason} ended without result`;
+			const tokenDelta =
+				activity.tokensBefore !== undefined
+					? ` ${formatTokens(activity.tokensBefore)}${activity.estimatedTokensAfter !== undefined ? ` → ~${formatTokens(activity.estimatedTokensAfter)}` : ""}`
+					: "";
+			return `compact ${activity.reason} completed${tokenDelta}${activity.willRetry ? " · retrying request" : ""}`;
+		}
+		case "auto_retry_start": {
+			const delay = activity.delayMs !== undefined ? ` in ${(activity.delayMs / 1000).toFixed(1)}s` : "";
+			const error = activity.errorMessage ? `: ${activity.errorMessage}` : "";
+			return `agent retry${attemptLabel(activity.attempt, activity.maxAttempts)} scheduled${delay}${error}`;
+		}
+		case "auto_retry_end":
+			return activity.success
+				? `agent retry${attemptLabel(activity.attempt)} succeeded`
+				: `agent retry${attemptLabel(activity.attempt)} failed${activity.finalError ? `: ${activity.finalError}` : ""}`;
+		case "summarization_retry_scheduled": {
+			const delay = activity.delayMs !== undefined ? ` in ${(activity.delayMs / 1000).toFixed(1)}s` : "";
+			const error = activity.errorMessage ? `: ${activity.errorMessage}` : "";
+			return `${retrySourceLabel(activity.source, activity.reason)} retry${attemptLabel(activity.attempt, activity.maxAttempts)} scheduled${delay}${error}`;
+		}
+		case "summarization_retry_attempt_start":
+			return `${retrySourceLabel(activity.source, activity.reason)} retry started`;
+		case "summarization_retry_finished":
+			return `${retrySourceLabel(activity.source, activity.reason)} retry finished`;
+	}
+}
+
+export function formatHarnessStats(result: SingleResult): string {
+	const events = result.harnessActivity ?? [];
+	const compactionEnds = events.filter((event) => event.type === "compaction_end");
+	const compactions = compactionEnds.filter((event) => event.hadResult && !event.aborted && !event.errorMessage).length;
+	const compactionFailures = compactionEnds.filter(
+		(event) => !event.aborted && (Boolean(event.errorMessage) || !event.hadResult),
+	).length;
+	const compactionAborts = compactionEnds.filter((event) => event.aborted).length;
+	const agentRetries = events.filter((event) => event.type === "auto_retry_start").length;
+	const summaryRetries = events.filter((event) => event.type === "summarization_retry_scheduled").length;
+	return [
+		compactions > 0 ? `cmp:${compactions}` : "",
+		compactionFailures > 0 ? `cmp-fail:${compactionFailures}` : "",
+		compactionAborts > 0 ? `cmp-abort:${compactionAborts}` : "",
+		agentRetries > 0 ? `retry:${agentRetries}` : "",
+		summaryRetries > 0 ? `sum-retry:${summaryRetries}` : "",
+	]
+		.filter(Boolean)
+		.join(" ");
+}
+
+export function getHarnessFailureLines(result: SingleResult): string[] {
+	const lines: string[] = [];
+	for (const event of result.harnessActivity ?? []) {
+		if (
+			(event.type === "compaction_end" && (event.aborted || event.errorMessage || !event.hadResult)) ||
+			(event.type === "auto_retry_end" && !event.success)
+		) {
+			lines.push(formatHarnessActivity(event));
+		}
+	}
+	return lines;
 }
 
 export function formatUsageStats(
@@ -205,10 +329,12 @@ export function isFailedResult(result: SingleResult): boolean {
 }
 
 export function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
+	const base = isFailedResult(result)
+		? result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)"
+		: getFinalOutput(result.messages) || "(no output)";
+	if (!isFailedResult(result)) return base;
+	const harnessFailures = getHarnessFailureLines(result).filter((line) => !base.includes(line));
+	return harnessFailures.length > 0 ? `${base}\n\nHarness: ${harnessFailures.join("; ")}` : base;
 }
 
 export function truncateParallelOutput(output: string): string {

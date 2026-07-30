@@ -95,6 +95,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
+- **Harness observability**: Captures child pi compaction, agent retry, and summarization-retry events; shows them in expanded tool results, `/subagent` trajectories, `subagent_tasks`, and background result files
 - **Abort support**: Ctrl+C propagates to kill subagent processes
 - **Live monitoring & per-child kill**: `/subagent` (`/sa`) overlay panel to watch each foreground
   child's trajectory and kill individuals without aborting the whole batch (see 前台任务监控与单杀)
@@ -105,6 +106,8 @@ Delegate tasks to specialized subagents with isolated context windows.
 subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
+├── child-events.ts      # 子 pi JSON 事件归一化：message/tool + compaction/retry 可观测性
+├── test-child-events.ts # child JSON 事件摄取回归测试（bun 直接运行）
 ├── subagent-panel.ts    # /subagent (/sa) 用户面板：列表 → 轨迹 → 单杀
 ├── render-helpers.ts    # 无状态纯 helper/类型（面板与 index 共享，避开 /reload 双实例，见下）
 ├── agents.ts            # Agent discovery logic
@@ -259,6 +262,7 @@ Built-in agents (bundled in `agents/`, overridable by same-name user/project age
 
 ## Error Handling
 
+- **Child harness activity**: `compaction_start/end`, agent retry, and summarization-retry events are retained in tool details and shown in expanded results, `/subagent`, `subagent_tasks`, and background reports. A failed compaction is appended to the model-visible failure diagnostic instead of being silently dropped
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: 中断子进程；single/chain 直接报错，parallel 收敛为该子任务 cancelled
