@@ -202,6 +202,79 @@ exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 
   `pi.sendMessage` 以 steer 唤醒模型。完成记录保留在当前 runtime 的 job 表中，因此默认 autoClose
   关闭 tmux 窗口后，`bg action=list` 仍会列出最终状态；`bg action=logs window=@id` 仍可读取日志。
 
+## 与 pi-powerline-footer 的兼容性
+
+### 当前结论与版本 pin
+
+在 **tmux 中运行 pi**，同时启用 `pi-powerline-footer@0.8.0` 的
+`powerline.fixedEditor: true` 时，长输出或频繁更新的 bash tool 结果附近可能出现滚动拖影。
+`tmux-bash` 会让问题更容易暴露，但目前的 A/B 测试与源码排查都指向 powerline 0.8.0 自己的
+fixed-editor compositor，而不是 tmux-bash 的输出执行后端：
+
+- `/powerline fixed-editor off` 后拖影消失；
+- 回退 `pi-powerline-footer@0.7.0` 后未再复现；
+- pi `0.82.1 → 0.83.0` 没有修改核心差分渲染、终端写入、overlay 合成或滚动逻辑，故 0.83.0
+  不能视为该问题的修复；
+- 截至 2026-07，powerline 上游尚无 `0.8.1` 或后续修复版本。
+
+因此，仓库安装文档当前固定：
+
+```bash
+pi install npm:pi-powerline-footer@0.7.0
+```
+
+若不需要固定编辑器，也可在新版 powerline 上设置 `fixedEditor: false`，让聊天区继续走 pi 的常规
+渲染路径。需要 `fixedEditor: true` 时，在完成下方复核前不要解除 `0.7.0` pin。
+
+### 问题路径
+
+```text
+tmux-bash 的长输出 / 流式更新
+  → tool result 触发聊天 viewport 频繁重绘（触发条件，不是根因）
+  → powerline fixed-editor 接管 pi-tui 的 render / doRender / terminal.write / terminal.rows
+  → powerline 0.8.0 用 DECSTBM 滚动区 + SU/SD 搬行 + cached transcript 做增量滚动
+  → tmux 屏幕状态与扩展缓存偶发偏离
+  → 已搬动的旧像素未被完整覆盖，形成拖影
+```
+
+powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除并重绘整个 viewport；0.8.0
+新增的 SU/SD 行搬移与屏上旧像素复用是两版之间最关键的差异。另一个待上游确认的状态泄漏路径是
+`buildFixedClusterPaint()` 在 `cluster.lines.length === 0` 时先返回，可能跳过后面的
+`resetScrollRegion()`。
+
+这和 tmux-bash 曾经存在的控制序列穿透是两个独立问题。当前 tmux-bash 已在数据进入 renderer 前做
+归一化：
+
+- `runtime.ts` 的 `normalizeForegroundOutput()`：先折叠 CR/EL，再剥 ANSI，之后才截断并送入
+  `onUpdate` / 最终结果；
+- `index.ts` 的 `renderCall()`：用 `collapseCarriageReturns()` 清理命令回显；
+- `shared/terminal-text.ts`：丢弃会跨行移动光标的 CSI，维护“一条 render 字符串对应一个物理行”的
+  约束。
+
+因此，后续若拖影仍只随 `fixedEditor` 开关出现，应优先排查 powerline compositor，不要先回退
+上述输出归一化。
+
+### 上游变化后的复核路径
+
+1. 记录候选环境版本：`pi --version`、`tmux -V`、`npm view pi-powerline-footer version`，并确认实际
+   安装的 powerline 版本。
+2. 先保持同一份会话和输出，执行 `/powerline fixed-editor off` 作为无拖影基线；再开启 fixed-editor
+   做 A/B，避免把 tmux-bash 输出问题和 fixed-editor 问题混在一起。
+3. 在 tmux 中覆盖这些场景：长静态输出、带 `\r` / `ESC[K` 的进度输出、流式 tool result、
+   `Ctrl+O` 展开/折叠、连续向上/向下滚动。
+4. 检查 powerline 候选版的 `fixed-editor/terminal-split.ts`：
+   - tmux 下是否已禁用 SU/SD 增量搬行，或提供全 viewport 重绘开关；
+   - 所有分支是否都会复位 DECSTBM 滚动区；
+   - 是否仍 monkey-patch `tui.doRender`、`terminal.write` 和 `terminal.rows`，从而绕开 pi 自身修复。
+5. 只有 fixed-editor 开启时也不再复现，且关闭时行为无回退，才把根 README 的安装命令移到新版。
+
+可从以下上游位置开始比较：
+
+- [pi-powerline-footer v0.8.0 CHANGELOG](https://github.com/nicobailon/pi-powerline-footer/blob/v0.8.0/CHANGELOG.md)
+- [powerline fixed-editor compositor](https://github.com/nicobailon/pi-powerline-footer/blob/v0.8.0/fixed-editor/terminal-split.ts)
+- [powerline PR #118：smooth fixed-editor scrolling](https://github.com/nicobailon/pi-powerline-footer/pull/118)
+- [pi v0.82.1...v0.83.0](https://github.com/earendil-works/pi/compare/v0.82.1...v0.83.0)
+
 ## 已知限制 / TODO
 
 - **跨 `/reload` 不恢复 job 表**：reload 后内存里的 job 映射会清空，reload 前启动的任务完成时
