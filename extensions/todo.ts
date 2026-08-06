@@ -9,6 +9,8 @@
  *   向本次请求 payload 注入非持久的 <system-reminder>（当前快照 + 对账提示），
  *   对齐 cc 的「hasn't been used recently」机制；不落盘、不在历史里累积
  * - editor 上方常驻 widget：进度条 + 三态图标（○ pending / ◼ in_progress / ✓ completed）
+ *   widget 只在 session_start 注册一次（占住 aboveEditor 的靠前位置，压在 powerline
+ *   状态栏之上），后续状态变化只 requestRender 刷新内容，不重新 setWidget。
  *
  * 状态存在工具结果的 details 里（非外部文件），因此分支切换时状态自动正确。
  */
@@ -229,20 +231,44 @@ export default function (pi: ExtensionAPI) {
 			const text = statusText(t.status, t.text, theme);
 			lines.push(truncateToWidth(` ${icon} ${id} ${text}`, width));
 		}
-		lines.push(""); // widget 与输入框之间留一行边距
+		lines.push(""); // 与下方 powerline 状态栏 / 输入框之间留一行边距
 		return lines;
 	};
 
-	// 状态变化后刷新 widget（无 todo 时清除）
+	// widget 的上下顺序 = 「首次插入 aboveEditor Map 的顺序」（TUI 侧 setWidget 同 key 是
+	// 先 delete 再 set，会把自己挪到 Map 末尾 → 渲染在最下面，紧贴输入框）。
+	// 旧实现每次状态变化都重新 setWidget，于是 todo 总排在 powerline
+	// （powerline-status / powerline-top，session_start 时安装）之后，看起来就是
+	// 「在输入框上面、但在状态栏下面」。
+	//
+	// 修法：只在 session 开始时注册一次（本扩展比 npm:pi-powerline-footer 先加载，
+	// 因此先占住 Map 的靠前位置），之后状态变化只 requestRender 刷新内容，永不重新插入。
+	// 无 todo 时 render 返回空数组（而不是删掉 widget），这样位置不会丢。
+	let tuiRef: { requestRender(): void } | undefined;
+	let widgetInstalled = false;
+
 	const refreshWidget = (ctx: ExtensionContext) => {
-		if (todos.length === 0) {
-			ctx.ui.setWidget("todo", undefined);
+		if (widgetInstalled) {
+			tuiRef?.requestRender();
 			return;
 		}
-		ctx.ui.setWidget("todo", (_tui, theme) => ({
-			render: (width: number) => renderWidgetLines(theme, width),
-			invalidate: () => {},
-		}));
+		widgetInstalled = true;
+		ctx.ui.setWidget(
+			"todo",
+			(tui, theme) => {
+				tuiRef = tui;
+				return {
+					render: (width: number) => (todos.length === 0 ? [] : renderWidgetLines(theme, width)),
+					invalidate: () => {},
+					dispose: () => {
+						// UI reset / reload 时被清掉 → 允许下次 session_start 重新占位
+						tuiRef = undefined;
+						widgetInstalled = false;
+					},
+				};
+			},
+			{ placement: "aboveEditor" },
+		);
 	};
 
 	// 全量快照文本（发给 LLM 的纯文本格式）。add/set 的 tool result 与 system prompt 注入共用。

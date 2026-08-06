@@ -60,6 +60,7 @@ fork 自 pi 官方 todo 示例、自维护演进。三态任务清单，**editor
 - 注册 `todo` 工具给 LLM（`list` / `add` / `set`+`status` / `clear`）；状态存于工具结果 `details`，**随对话分支自动正确**，`/reload` 兼容历史旧数据
 - editor 上方 widget：三段式进度条 `█`（完成）/ `▓`（进行中·浅灰）/ `░`（未开始） + 三态图标 `○`（pending）/ `◼`（in_progress）/ `✓`（completed）
 - `/todos` 命令弹窗查看当前分支清单
+- **与 `pi-powerline-footer` 的层叠顺序**：`aboveEditor` widget 的上下顺序由「首次 `setWidget` 的插入顺序」决定（同 key 重复 `setWidget` 会被挪到最下面）。本扩展只在 `session_start` 注册一次、之后靠 `requestRender` 刷新内容，因此稳定停在 powerline 状态栏**之上**。前提是 `settings.json` 的 `packages` 里 `my-pi-plugins` 排在 `npm:pi-powerline-footer` **之前**（扩展按该顺序加载 / 派发事件）。
 
 ### 🎨 gruvbox-dark
 
