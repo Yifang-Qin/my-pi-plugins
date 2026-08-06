@@ -204,29 +204,31 @@ exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 
 
 ## 与 pi-powerline-footer 的兼容性
 
-### 当前结论与版本 pin
+### 当前结论：跟随最新版
 
-在 **tmux 中运行 pi**，同时启用 `pi-powerline-footer@0.8.0` 的
-`powerline.fixedEditor: true` 时，长输出或频繁更新的 bash tool 结果附近可能出现滚动拖影。
-`tmux-bash` 会让问题更容易暴露，但目前的 A/B 测试与源码排查都指向 powerline 0.8.0 自己的
-fixed-editor compositor，而不是 tmux-bash 的输出执行后端：
-
-- `/powerline fixed-editor off` 后拖影消失；
-- 回退 `pi-powerline-footer@0.7.0` 后未再复现；
-- pi `0.82.1 → 0.83.0` 没有修改核心差分渲染、终端写入、overlay 合成或滚动逻辑，故 0.83.0
-  不能视为该问题的修复；
-- 截至 2026-07，powerline 上游尚无 `0.8.1` 或后续修复版本。
-
-因此，仓库安装文档当前固定：
+仓库安装文档现在直接跟随 powerline latest：
 
 ```bash
-pi install npm:pi-powerline-footer@0.7.0
+pi install npm:pi-powerline-footer
 ```
 
-若不需要固定编辑器，也可在新版 powerline 上设置 `fixedEditor: false`，让聊天区继续走 pi 的常规
-渲染路径。需要 `fixedEditor: true` 时，在完成下方复核前不要解除 `0.7.0` pin。
+历史上曾固定 `pi-powerline-footer@0.7.0`，用来规避 `0.8.0` 的 fixed-editor 在 tmux 下的滚动拖影。
+该 pin 现已解除，原因有两点：
 
-### 问题路径
+- **pi 升到 0.84.0 后旧 pin 会导致启动异常**：`0.7.0`（乃至 `0.8.x/0.9.x`）声明的 peer 范围是
+  `@earendil-works/* >=0.74.0 <0.81.0`，在 0.84.0 上 peer 不满足，会让 pi 打不开；`0.10.0+` 才把
+  下限抬到 `>=0.81.0`。
+- **新版已修复拖影**：实测最新版 powerline 在 tmux 中开启 `powerline.fixedEditor: true`、配合
+  tmux-bash 的长输出 / 流式 tool result，滚动拖影不再复现，渲染表现正常。
+
+> 注：powerline latest 的 peer 上界名义上仍写 `<0.84.0`，但 pi 对 peer 版本是警告而非硬拒，
+> 0.84.0 上实测可正常加载运行。等上游把上界抬到覆盖 0.84.x 后本注可删。
+
+若不需要固定编辑器，也可设置 `fixedEditor: false`，让聊天区继续走 pi 的常规渲染路径。
+
+### 拖影问题路径（历史背景，已在新版 powerline 修复）
+
+下面记录的是旧版（`0.8.0`）fixed-editor 在 tmux 下拖影的成因，保留供日后排查同类问题参考：
 
 ```text
 tmux-bash 的长输出 / 流式更新
@@ -256,6 +258,8 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
 
 ### 上游变化后的复核路径
 
+若日后升级 powerline 或 pi 后拖影重现，按此复核：
+
 1. 记录候选环境版本：`pi --version`、`tmux -V`、`npm view pi-powerline-footer version`，并确认实际
    安装的 powerline 版本。
 2. 先保持同一份会话和输出，执行 `/powerline fixed-editor off` 作为无拖影基线；再开启 fixed-editor
@@ -266,7 +270,7 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
    - tmux 下是否已禁用 SU/SD 增量搬行，或提供全 viewport 重绘开关；
    - 所有分支是否都会复位 DECSTBM 滚动区；
    - 是否仍 monkey-patch `tui.doRender`、`terminal.write` 和 `terminal.rows`，从而绕开 pi 自身修复。
-5. 只有 fixed-editor 开启时也不再复现，且关闭时行为无回退，才把根 README 的安装命令移到新版。
+5. 只有 fixed-editor 开启时也不再复现，且关闭时行为无回退，才认为该版本安全。
 
 可从以下上游位置开始比较：
 

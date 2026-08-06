@@ -98,13 +98,14 @@ pi install https://github.com/Yifang-Qin/my-pi-plugins
 3. **装配套 npm 包**
 
    ```bash
-   # 暂时固定 0.7.0：0.8.0 的 fixed-editor 在 tmux 下可能产生滚动拖影
-   pi install npm:pi-powerline-footer@0.7.0
+   pi install npm:pi-powerline-footer
    pi install npm:pi-web-access
    ```
 
-   `pi-powerline-footer` 暂不跟随 latest；解除 pin 前需重新验证其 fixed-editor 与 tmux-bash 在 tmux
-   下的组合渲染，原因和复核步骤见 [tmux-bash 兼容性说明](extensions/tmux-bash/README.md#与-pi-powerline-footer-的兼容性)。
+   `pi-powerline-footer` 跟随 latest 安装即可。旧版曾因 `pi install npm:pi-powerline-footer@0.7.0`
+   固定，用来规避 0.8.0 fixed-editor 在 tmux 下的滚动拖影；该 pin 现已解除——一是它在 pi 0.84.0 上
+   会因 peer 版本不兼容导致启动异常，二是新版 powerline 已修复拖影，实测 fixed-editor 在 tmux 下
+   与 tmux-bash 组合渲染正常。背景与复核步骤见 [tmux-bash 兼容性说明](extensions/tmux-bash/README.md#与-pi-powerline-footer-的兼容性)。
 
 4. **个性化设置**：在 `~/.pi/agent/settings.json` 里加（或直接用 `/theme gruvbox-dark` 选主题）：
 
