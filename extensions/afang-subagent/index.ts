@@ -1035,6 +1035,9 @@ export default function (pi: ExtensionAPI) {
 				: []),
 		].join("\n"),
 		promptGuidelines: [
+			"Use subagent only when delegation is necessary, materially useful, or explicitly requested by the user. Do not use subagent by default.",
+			"For simple, localized, or directly solvable tasks, work in the current session instead of delegating.",
+			"Prefer solving the task directly; use parallel or chained subagents only when the task genuinely benefits from independent or sequential delegation.",
 			"After subagent starts a background task, continue other work or end your turn normally. Do not wait or poll: if the task finishes while this session is active and you are idle, its completion notification automatically triggers a new turn.",
 		],
 		parameters: SubagentParams,
