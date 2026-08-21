@@ -78,6 +78,21 @@ export default function (pi: ExtensionAPI): void {
 	const cache = new Map<string, { files: string[]; at: number }>();
 	let inflight: Promise<string[]> | null = null;
 
+	// Captured from the ctx.ui.custom factory so we can force a repaint after
+	// programmatically writing the editor once the finder has closed.
+	//
+	// Why this is needed (pi >= 0.84.0): setEditorText/pasteToEditor mutate the
+	// editor WITHOUT requesting a render — pi-tui's contract is that the input
+	// loop repaints after each keystroke. When the user picks a file, close()
+	// synchronously restores the editor (old text) + requestRender, and 0.84.0's
+	// requestImmediateRender paints that frame from the process.nextTick queue,
+	// which drains BEFORE promise microtasks. Our `await pickFile` continuation
+	// (insertMention -> setEditorText) therefore runs AFTER that frame, with no
+	// further frame scheduled — the inserted path only showed up on the next
+	// keystroke. (Pre-0.84 the post-input render was a throttled setTimeout,
+	// i.e. a macrotask that ran after our microtask, hiding the bug.)
+	let requestRepaint: (() => void) | null = null;
+
 	const getFiles = async (cwd: string): Promise<string[]> => {
 		const hit = cache.get(cwd);
 		if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.files;
@@ -103,6 +118,7 @@ export default function (pi: ExtensionAPI): void {
 			// component renders a fixed-height list, so the layout never
 			// oscillates while typing.
 			const maxVisible = Math.max(5, Math.min(20, tui.terminal.rows - 12));
+			requestRepaint = () => tui.requestRender();
 			return new FinderOverlay({
 				tui,
 				theme,
@@ -132,7 +148,10 @@ export default function (pi: ExtensionAPI): void {
 				return;
 			}
 			const mention = await pickFile(ctx);
-			if (mention) ctx.ui.pasteToEditor(mention);
+			if (mention) {
+				ctx.ui.pasteToEditor(mention);
+				requestRepaint?.();
+			}
 		},
 	});
 
@@ -176,13 +195,16 @@ export default function (pi: ExtensionAPI): void {
 			const tail = mention.slice(1);
 			if (!at) {
 				ctx.ui.pasteToEditor(tail);
-				return;
+			} else {
+				const line = at.lines[at.cursorLine] ?? "";
+				const newLine = line.slice(0, at.cursorCol) + tail + line.slice(at.cursorCol);
+				const newLines = [...at.lines];
+				newLines[at.cursorLine] = newLine;
+				ctx.ui.setEditorText(newLines.join("\n"));
 			}
-			const line = at.lines[at.cursorLine] ?? "";
-			const newLine = line.slice(0, at.cursorCol) + tail + line.slice(at.cursorCol);
-			const newLines = [...at.lines];
-			newLines[at.cursorLine] = newLine;
-			ctx.ui.setEditorText(newLines.join("\n"));
+			// Neither pasteToEditor nor setEditorText schedules a frame; without
+			// this the path only appears on the next keystroke (see requestRepaint).
+			requestRepaint?.();
 		};
 
 		let finderBusy = false;
