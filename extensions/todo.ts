@@ -194,7 +194,9 @@ export default function (pi: ExtensionAPI) {
 			if (msg.role !== "toolResult" || msg.toolName !== "todo") continue;
 
 			const details = msg.details as TodoDetails | undefined;
-			if (details) {
+			// 参数校验失败的 toolResult 的 details 是空对象 `{}`（无 todos 字段），
+			// 必须跳过，否则 details.todos.map 会抛「reading 'map'」。
+			if (details && Array.isArray(details.todos)) {
 				todos = details.todos.map((t) => normalizeTodo(t));
 				nextId = details.nextId;
 			}
@@ -481,7 +483,8 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, { expanded }, theme, _context) {
 			const details = result.details as TodoDetails | undefined;
-			if (!details) {
+			// 参数校验失败的 result.details 是空对象 `{}`，直接回退到原始文本渲染。
+			if (!details || !Array.isArray(details.todos)) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
 			}
