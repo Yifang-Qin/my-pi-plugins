@@ -391,6 +391,60 @@ export default function (pi: ExtensionAPI): void {
 				? reply(`Killed background job in window ${params.window}.`, { window: params.window })
 				: reply(`No such tmux window: ${params.window} (already finished or closed).`, null, true);
 		},
+
+		// —— 调用行：明确显示这次 bg 调用的 action 与目标 ——
+		// 没有 renderCall 时 TUI 只显示工具名，看不出是 list / logs / kill，只能从输出反推。
+		// 风格对齐 bash 的 renderCall（toolTitle 加粗前缀 + 参数）；kill 是破坏性动作，用 error 色警示。
+		renderCall(args, theme) {
+			const action = args?.action ?? "?";
+			let text = theme.fg("toolTitle", theme.bold("bg "));
+			text += action === "kill" ? theme.fg("error", theme.bold(action)) : theme.fg("accent", action);
+			if (args?.window) text += ` ${args.window}`;
+			if (action === "logs" && args?.lines) text += theme.fg("muted", ` · last ${args.lines} lines`);
+			return new Text(text, 0, 0);
+		},
+
+		// —— 结果：按 action 上色，15 行折叠（与 bash 结果一致，expanded 全展开）——
+		// 进入这里的文本已在 execute 边界归一化（list 逐行 toSingleLine；logs 经 readJobLogs 的 CR 折叠
+		// + stripAnsi），满足「1 字符串 = 1 物理行」契约，无需再过 collapseCarriageReturns。
+		renderResult(result, options, theme, context) {
+			const output = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+			const trimmed = output.trim();
+			if (!trimmed) return new Text(theme.fg("muted", "(no output)"), 0, 0);
+
+			const action = context?.args?.action;
+			const isError = context?.isError === true;
+
+			// list 的任务行：`@241  [completed exit 0 · 3s]  name  $ cmd` —— 只给状态括号上色，
+			// 其余保持 toolOutput，一眼区分 running / 成功 / 失败，又不至于整屏大块颜色。
+			const colorListLine = (line: string): string => {
+				const m = /^(\S+\s+)\[([^\]]+)\](.*)$/.exec(line);
+				if (!m) return theme.fg("muted", line); // 元信息行（omitted / truncated / 无任务）
+				const [, head, status, rest] = m;
+				const statusColor = /^running\b/.test(status)
+					? ("accent" as const)
+					: /^completed exit 0\b/.test(status)
+						? ("success" as const)
+						: /^window missing\b/.test(status)
+							? ("warning" as const)
+							: ("error" as const); // killed / completed exit 非零
+				return theme.fg("toolOutput", head) + theme.fg(statusColor, `[${status}]`) + theme.fg("toolOutput", rest);
+			};
+
+			const colorLine = (line: string): string => {
+				if (isError) return theme.fg("error", line);
+				if (action === "list") return colorListLine(line);
+				if (action === "kill") return theme.fg("success", line);
+				// logs：正文 toolOutput，截断脚注 muted。
+				return /^\[output truncated;/.test(line) ? theme.fg("muted", line) : theme.fg("toolOutput", line);
+			};
+
+			const lines = trimmed.split("\n");
+			const max = options?.expanded ? Infinity : 15;
+			let body = lines.slice(0, max).map(colorLine).join("\n");
+			if (lines.length > max) body += theme.fg("muted", `\n… +${lines.length - max} lines`);
+			return new Text(body, 0, 0);
+		},
 	});
 
 	// —— /bg 面向用户的交互面板（overlay：列表 → Enter 看输出 / x kill）—— //
