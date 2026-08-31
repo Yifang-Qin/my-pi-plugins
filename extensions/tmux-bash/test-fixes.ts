@@ -136,7 +136,9 @@ check("好命令放行", goodErr === null, goodErr ?? undefined);
 }
 
 // —— 测试 2/3：runForegroundBash 集成 —— //
+// 用隔离 tmux session：测试 3 要按窗口名杀窗口，绝不能误伤共享 pi-bg 里真实用户的任务窗口。
 const state = createState(loadOptions());
+state.options.sessionName = `pi-bg-test-${Date.now()}`;
 const piSession = `test-${Date.now()}`;
 resetRunDir(state, piSession);
 
@@ -161,11 +163,24 @@ check(
 	okResult.content[0].text.replace(/\n/g, "\\n"),
 );
 
-// 3. 窗口死亡检测：sleep 长命令启动后，从外部 kill 窗口，应在 ~2s 内报错返回
+// 3. 窗口死亡检测：sleep 长命令启动后，从外部 kill 窗口，应在 ~2s 内报错返回。
+// 注意：前台窗口刻意【不打 jobId 标签】（避免被 /bg 列出/误杀正在跑的前台命令），
+// listTaskWindows 找不到它——须在隔离 session 里按窗口名定位（windowNameFor("sleep 60") === "sleep"）。
 const killer = setTimeout(() => {
-	const wins = listTaskWindows(state.options, piSession);
-	console.log(`   （外部 kill 窗口：${wins.map((w) => w.id).join(", ") || "未找到！"}）`);
-	for (const w of wins) killWindow(state.options, w.id);
+	let target: string | undefined;
+	try {
+		const raw = execFileSync("tmux", ["list-windows", "-t", state.options.sessionName, "-F", "#{window_id}\t#{window_name}"], {
+			encoding: "utf-8",
+		});
+		target = raw
+			.split("\n")
+			.map((line) => line.split("\t"))
+			.find(([, name]) => name === "sleep")?.[0];
+	} catch {
+		/* session 不存在等：留 target 为空 */
+	}
+	console.log(`   （外部 kill 窗口：${target ?? "未找到！"}）`);
+	if (target) killWindow(state.options, target);
 }, 1500);
 const t1 = Date.now();
 const deadResult = await runForegroundBash(state, { command: "sleep 60", cwd: process.cwd() });
@@ -264,6 +279,11 @@ check("tmux 终态标签 → 恢复 exit 7", recovered?.exitCode === 7, String(r
 killWindow(retainedState.options, retained.windowId);
 cleanup(retainedState, "quit");
 cleanup(state, "quit");
+try {
+	execFileSync("tmux", ["kill-session", "-t", state.options.sessionName], { stdio: "ignore" });
+} catch {
+	/* 隔离 session 可能从未创建 */
+}
 
 console.log(failed === 0 ? "\n全部通过 🎉" : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);
