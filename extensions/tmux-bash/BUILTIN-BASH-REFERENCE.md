@@ -218,11 +218,13 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    `state.startedAt`）。因本插件用同名 `registerTool` 完全替换 bash（含 `renderCall`/`renderResult`），
    内置那套计时器被整体遮蔽（见 `tool-execution.ts` 的 `renderResult ?? builtInToolDefinition.renderResult`），
    故在本插件 `renderResult` 里重新实现：`renderCall` 于 `executionStarted` 打点 `context.state.startedAt`；
-   `isPartial` 分支起每秒 `invalidate` 的活计时器，在**预览下方**显示 `Running · Ns`；结束 / error /
-   转后台时 `clearInterval` 收尾。有意的差异：① 运行中用**整数秒**（`Math.floor`，避免一位小数悬垂的
-   观感），完成后的总耗时改用 `details.durationMs`（runtime 实测，非渲染侧时钟）拼进末尾状态行
-   `✓ done · X.Xs`（保留一位小数）；② 文案用本插件状态行风格 `Running` / `✓ done`，而非内置的
-   `Elapsed` / `Took`；③ 运行中与完成后的状态行**同一个位置**（预览在上、状态行在下，两分支结构对称）。
+   `isPartial` 分支起每秒 `invalidate` 的活计时器，在**预览下方**显示 `Running · Ns`，并根据
+   `context.args` 追加当前运行上限：显式 timeout 显示 `hard timeout Xs · Ys left`，未设置显式
+   timeout 时显示 `auto-bg after Xs · Ys left`；结束 / error / 转后台时 `clearInterval` 收尾。
+   有意的差异：① 运行中用**整数秒**（`Math.floor`，避免一位小数悬垂的观感），完成后的总耗时改用
+   `details.durationMs`（runtime 实测，非渲染侧时钟）拼进末尾状态行 `✓ done · X.Xs`（保留一位小数）；
+   ② 文案用本插件状态行风格 `Running` / `✓ done`，而非内置的 `Elapsed` / `Took`；③ 运行中与完成后的
+   状态行**同一个位置**（预览在上、状态行在下，两分支结构对称）。
 9. **session 元数据注入（对齐 0.82.0 Bash Tool Session Environment）**：0.82.0 起 pi 内置 bash /
    `createBashTool()` 会在**每条命令启动时**注入一批描述当前 session/model 的 `PI_*` 变量：
    `PI_SESSION_ID` / `PI_SESSION_FILE` / `PI_PROVIDER` / `PI_MODEL` / `PI_REASONING_LEVEL`（只注入

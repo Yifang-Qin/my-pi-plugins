@@ -74,7 +74,8 @@
   subagent（深度 1，无 subagent 工具），因此 subagent 不可再派下一层。主 session 的工具描述会附加
   提示，告知模型其子 agent 无法继续委派，避免写出依赖嵌套委派的任务。此前唯一的闸门是 `--tools`
   白名单（worker 未限制工具，可无限递归）。
-- agent 未指定 `model` 时继承主会话当前模型（官方版不指定则回退 pi 默认模型）
+- agent 未指定 `model` 时继承主会话当前模型**和 thinking level**（`ctx.model` / `ctx.thinkingLevel`；
+  官方示例 0.84.2 起同样继承）；显式指定 `model:` 的 agent 用该模型的默认思考档位
 - **内建 agent 注册进工具描述（system prompt 常驻可见）**：注册时扫描扩展自带 `agents/*.md`，
   把名字 + description 写入 `subagent` 工具描述，模型冷启动即可"看菜下单"；描述随 `/reload`
   重建，不会过期。user/project 定制仍为运行时动态发现，描述里只提示存放位置与查看方法
@@ -152,7 +153,8 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
-When running interactively, the tool prompts for confirmation before running project-local agents. Set `confirmProjectAgents: false` to disable.
+When running interactively, the tool prompts for confirmation before running project-local agents, unless the
+repository is already trusted via `/trust` (`ctx.isProjectTrusted()`, pi 0.84.3+). Set `confirmProjectAgents: false` to disable.
 
 ## Usage
 
@@ -222,7 +224,7 @@ Agents are markdown files with YAML frontmatter:
 ---
 name: my-agent
 description: What this agent does
-tools: read, grep, find, ls
+tools: read, grep, find, ls   # 逗号字符串或 YAML 数组 [read, grep] 均可
 model: claude-haiku-4-5
 ---
 
@@ -250,7 +252,8 @@ Built-in agents (bundled in `agents/`, overridable by same-name user/project age
 | `worker` | General-purpose | (继承主模型) | (all default) |
 
 > **本 fork 的改动**：agent 定义中不指定 `model` 时，自动继承主会话当前模型
-> （`ctx.model`，含 `/model` 切换后的）；在 frontmatter 里显式写 `model:` 仍可覆盖。
+> （`ctx.model`，含 `/model` 切换后的）与 thinking level（`ctx.thinkingLevel`）；在 frontmatter 里
+> 显式写 `model:` 仍可覆盖（此时不继承思考档位）。
 
 ## Workflow Prompts
 

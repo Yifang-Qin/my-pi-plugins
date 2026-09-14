@@ -27,6 +27,7 @@ import {
 	readJobLogs,
 	reconcileCompletedJobs,
 	resetRunDir,
+	resolveTimeoutMs,
 	runForegroundBash,
 	startBackgroundCommand,
 	startWatcher,
@@ -48,6 +49,59 @@ const EXIT_CODE_PATTERN = /Command exited with code (\d+)/;
 // renderCall/renderResult 之间共享、跨重绘持久的渲染态（= tool-execution 的 rendererState）：
 // 前台运行中的实时计时器，对齐内置 bash 的 "Elapsed X.Xs" 活计时。
 type TimerState = { startedAt?: number; interval?: ReturnType<typeof setInterval> };
+
+// renderer 只根据当前 tool args + 扩展配置推导「运行上限」；不把参数复制进 rendererState。
+// 这样每个 tool row 的状态天然隔离，且 /reload 后不会留下另一份 args 快照。
+type BashRenderArgs = {
+	command?: string;
+	timeout?: number;
+	background?: boolean;
+};
+
+type RunningLimit =
+	| { kind: "hard-timeout"; totalMs: number }
+	| { kind: "foreground-timeout"; totalMs: number };
+
+function runningLimitFor(args: BashRenderArgs | undefined, foregroundTimeoutMs: number): RunningLimit | null {
+	// 拿不到 args（理论上不该发生，契约里 call/result 共享）时宁可不显示，也不按默认路径
+	// 显示 auto-bg——那对带显式 timeout 的调用是误导。
+	if (!args) return null;
+	// background:true 当前会立即分离，timeout 也不会被执行；不能显示一个实际上不生效的上限。
+	if (args.background) return null;
+	const hardTimeoutMs = resolveTimeoutMs(args.timeout);
+	if (hardTimeoutMs !== null) return { kind: "hard-timeout", totalMs: hardTimeoutMs };
+	return { kind: "foreground-timeout", totalMs: foregroundTimeoutMs };
+}
+
+function formatLimitValue(totalMs: number): string {
+	const seconds = totalMs / 1000;
+	return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
+}
+
+// 「配置上限」的文案单一来源：formatConfiguredLimit / formatRunningLimit 都从这里拼。
+function describeLimit(limit: RunningLimit): string {
+	return limit.kind === "hard-timeout"
+		? `hard timeout ${formatLimitValue(limit.totalMs)}`
+		: `auto-bg after ${formatLimitValue(limit.totalMs)}`;
+}
+
+function formatConfiguredLimit(args: BashRenderArgs | undefined, foregroundTimeoutMs: number): string {
+	const limit = runningLimitFor(args, foregroundTimeoutMs);
+	return limit ? describeLimit(limit) : "";
+}
+
+function formatRunningLimit(
+	args: BashRenderArgs | undefined,
+	foregroundTimeoutMs: number,
+	startedAt: number | undefined,
+	now: number,
+): string {
+	const limit = runningLimitFor(args, foregroundTimeoutMs);
+	if (!limit || startedAt === undefined) return "";
+	const remainingMs = Math.max(0, limit.totalMs - Math.max(0, now - startedAt));
+	const remaining = remainingMs > 0 ? `${Math.ceil(remainingMs / 1000)}s left` : "due now";
+	return ` · ${describeLimit(limit)} · ${remaining}`;
+}
 
 // 内置 bash 形状（command + timeout）保持不变，仅新增 background 开关。见 BUILTIN-BASH-REFERENCE.md §2/§7。
 const BashParams = Type.Object({
@@ -226,6 +280,8 @@ export default function (pi: ExtensionAPI): void {
 			let text = theme.fg("toolTitle", theme.bold("$ "));
 			text += shown.map((l, i) => (i === 0 ? l : `  ${l}`)).join("\n");
 			if (lines.length > maxLines) text += theme.fg("muted", `\n  … +${lines.length - maxLines} lines`);
+			const configuredLimit = formatConfiguredLimit(args, state.options.foregroundTimeoutMs);
+			if (configuredLimit) text += theme.fg("muted", ` (${configuredLimit})`);
 			if (args?.background) text += theme.fg("accent", " &");
 			return new Text(text, 0, 0);
 		},
@@ -239,13 +295,20 @@ export default function (pi: ExtensionAPI): void {
 				if (st && st.startedAt !== undefined && !st.interval && context?.invalidate) {
 					st.interval = setInterval(() => context.invalidate(), 1000);
 				}
+				const now = Date.now();
 				const elapsed =
-					st?.startedAt !== undefined ? ` · ${Math.floor((Date.now() - st.startedAt) / 1000)}s` : "";
+					st?.startedAt !== undefined ? ` · ${Math.floor((now - st.startedAt) / 1000)}s` : "";
+				const limit = formatRunningLimit(
+					context?.args as BashRenderArgs | undefined,
+					state.options.foregroundTimeoutMs,
+					st?.startedAt,
+					now,
+				);
 				const preview = output.trim();
 				const previewBody = preview
 					? preview.split("\n").slice(-5).map((l) => theme.fg("dim", l)).join("\n")
 					: "";
-				const runningLine = theme.fg("muted", `Running${elapsed}`);
+				const runningLine = theme.fg("muted", `Running${elapsed}${limit}`);
 				const wrapper = new Container();
 				if (previewBody) wrapper.addChild(new Text(previewBody, 0, 0));
 				wrapper.addChild(new Text(previewBody ? `\n${runningLine}` : runningLine, 0, 0));

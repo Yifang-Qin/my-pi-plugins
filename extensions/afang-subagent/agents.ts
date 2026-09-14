@@ -19,6 +19,12 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/**
+	 * 派发时继承自父会话的 thinking level（仅对未显式指定 `model` 的 agent 注入，
+	 * 与官方 subagent 示例一致：自带 model 的 agent 不套用父会话的思考档位）。
+	 * frontmatter 里不支持声明，由 execute 在发现后填充。
+	 */
+	thinkingLevel?: string;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -27,6 +33,31 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+}
+
+interface AgentFrontmatter extends Record<string, unknown> {
+	name?: string;
+	description?: string;
+	model?: string;
+	tools?: unknown;
+}
+
+/**
+ * 把 frontmatter 的 `tools` 归一化为工具名列表。两种写法都接受：
+ *
+ *     tools: read, bash        # 逗号字符串
+ *     tools: [read, bash]      # YAML 数组
+ *
+ * 其他类型（数字/对象等）视为未声明而不是抛错：这里跑在 agent 发现流程里，
+ * 单个写坏的文件不应拖垮整个 agent 列表。
+ */
+function parseToolList(raw: unknown): string[] | undefined {
+	const items: unknown[] = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(",") : [];
+	const tools = items
+		.filter((t): t is string => typeof t === "string")
+		.map((t) => t.trim())
+		.filter(Boolean);
+	return tools.length > 0 ? tools : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
@@ -55,21 +86,16 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
 
 		if (!frontmatter.name || !frontmatter.description) {
 			continue;
 		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
-
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
+			tools: parseToolList(frontmatter.tools),
 			model: frontmatter.model,
 			systemPrompt: body,
 			source,

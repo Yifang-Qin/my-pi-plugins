@@ -380,6 +380,16 @@ function readExitCode(exitFile: string): number {
 	}
 }
 
+/**
+ * 把模型传入的显式 timeout 解析成硬超时毫秒数。
+ * null 的语义必须与 runtime 一致：未设置 / 非法值都走「前台等待后自动切后台」，
+ * 而不是被 renderer 误显示成一个硬超时。renderer 通过 context.args 复用此 helper。
+ */
+export function resolveTimeoutMs(timeoutSec: unknown): number | null {
+	if (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0) return null;
+	return timeoutSec * 1000;
+}
+
 // 前台同步执行：命令始终在 detached tmux 窗口里跑，这里流式转发 .out 输出并等待完成。
 //   - 完成 → 返回最终结果（对齐内置 bash 形状）。
 //   - 未显式 timeout 且超过前台等待窗口 → 自动转后台（不杀），登记 job 交给 watcher 通知。
@@ -428,10 +438,7 @@ export async function runForegroundBash(
 	// 会列出、footer 会计数、用户还能误杀正在执行的前台命令）。仅当它真正「转后台」时
 	// 才打标签（见下方自动转后台分支）。
 	const startedAt = Date.now();
-	const hardTimeoutMs =
-		params.timeoutSec != null && Number.isFinite(params.timeoutSec) && params.timeoutSec > 0
-			? params.timeoutSec * 1000
-			: null;
+	const hardTimeoutMs = resolveTimeoutMs(params.timeoutSec);
 	const POLL_MS = 150;
 
 	params.onUpdate?.({ content: [], details: undefined });

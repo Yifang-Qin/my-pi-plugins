@@ -16,20 +16,28 @@
 //      refreshes the transcript and, for a user-turn target, restores its prompt
 //      into an empty editor for us.
 
-import { collectEntriesForBranchSummary, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	collectEntriesForBranchSummary,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { NavOverlay } from "./nav-overlay.js";
 import { buildNavModel } from "./session-tree.js";
 
-interface SummarizeDecision {
-	cancelled?: boolean;
-	summarize: boolean;
-	customInstructions?: string;
-}
+// { cancelled: true } backs out of navigation entirely; otherwise `summarize` is set.
+type SummarizeDecision =
+	| { cancelled: true; summarize?: undefined; customInstructions?: undefined }
+	| { cancelled?: false; summarize: boolean; customInstructions?: string };
 
 // Ask whether to summarize the branch we're leaving behind. Skips the prompt
 // entirely when there is nothing to summarize (smarter than the built-in, which
 // always asks). Returns { cancelled } if the user backs out of the flow.
-async function promptSummarize(ctx: ExtensionContext, leafId: string | null, targetId: string): Promise<SummarizeDecision> {
+// Takes ExtensionCommandContext: `navigateTree` only exists on the command context.
+async function promptSummarize(
+	ctx: ExtensionCommandContext,
+	leafId: string | null,
+	targetId: string,
+): Promise<SummarizeDecision> {
 	const { entries } = collectEntriesForBranchSummary(ctx.sessionManager, leafId, targetId);
 	if (entries.length === 0) return { summarize: false };
 
@@ -52,7 +60,7 @@ async function promptSummarize(ctx: ExtensionContext, leafId: string | null, tar
 	return { summarize: true };
 }
 
-async function openNav(ctx: ExtensionContext): Promise<void> {
+async function openNav(ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify("/nav needs the interactive TUI", "warning");
 		return;

@@ -38,6 +38,11 @@
   最多输出 50 条任务（命令摘要与总输出均截断），避免任务历史无限撑大上下文和 session。
 - 结果末尾附**彩色状态行**（`✓ done · 1.2s` / `✗ exit 1` / `✗ timeout` / `✗ aborted` /
   `⧉ running in background`，合并自原独立扩展 `bash-status-line`）。
+- 前台工具行会实时显示当前运行上限：显式 `timeout` 显示为
+  `Running · 7s · hard timeout 30s · 23s left`；未设置显式超时时显示为
+  `Running · 37s · auto-bg after 120s · 83s left`。这只是渲染层增强，不改变 runtime
+  的「显式 timeout 硬杀 / 未设置 timeout 自动切后台」语义；`background:true` 不显示无效的
+  timeout，因为该参数当前会被立即分离路径忽略。
 - **`bash -n` 语法预检**：建窗口前先对 wrapper 脚本做语法校验，失败立即以 `✗ exit 2`
   返回（报错行号优先相对原始命令，附本机 bash 版本），命令不会启动、无副作用。典型
   诱因：macOS 系统 bash 3.2 的 `$(…)` 扫描器会把 heredoc 正文里的撚号（`don't`）误判为

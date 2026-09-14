@@ -163,6 +163,7 @@ async function runSingleAgent(
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
+	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -779,6 +780,7 @@ function startBackgroundTask(
 	void (async () => {
 		const args: string[] = ["--mode", "json", "-p", "--no-session"];
 		if (agent.model) args.push("--model", agent.model);
+		if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 		let tmpPromptDir: string | null = null;
@@ -1048,12 +1050,15 @@ export default function (pi: ExtensionAPI) {
 			const agents = discovery.agents;
 
 			// Agents without an explicit `model` inherit the main session's current model
-			// (mutating is safe: agents are freshly discovered on every invocation).
+			// AND thinking level (mutating is safe: agents are freshly discovered on every
+			// invocation). Agents that pin their own model keep pi's default thinking level
+			// for that model — same rule as the official subagent example.
 			const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-			if (inheritedModel) {
-				for (const agent of agents) {
-					if (!agent.model) agent.model = inheritedModel;
-				}
+			const inheritedThinking = ctx.thinkingLevel;
+			for (const agent of agents) {
+				if (agent.model) continue;
+				if (inheritedModel) agent.model = inheritedModel;
+				if (inheritedThinking) agent.thinkingLevel = inheritedThinking;
 			}
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
@@ -1106,7 +1111,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			// 项目级 agent 由仓库控制，默认要确认；但用户已在 /trust 里信任的仓库不再重复询问
+			// （pi 0.84.3+ 的 ctx.isProjectTrusted()，官方 subagent 示例同此处理）。
+			if (
+				(agentScope === "project" || agentScope === "both") &&
+				confirmProjectAgents &&
+				ctx.hasUI &&
+				!ctx.isProjectTrusted()
+			) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
