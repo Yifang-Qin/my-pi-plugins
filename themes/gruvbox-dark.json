@@ -81,13 +81,13 @@
     "syntaxOperator": "aquaBright",
     "syntaxPunctuation": "light0",
 
-    "thinkingOff": "dark3",
-    "thinkingMinimal": "dark4",
-    "thinkingLow": "blue",
-    "thinkingMedium": "aqua",
-    "thinkingHigh": "yellow",
-    "thinkingXhigh": "dark1",
-    "thinkingMax": "red",
+    "thinkingOff": "gray",
+    "thinkingMinimal": "gray",
+    "thinkingLow": "gray",
+    "thinkingMedium": "gray",
+    "thinkingHigh": "gray",
+    "thinkingXhigh": "gray",
+    "thinkingMax": "gray",
 
     "bashMode": "green"
   },
