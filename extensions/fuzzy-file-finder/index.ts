@@ -26,6 +26,9 @@
 // slot leaves the chat viewport untouched: the compositor paints this
 // component inside the pinned bottom cluster, and vanilla pi treats it like
 // its built-in selectors.
+// (2026-10: powerline >= 0.9 dropped its fixed-editor compositor; pi 1.0 owns
+// the fixed input natively in fullscreen mode. The editor-slot choice stays;
+// re-verify under fullscreen before switching to an overlay.)
 //
 // How the "@" hijack works (and why it's an autocomplete provider, NOT a
 // CustomEditor): pi-tui's Editor hard-codes "@" as an autocomplete trigger, so

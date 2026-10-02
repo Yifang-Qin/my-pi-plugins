@@ -209,29 +209,24 @@ exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 
 
 ## 与 pi-powerline-footer 的兼容性
 
-### 当前结论：跟随最新版
+### 当前结论：跟随最新版（pi 1.0 + powerline 0.19 复核，2026-10）
 
-仓库安装文档现在直接跟随 powerline latest：
+仓库安装文档直接跟随 powerline latest：
 
 ```bash
 pi install npm:pi-powerline-footer
 ```
 
-历史上曾固定 `pi-powerline-footer@0.7.0`，用来规避 `0.8.0` 的 fixed-editor 在 tmux 下的滚动拖影。
-该 pin 现已解除，原因有两点：
+- **powerline 已不再有自己的 fixed-editor**：0.9.0 起「Native fixed input cutover」移除了扩展自管的
+  固定编辑器与聊天区滚动，改由 pi 原生负责（pi 1.0 默认 `tuiMode: "fullscreen"`）。因此下文
+  「拖影问题路径」「复核路径」中涉及 `powerline.fixedEditor`、DECSTBM compositor、
+  `/powerline fixed-editor` 的内容只对 **powerline < 0.9** 有意义，现仅作历史参考。
+- **peer 范围**：当前 0.19.0 的 `package.json` 声明 `@earendil-works/* >=0.81.0`，无上界，pi 1.0.0
+  满足（旧注「peer 上界 `<0.84.0`」已过时并删除）。
+- 历史上曾固定 `pi-powerline-footer@0.7.0` 规避 `0.8.0` fixed-editor 在 tmux 下的滚动拖影；该 pin
+  早已解除——旧版 peer 为 `>=0.74.0 <0.81.0`，在 0.84+ 上会让 pi 打不开。
 
-- **pi 升到 0.84.0 后旧 pin 会导致启动异常**：`0.7.0`（乃至 `0.8.x/0.9.x`）声明的 peer 范围是
-  `@earendil-works/* >=0.74.0 <0.81.0`，在 0.84.0 上 peer 不满足，会让 pi 打不开；`0.10.0+` 才把
-  下限抬到 `>=0.81.0`。
-- **新版已修复拖影**：实测最新版 powerline 在 tmux 中开启 `powerline.fixedEditor: true`、配合
-  tmux-bash 的长输出 / 流式 tool result，滚动拖影不再复现，渲染表现正常。
-
-> 注：powerline latest 的 peer 上界名义上仍写 `<0.84.0`，但 pi 对 peer 版本是警告而非硬拒，
-> 0.84.0 上实测可正常加载运行。等上游把上界抬到覆盖 0.84.x 后本注可删。
-
-若不需要固定编辑器，也可设置 `fixedEditor: false`，让聊天区继续走 pi 的常规渲染路径。
-
-### 拖影问题路径（历史背景，已在新版 powerline 修复）
+### 拖影问题路径（历史背景，仅 powerline < 0.9）
 
 下面记录的是旧版（`0.8.0`）fixed-editor 在 tmux 下拖影的成因，保留供日后排查同类问题参考：
 
@@ -261,7 +256,10 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
 因此，后续若拖影仍只随 `fixedEditor` 开关出现，应优先排查 powerline compositor，不要先回退
 上述输出归一化。
 
-### 上游变化后的复核路径
+### 上游变化后的复核路径（历史，仅 powerline < 0.9）
+
+> powerline 0.9+ 已无 fixed-editor，以下步骤里的 `fixed-editor` A/B 不再适用；若 pi 原生 fullscreen
+> 下出现拖影，改用 `tuiMode: "regular"` 作为对照基线，思路同下。
 
 若日后升级 powerline 或 pi 后拖影重现，按此复核：
 

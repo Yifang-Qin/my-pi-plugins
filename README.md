@@ -107,17 +107,17 @@ pi install https://github.com/Yifang-Qin/my-pi-plugins
    pi install npm:pi-web-access
    ```
 
-   `pi-powerline-footer` 跟随 latest 安装即可。旧版曾因 `pi install npm:pi-powerline-footer@0.7.0`
-   固定，用来规避 0.8.0 fixed-editor 在 tmux 下的滚动拖影；该 pin 现已解除——一是它在 pi 0.84.0 上
-   会因 peer 版本不兼容导致启动异常，二是新版 powerline 已修复拖影，实测 fixed-editor 在 tmux 下
-   与 tmux-bash 组合渲染正常。背景与复核步骤见 [tmux-bash 兼容性说明](extensions/tmux-bash/README.md#与-pi-powerline-footer-的兼容性)。
+   `pi-powerline-footer` 跟随 latest 安装即可（当前 0.19.0，peer `>=0.81.0`，兼容 pi 1.0）。旧版曾固定
+   `pi-powerline-footer@0.7.0` 规避 0.8.0 fixed-editor 在 tmux 下的滚动拖影；该 pin 已解除——它在 pi
+   0.84+ 上会因 peer 不兼容导致启动异常，而且 powerline 0.9.0 起已移除自管 fixed-editor，固定输入框
+   由 pi 原生 fullscreen（pi 1.0 默认）负责。背景见 [tmux-bash 兼容性说明](extensions/tmux-bash/README.md#与-pi-powerline-footer-的兼容性)。
 
 4. **个性化设置**：在 `~/.pi/agent/settings.json` 里加（或直接用 `/theme gruvbox-dark` 选主题）：
 
    ```json
    {
      "theme": "gruvbox-dark",
-     "powerline": { "preset": "default", "fixedEditor": true, "placement": "above" }
+     "powerline": { "preset": "default", "placement": "above" }
    }
    ```
 
