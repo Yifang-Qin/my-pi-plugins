@@ -179,3 +179,12 @@ check(
 );
 
 check("unknown JSON events are ignored", processChildEvent(result, { type: "unknown" }) === false);
+
+const systemCarrier = makeResult();
+check(
+	"child system prompt messages (pi 0.86+) are not ingested",
+	processChildEvent(systemCarrier, {
+		type: "message_end",
+		message: { role: "system", content: "", sections: { preamble: "You are..." }, timestamp: Date.now() },
+	}) === false && systemCarrier.messages.length === 0,
+);

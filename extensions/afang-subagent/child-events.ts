@@ -34,6 +34,10 @@ export function processChildEvent(result: SingleResult, event: any): boolean {
 	if (!event || typeof event !== "object") return false;
 
 	if (event.type === "message_end" && event.message) {
+		// pi 0.86+ 的 transcript 以一条 role:"system" 消息开头（完整 system prompt sections，数 KB），
+		// 之后 prompt/工具变更还会追加 system 补丁，它们都会经 JSON 流以 message_end 发出。
+		// 这些对父侧渲染/汇报无用，若进 result.messages 会随 tool 结果 details 每次落盘，直接丢弃。
+		if ((event.message as { role?: unknown }).role === "system") return false;
 		const msg = event.message as Message;
 		result.messages.push(msg);
 
