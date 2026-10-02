@@ -33,9 +33,10 @@ const REMINDER_COOLDOWN = 12;
 // 常驻 system prompt 段落：Codex 风格，只讲工具用法（静态部分）。
 // 状态感知的注入（未完成快照 / 全完成 nudge）在 before_agent_start 里按当前状态另行追加。
 // 措辞必须与下方 registerTool 的 schema 对齐（action: list/add/set/clear，status 三态）。
-const TODO_GUIDE = `
-
-## Task Management
+// 以 system prompt section 形式注入（pi 0.86+），渲染为 <todo_guide>…</todo_guide>。
+const TODO_GUIDE_SECTION = "todo_guide";
+const TODO_STATE_SECTION = "todo_state";
+const TODO_GUIDE = `## Task Management
 
 You have a \`todo\` tool for tracking multi-step work. Actions:
 - \`add\` (text): append a new todo (starts as pending).
@@ -283,33 +284,39 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// 常驻注入：仅当本插件的 todo 工具在当前提示里激活时才追加 guide。
-	// before_agent_start 每个 user turn 触发一次，system prompt 逐轮重建，
-	// 因此每个发给 LLM 的请求都会带上这段（等价于常驻）。
+	// before_agent_start 每个 user turn 触发一次，pi 从基础选项重建 sections 后与 transcript
+	// 里模型已有的 sections 做 diff，因此每个发给 LLM 的请求都带着这段（等价于常驻）。
 	// 另做两处「状态感知」注入（互斥分支）：
 	// - 有未完成项：把全量快照带进本 turn 的 system prompt，开局即知有活没干完，
 	//   避免清单沉在历史深处被遗忘（长 agentic loop 场景的第一道保险）。
 	// - 全部完成但列表仍挂着：追加一句 nudge 让模型在开无关新任务前主动 clear
 	//   （只提示，不自动清——「全完成」不代表用户要开新活，同任务追问时
 	//   自动清会丢掉刚做完的清单上下文）。
+	//
+	// 实现（pi 0.86+）：改写 systemPromptOptions.sections，而**不**返回 { systemPrompt }。
+	// 返回 systemPrompt 等价于 forceSystemPrompt——整段 prompt 被不透明覆盖：后续扩展对
+	// sections 的修改全部失效，且每轮重建开头的 system 消息、绕过 transcript delta 机制。
+	// 改 sections 后 pi 只把「变了的 section」作为 system 补丁追加进 transcript，缓存前缀得以保留：
+	// - todo_guide 静态，只在 todo 工具首次激活时进一次；工具停用时 section 缺席 → 自动撤回。
+	// - todo_state 随清单变化（每个 user turn 至多一次补丁）；清单清空时缺席 → 自动撤回。
 	pi.on("before_agent_start", async (event) => {
-		const active = event.systemPromptOptions.selectedTools?.includes("todo") ?? false;
+		const options = event.systemPromptOptions;
+		const active = options.selectedTools?.includes("todo") ?? false;
 		if (!active) return;
 
-		let systemPrompt = event.systemPrompt + TODO_GUIDE;
+		options.sections[TODO_GUIDE_SECTION] = TODO_GUIDE;
 
 		if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
-			systemPrompt +=
-				`\n\n**Note:** All ${todos.length} todos from the previous task are completed. ` +
+			options.sections[TODO_STATE_SECTION] =
+				`**Note:** All ${todos.length} todos from the previous task are completed. ` +
 				"If the user's new request is unrelated, call `todo clear` before starting " +
 				"(or clear and re-populate for the new task). Don't carry a stale completed list forward.";
 		} else if (todos.length > 0) {
-			systemPrompt +=
-				`\n\n**Note:** There are unfinished todos from earlier work:\n\n${snapshotText()}\n\n` +
+			options.sections[TODO_STATE_SECTION] =
+				`**Note:** There are unfinished todos from earlier work:\n\n${snapshotText()}\n\n` +
 				"Continue from the `in_progress` item unless the user's new request changes priorities. " +
 				"Keep statuses up to date as you work; if the list no longer matches what you're doing, clean it up.";
 		}
-
-		return { systemPrompt };
 	});
 
 	// 反应式 reminder（②）：context 事件在**每次 LLM call 前**触发——含 agentic loop 中途，
