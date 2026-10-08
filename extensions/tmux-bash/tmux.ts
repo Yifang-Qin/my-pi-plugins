@@ -60,11 +60,17 @@ export function ensureSession(opts: TmuxBashOptions, cwd: string): void {
 // 在会话里新开一个窗口执行脚本，返回稳定的 #{window_id}（如 @123）。
 // tmux 把末尾参数当作要执行的 shell-command；scriptPath 是可执行脚本，直接跑。
 //
-// 必须带 -a：`-t <session>` 只给会话名时，tmux 把 target-window 解析成会话的当前窗口
-// （即 ensureSession 建的占位窗口，落在 base-index 处）；不带 -a/-b 时 new-window 会试图
-// 在该目标索引建窗，与占位窗口撞索引 → "create window failed: index N in use"（默认
-// base-index=0 时就是 index 0）。-a 表示追加到目标窗口之后、自动取下一个空闲索引，
-// 无论用户 base-index / renumber-windows 怎么配都不会冲突。
+// 必须带 -a：`-t <session>:` 解析成会话的当前窗口（即 ensureSession 建的占位窗口，落在
+// base-index 处）；不带 -a/-b 时 new-window 会试图在该目标索引建窗，与占位窗口撞索引 →
+// "create window failed: index N in use"（默认 base-index=0 时就是 index 0）。-a 表示追加到
+// 目标窗口之后、自动取下一个空闲索引，无论用户 base-index / renumber-windows 怎么配都不会冲突。
+//
+// 目标必须写成 `<session>:`（带尾冒号）而不是裸 `<session>`：new-window 的 -t 是 target-window，
+// 不含 ':' 时 tmux 先把它当**当前会话里的窗口名/索引**来匹配，匹配不到才退回按会话名解析。
+// 而 ensureSession 建的占位窗口恰好也叫 `pi-bg`（= 会话名），于是只要存在第二个 tmux 会话、
+// 且**那个会话**是 tmux 眼里的「当前会话」（= 最近使用），裸 `-t pi-bg` 就会命中它里面名为
+// `pi-bg` 的窗口，把任务窗口建到**别的会话**里（实测 tmux 3.7c）。后果是 listTaskWindows /
+// killWindow 都找不到它，后台任务变成游离窗口。尾冒号强制按 target-session 解析，消除歧义。
 export function newWindow(
 	opts: TmuxBashOptions,
 	windowName: string,
@@ -76,7 +82,7 @@ export function newWindow(
 		"-a",
 		"-d",
 		"-t",
-		opts.sessionName,
+		`${opts.sessionName}:`,
 		"-n",
 		windowName.slice(0, opts.maxWindowNameLength),
 		"-c",

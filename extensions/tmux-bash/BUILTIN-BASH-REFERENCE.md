@@ -4,16 +4,23 @@
 参数 / 结果 / 错误文案 / 截断等「形状」，并标注本插件是「已对齐」「近似」还是「故意偏离」。
 `index.ts` 的注释按章节号引用本文件（如「见 §2/§7」）。
 
-> **来源与版本**：内容基于 pi `@earendil-works/pi-coding-agent@0.80.10` 的
-> `dist/core/tools/bash.js` 与 `dist/core/tools/truncate.js`。**pi 升级后须复核本文件**——
-> 内置 bash 的错误文案 / 截断 footer 一旦改动，本插件的「对齐」承诺就会回归（这也是 README
+> **来源与版本**：内容基于 pi `@earendil-works/pi-coding-agent` 的
+> `dist/core/tools/bash.js` 与 `dist/core/tools/truncate.js`，**最近一次复核：1.1.0（2026-10）**
+> ——相对最初成文的 0.80.10，错误文案（`Command exited with code {N}` / `Command aborted` /
+> `Command timed out after {N} seconds`）、`timeout` 校验文案、三态截断 footer 与 `truncateTail`
+> 的尾部截断算法（2000 行 / 50KB）均**逐字未变**，本文件无需改动。**pi 升级后仍须复核本文件**
+> ——内置 bash 的错误文案 / 截断 footer 一旦改动，本插件的「对齐」承诺就会回归（这也是 README
 > 「为什么覆盖内置 bash 有耦合成本」那段的具体所指）。
 >
-> 复核方法：
+> 未纳入对齐清单的两条内置文案（长期存在、非新增）：`Command terminated without an exit code`
+> 与 `Working directory does not exist: {cwd}\nCannot execute {shell} commands.`。本插件分别对应
+> 「窗口消失但无哨兵」的自有文案（见 §7）与 `tmux new-window -c` 失败后的
+> `Failed to execute command: …`，属**故意偏离**。
+>
+> 复核方法（pi 1.0 起为 managed install，包不在全局 npm 目录下）：
 > ```bash
-> PI=$(node -e "console.log(require.resolve('@earendil-works/pi-coding-agent'))" 2>/dev/null \
->   || echo /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js)
-> less "$(dirname "$PI")/core/tools/bash.js"
+> PI=~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)/node_modules/@earendil-works/pi-coding-agent
+> less "$PI/dist/core/tools/bash.js"
 > ```
 
 图例：✅ 已对齐（含文案逐字）· ≈ 近似（语义一致、文案不逐字）· ✏️ 故意偏离（tmux 后台化带来的差异）

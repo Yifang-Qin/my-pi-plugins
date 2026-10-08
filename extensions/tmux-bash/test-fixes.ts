@@ -3,12 +3,19 @@
 //   2. 前台循环窗口死亡检测：窗口未写哨兵被外部 kill 时，快速以 isError 返回
 //   3. 前台输出边界标准化：CR 进度条折叠为最终行，危险 ANSI 不穿透到 TUI
 //   4. 后台完成通知走 steer，自然完成会刷新 TUI 状态，且 autoClose 后 bg list 仍保留 completed + exitCode
+//   5. autoClose=false 时窗口保留，且内存 job 丢失后能从 tmux 终态标签恢复 completed/exitCode
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
-// 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/{pi-coding-agent,pi-tui}
-// 软链接到全局安装（node_modules 已 gitignore）：
-//   mkdir -p node_modules/@earendil-works
-//   ln -sfn /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent node_modules/@earendil-works/pi-coding-agent
-//   ln -sfn /opt/homebrew/lib/node_modules/@earendil-works/pi-tui         node_modules/@earendil-works/pi-tui
+// 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/* 软链接（node_modules 已 gitignore）。
+// pi 1.0 起是 managed install，包在带版本号的 release 目录下，**每次 pi update 后都要重链**：
+//   REL=~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)/node_modules
+//   mkdir -p node_modules/@earendil-works node_modules/@types
+//   for p in pi-coding-agent pi-tui pi-ai pi-agent-core; do
+//     ln -sfn "$REL/@earendil-works/$p" "node_modules/@earendil-works/$p"
+//   done
+//   ln -sfn "$REL/typebox" node_modules/typebox
+//   ln -sfn "$REL/@types/node" node_modules/@types/node
+// 注意：测试 4/5 用的是**共享** tmux 会话（loadOptions() 默认 sessionName=pi-bg），会在你日常
+// 使用的那个 pi-bg 会话里临时建窗口并自行清理；跑完如有残留窗口可 `tmux list-windows -a` 复查。
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -278,6 +285,55 @@ check("tmux 终态标签 → 恢复 completed", recovered?.status === "completed
 check("tmux 终态标签 → 恢复 exit 7", recovered?.exitCode === 7, String(recovered?.exitCode));
 killWindow(retainedState.options, retained.windowId);
 cleanup(retainedState, "quit");
+
+// 6. 任务窗口必须落在 options.sessionName 这个会话里（new-window 的 target 歧义回归测试）。
+//    坑：new-window 的 -t 是 target-window，不含 ':' 时 tmux 先按「当前会话里的窗口名」匹配；
+//    ensureSession 建的占位窗口恰好也叫 pi-bg（= 会话名），于是只要存在第二个 tmux 会话且它
+//    不是「当前会话」，裸 `-t pi-bg` 就会把窗口建到那个会话里 → listTaskWindows/killWindow
+//    全部找不到，后台任务变成游离窗口。修复是把 target 写成 `<session>:`。
+//    这里刻意造出歧义现场：额外会话 + 占位窗口同名 + 让它成为最近使用的会话。
+const decoySession = `pi-bg-decoy-${Date.now()}`;
+try {
+	execFileSync("tmux", ["new-session", "-d", "-s", decoySession, "-n", "pi-bg", "-c", process.cwd()], {
+		stdio: "ignore",
+	});
+} catch {
+	/* 建不出诱饵会话就退化成普通用例，不影响其余断言 */
+}
+const targetState = createState(loadOptions());
+targetState.options.autoCloseOnComplete = false;
+const targetSession = `test-target-${Date.now()}`;
+resetRunDir(targetState, targetSession);
+const targeted = startBackgroundCommand(targetState, "sleep 0.1", undefined, process.cwd());
+let landedIn = "";
+try {
+	landedIn =
+		execFileSync("tmux", ["list-windows", "-a", "-F", "#{session_name}\t#{window_id}"], {
+			encoding: "utf-8",
+		})
+			.split("\n")
+			.find((line) => line.endsWith(`\t${targeted.windowId}`))
+			?.split("\t")[0] ?? "";
+} catch {
+	/* ignore */
+}
+check(
+	"存在同名窗口的其他会话时 → 任务窗口仍建在目标会话",
+	landedIn === targetState.options.sessionName,
+	`landed in "${landedIn}", want "${targetState.options.sessionName}"`,
+);
+check(
+	"存在同名窗口的其他会话时 → listTaskWindows 能找到该窗口",
+	listTaskWindows(targetState.options, targetSession).some((window) => window.id === targeted.windowId),
+);
+killWindow(targetState.options, targeted.windowId);
+cleanup(targetState, "quit");
+try {
+	execFileSync("tmux", ["kill-session", "-t", decoySession], { stdio: "ignore" });
+} catch {
+	/* 诱饵会话可能从未创建 */
+}
+
 cleanup(state, "quit");
 try {
 	execFileSync("tmux", ["kill-session", "-t", state.options.sessionName], { stdio: "ignore" });
