@@ -1,256 +1,269 @@
 /**
- * Todo Extension - 三态任务清单 + 常驻进度 widget
+ * 分层 todo：phase → task，状态仅存在当前分支 toolResult.details 中。
+ * 纯状态逻辑见 shared/todo-state.ts；widget 只安装一次，之后请求重绘，保持 powerline 顺序。
  *
- * - 注册 `todo` 工具给 LLM：list / add / set / clear
- *   （add/set 的 tool result 回显全量清单快照，对齐 cc/codex 的「全量替换」语义，
- *   让对话历史里始终有新鲜快照而非只有增量日志，降低长会话中被遗忘的概率）
- * - 注册 `/todos` 命令给用户查看清单
- * - context 事件反应式 reminder：agentic loop 深处距上次 todo 调用过久时，
- *   向本次请求 payload 注入非持久的 <system-reminder>（当前快照 + 对账提示），
- *   对齐 cc 的「hasn't been used recently」机制；不落盘、不在历史里累积
- * - editor 上方常驻 widget：进度条 + 三态图标（○ pending / ◼ in_progress / ✓ completed）
- *   widget 只在 session_start 注册一次（占住 aboveEditor 的靠前位置，压在 powerline
- *   状态栏之上），后续状态变化只 requestRender 刷新内容，不重新 setWidget。
+ * 注入时机：
+ * - before_agent_start：静态 guide + 紧凑状态摘要（一行计数 + 当前任务），并重置本轮 nudge 预算；
+ *   清单为空 + 会话首条 user 消息时改为返回 eager prelude（建议先铺计划，不强制）
+ * - 工具结果：全展开分层快照，状态的唯一权威载体
+ * - tool_result：只统计修改类工具调用次数
+ * - turn_end：mid-run nudge（极简、不带清单、永不 continue）
+ * - session_compact：压缩会吃掉承载计划的工具结果，当场补一条状态摘要 / 重申 eager
+ * - 调用失败：补一条隐藏提醒，本轮末尾 flush
  *
- * 状态存在工具结果的 details 里（非外部文件），因此分支切换时状态自动正确。
+ * 刻意不做控制流干预：不因「还有 todo 未完成」而拦住收工，模型随时可以停。
+ * 曾按 omp 的 checkCompletion 做过 agent_before_settle 拦截 + 自动续跑，已整体撑销：
+ * 它必须先判断「模型是不是在等用户回答」，而这只能靠关键词/正则启发式；
+ * 漏判的后果是强行续跑、让模型替用户做决定——错在危险方向。实测反例：
+ * 「要麻烦你确认一下…」不带「请」、不以问号结尾，就被漏判。自然语言里「我在等你」
+ * 的说法是无穷的，补正则永远是打地鼠，不要再尝试。
  */
-
-import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { stripNonSgrAnsi, toSingleLine } from "./shared/terminal-text.ts";
+import {
+	activeTask,
+	allTasks,
+	applyTodo,
+	cloneState,
+	emptyTodoState,
+	isActionable,
+	isClosed,
+	plainTodoText,
+	readTodoSnapshot,
+	restoreTodos,
+	snapshotText,
+	todoCounts,
+	TodoSchema,
+	type TodoDetails,
+	type TodoPhase,
+	type TodoTask,
+} from "./shared/todo-state.ts";
 
-type TodoStatus = "pending" | "in_progress" | "completed";
-
-// 反应式 reminder（cc「hasn't been used recently」风格）的两个阈值（单位：消息条数）：
-// GAP：距上次 todo 工具调用 / 距本 turn 的 user 消息都超过这个数才注入。
-//      tool-heavy loop 下每个 LLM call ≈ assistant + toolResult 两条，12 条 ≈ 6 个 call。
-// COOLDOWN：一次注入后至少再积累这么多条消息才允许下一次，防刷屏/防脱敏。
-const REMINDER_GAP = 12;
-const REMINDER_COOLDOWN = 12;
-
-// 常驻 system prompt 段落：Codex 风格，只讲工具用法（静态部分）。
-// 状态感知的注入（未完成快照 / 全完成 nudge）在 before_agent_start 里按当前状态另行追加。
-// 措辞必须与下方 registerTool 的 schema 对齐（action: list/add/set/clear，status 三态）。
-// 以 system prompt section 形式注入（pi 0.86+），渲染为 <todo_guide>…</todo_guide>。
-const TODO_GUIDE_SECTION = "todo_guide";
-const TODO_STATE_SECTION = "todo_state";
+const NUDGE_MUTATION_THRESHOLD = 12;
+const NUDGE_MAX_PER_CYCLE = 2;
+// 只数「真的改了东西」的工具（对齐 omp 的 MUTATING_TOOLS）：读文件/搜索再多也不代表有新进度要对账。
+const MUTATING_TOOLS = new Set(["bash", "edit", "write", "eval", "ast_edit", "multi_edit", "apply_patch"]);
+const PREVIEW_TASKS = 8;
 const TODO_GUIDE = `## Task Management
 
-You have a \`todo\` tool for tracking multi-step work. Actions:
-- \`add\` (text): append a new todo (starts as pending).
-- \`set\` (id + status): move a todo to pending / in_progress / completed.
-- \`list\`: show the current todos.
-- \`clear\`: remove all todos.
+Use the \`todo\` tool for non-trivial work or 3+ steps. Organize tasks into phases (two levels only).
+- \`init\` (phases: [{name, items: string[]}]): replace the plan in one call. A single-phase plan may be sent flat as items: [...] with an optional phase name. Cover each requested item; skip filler tasks.
+- \`append\` (phase + items): add tasks, creating the phase if missing. Names are unique; task text is unique within its phase.
+- \`done\` / \`drop\`: complete / abandon a task (id), phase (phase), or all tasks (neither target).
+- \`start\` (id): explicitly select a current task. IDs come from results; never guess. IDs are not reused after init or clear on this branch.
+- \`block\` (id or phase, reason?): record an external wait; closed tasks stay closed. \`unblock\` returns blocked tasks to pending.
+- \`rm\` (id or phase or neither): remove tasks and empty phases. \`clear\`: remove the whole plan.
+- \`view\`: read the full plan, including closed tasks and their IDs.
+Fields that don't apply to the action are ignored. For done/drop/block/unblock/rm pass either id or phase, never both.
+After each mutation the tool keeps at most one in_progress task, and automatically starts the earliest pending task when none is active. Blocked tasks never start automatically.
+Mark done immediately and continue with the next action in the same turn. Pair planning/updates with actual work; don't spend a turn only on todo bookkeeping.
+Before the final response, reconcile the plan. Clear it if all tasks are completed or abandoned; otherwise preserve remaining tasks (including blocked ones) and explain them to the user.`;
 
-Use it when a task has 3+ distinct steps or is non-trivial:
-- Lay out the steps with \`add\` before starting the work.
-- Keep exactly one todo \`in_progress\` at a time; mark it \`completed\` as soon as it's done, then start the next.
-- Skip the tool for trivial single-step tasks — don't invent filler steps.
-- Before the final response, reconcile the todo list with the work actually completed. Mark finished items \`completed\`; if no unfinished items remain, call \`clear\`. Otherwise keep the remaining items and mention them to the user.`;
+// eager prelude（对齐 omp preferred 档位）：只建议、不强制，且明说琐碎任务跳过。
+const EAGER_PRELUDE =
+	"<system-reminder>\nConsider calling `todo` first to lay out a phased plan with a single `init` call. " +
+	"A good list covers the whole request — investigation through implementation and verification — not just " +
+	"the next step, with task labels a later turn could execute without re-planning. Keep each task to a " +
+	"concise 5-10 word label; `init` only accepts phase names and task strings, so don't invent extra fields. " +
+	"If you create the list, continue the request in the same turn instead of stopping after the todo call. " +
+	"Skip it for trivial single-step work.\n</system-reminder>";
 
-interface Todo {
-	id: number;
-	text: string;
-	status: TodoStatus;
-}
+// ASCII 复选框：宽度可预测（固定 3 列）、不依赖字体，和 Markdown 清单一致。
+// 对齐 omp：只有 completed 是打勾，其余全是空框，状态靠**颜色 + 删除线**区分。
+// 这样纵向扫视时方框列是对齐的，比混排多种图标整齐。
+const CHECKED = "[x]";
+const UNCHECKED = "[ ]";
+// 折叠预览里领头的已关闭任务数（对齐 omp COLLAPSED_CLOSED_CONTEXT）：
+// 即使乱序完成，也总有一行打勾行可见，持续给出「在推进」的反馈。
+const CLOSED_LEAD = 1;
+// 树形连接线（pi 没有 omp renderTreeList 的等价物，自己做一个最小版）。
+const BRANCH = "├─ ";
+const LAST = "└─ ";
 
-// 兼容旧会话：早期版本用 done 布尔而非 status
-type LegacyTodo = { id: number; text: string; done?: boolean; status?: TodoStatus };
+const fit = (text: string, width: number): string =>
+	truncateToWidth(toSingleLine(stripNonSgrAnsi(text)), Math.max(1, width));
 
-interface TodoDetails {
-	action: "list" | "add" | "set" | "clear";
-	todos: Todo[];
-	nextId: number;
-	error?: string;
-}
-
-const TodoParams = Type.Object({
-	action: StringEnum(["list", "add", "set", "clear"] as const),
-	text: Type.Optional(Type.String({ description: "Todo text (for add)" })),
-	id: Type.Optional(Type.Number({ description: "Todo ID (for set)" })),
-	status: Type.Optional(
-		StringEnum(["pending", "in_progress", "completed"] as const, {
-			description: "New status (for set)",
-		}),
-	),
-});
-
-// 旧数据（done 布尔）→ 新三态 status 的规范化
-const normalizeTodo = (t: LegacyTodo): Todo => ({
-	id: t.id,
-	text: t.text,
-	status: t.status ?? (t.done ? "completed" : "pending"),
-});
-
-// 三态图标（带主题色）：pending ○ / in_progress ◼ / completed ✓
-const statusIcon = (status: TodoStatus, theme: Theme): string => {
-	switch (status) {
+const taskLine = (task: TodoTask, theme: Theme): string => {
+	const id = `#${task.id} `;
+	const text = plainTodoText(task.text);
+	switch (task.status) {
 		case "completed":
-			return theme.fg("success", "✓");
+			return theme.fg("success", `${CHECKED} ${id}${theme.strikethrough(text)}`);
+		case "abandoned":
+			return theme.fg("error", `${UNCHECKED} ${id}${theme.strikethrough(text)}`);
+		case "blocked":
+			return theme.fg(
+				"warning",
+				`${UNCHECKED} ${id}${text} (${task.blocker ? `blocked: ${plainTodoText(task.blocker)}` : "blocked"})`,
+			);
 		case "in_progress":
-			return theme.fg("accent", "◼");
+			return theme.fg("accent", `${UNCHECKED} ${id}${text}`);
 		default:
-			return theme.fg("dim", "○");
+			return theme.fg("dim", `${UNCHECKED} ${id}${text}`);
 	}
 };
 
-// 三态文本配色：completed 最暗、in_progress 最亮、pending 居中
-const statusText = (status: TodoStatus, text: string, theme: Theme): string => {
-	switch (status) {
-		case "completed":
-			return theme.fg("dim", text);
-		case "in_progress":
-			return theme.fg("text", text);
-		default:
-			return theme.fg("muted", text);
-	}
+// 最后一行用 └─ 收口，其余 ├─；「还有 N 条」作为最后那个 └─ 行（同 omp）。
+const withBranches = (rows: string[], theme: Theme): string[] =>
+	rows.map((row, index) => theme.fg("dim", index === rows.length - 1 ? LAST : BRANCH) + row);
+
+// 折叠预览的「行走窗口」（对齐 omp selectCollapsedTodos）：末尾的已关闭任务领头（额外加、
+// 不占未完成配额），从当前任务开始往后铺；hidden 只数没装下的**未完成**项。
+// 与 omp 的唯一偏离：窗口没铺满时（当前任务靠末尾）向前多拉几条已关闭任务填满，
+// 比留空白有信息量；窗口满时行为与 omp 一致。
+function collapsedTasks(tasks: TodoTask[]): { items: TodoTask[]; hidden: number } {
+	const open = tasks.filter((task) => !isClosed(task));
+	const base = open.length === 0 ? tasks : open;
+	const start = Math.max(
+		0,
+		base.findIndex((task) => task.status === "in_progress"),
+	);
+	const items = base.slice(start, start + PREVIEW_TASKS);
+	const hidden = base.length - items.length;
+	if (open.length === 0) return { items, hidden };
+	const closed = tasks.filter(isClosed);
+	const lead = closed.slice(-Math.max(CLOSED_LEAD, PREVIEW_TASKS - items.length));
+	return { items: [...lead, ...items], hidden };
+}
+
+// phase 头：活跃阶段加粗 accent，其余 muted；进度 dim。不放状态图标（同 omp）。
+const phaseHeader = (phase: TodoPhase, index: number, isActive: boolean, theme: Theme): string => {
+	const counts = todoCounts(phase.tasks);
+	const label = `${index + 1}. ${plainTodoText(phase.name)}`;
+	const progress = ` · ${counts.closed}/${counts.total}${counts.blocked ? ` · ${counts.blocked} blocked` : ""}`;
+	return (isActive ? theme.bold(theme.fg("accent", label)) : theme.fg("muted", label)) + theme.fg("dim", progress);
 };
 
-/**
- * UI component for the /todos command
- */
+function treeLines(phases: TodoPhase[], theme: Theme, full: boolean, touched: readonly string[] = []): string[] {
+	const current = activeTask(phases)?.phase;
+	// 没有活跃任务（全部关闭）时，焦点落在最后一个有任务的 phase——否则所有 phase
+	// 都折叠，widget 只剩几行光秃秃的标题（reload 后实测到的 bug）。对应 omp 的
+	// selectCollapsedTodos：phase 没有未完成项时回退展示自己的已关闭任务。
+	const focus = current ?? [...phases].reverse().find((phase) => phase.tasks.length > 0);
+	// 单 phase（如扁平 init 的 Tasks）不显示 phase 头：那一行没信息量。
+	const multiPhase = phases.length > 1;
+	// 任务缩进要对齐 phase **名称**的起点，而不是硬编码 2 格：标签前缀是
+	// `N. `（数字位数 + 点 + 空格）。用最宽的编号算，保证各 phase 的任务列不参差不齐。
+	// 此前用 2 格，`├` 落在句点与名称之间那个空格上，看着像没对齐。
+	const indent = " ".repeat(String(phases.length).length + 2);
+	const lines: string[] = [];
+	for (const [index, phase] of phases.entries()) {
+		const expanded =
+			!multiPhase ||
+			full ||
+			phase === focus ||
+			touched.includes(phase.name) ||
+			(todoCounts(phase.tasks).blocked > 0 && !current);
+		// 标题高亮只跟真正的活跃 phase：计划已全部关闭时不该还有东西被点亮。
+		if (multiPhase) lines.push(phaseHeader(phase, index, phase === current, theme));
+		if (!expanded) continue;
+		const { items, hidden } = full ? { items: phase.tasks, hidden: 0 } : collapsedTasks(phase.tasks);
+		const rows = items.map((task) => taskLine(task, theme));
+		if (hidden > 0) rows.push(theme.fg("dim", `… ${hidden} more task${hidden === 1 ? "" : "s"}`));
+		for (const row of withBranches(rows, theme)) lines.push(multiPhase ? `${indent}${row}` : row);
+	}
+	return lines;
+}
+
+// 总览行：只给大局。状态细分已由 phase 头和任务行分别给出，再列一遍会把
+// widget 首行挤爆（实测 76 列就被截）。blocked 非零才显示。
+function progressText(phases: TodoPhase[]): string {
+	const counts = todoCounts(allTasks(phases));
+	return `${counts.closed}/${counts.total} closed${counts.blocked ? ` · ${counts.blocked} blocked` : ""}`;
+}
+
+// 给模型的一行计划摘要；todo_state 与 compaction 提醒共用。
+function planSummary(phases: TodoPhase[]): string {
+	const counts = todoCounts(allTasks(phases));
+	const current = activeTask(phases);
+	return (
+		`${counts.open} open, ${counts.blocked} blocked, ${counts.closed}/${counts.total} closed.` +
+		(current
+			? ` Current: #${current.task.id} ${plainTodoText(current.task.text)}.`
+			: " No actionable task; the rest is blocked.")
+	);
+}
+
+/** /todos 全量树支持滚动；任务很多时仍能查看每一项。 */
 class TodoListComponent {
-	private todos: Todo[];
-	private theme: Theme;
-	private onClose: () => void;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-
-	constructor(todos: Todo[], theme: Theme, onClose: () => void) {
-		this.todos = todos;
-		this.theme = theme;
-		this.onClose = onClose;
-	}
-
+	private scroll = 0;
+	private maxScroll = 0;
+	private pageSize = 1;
+	constructor(
+		private phases: TodoPhase[],
+		private theme: Theme,
+		private rows: () => number,
+		private repaint: () => void,
+		private close: () => void,
+	) {}
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.onClose();
+			this.close();
+			return;
 		}
+		if (matchesKey(data, "up")) this.scroll--;
+		else if (matchesKey(data, "down")) this.scroll++;
+		else if (matchesKey(data, "pageUp")) this.scroll -= this.pageSize;
+		else if (matchesKey(data, "pageDown")) this.scroll += this.pageSize;
+		else if (matchesKey(data, "home")) this.scroll = 0;
+		else if (matchesKey(data, "end")) this.scroll = this.maxScroll;
+		else return;
+		this.scroll = Math.max(0, Math.min(this.maxScroll, this.scroll));
+		this.repaint();
 	}
-
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
-		}
-
-		const lines: string[] = [];
-		const th = this.theme;
-
-		lines.push("");
-		const title = th.fg("accent", " Todos ");
-		const headerLine =
-			th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(0, width - 10)));
-		lines.push(truncateToWidth(headerLine, width));
-		lines.push("");
-
-		if (this.todos.length === 0) {
-			lines.push(truncateToWidth(`  ${th.fg("dim", "No todos yet. Ask the agent to add some!")}`, width));
-		} else {
-			const completed = this.todos.filter((t) => t.status === "completed").length;
-			const total = this.todos.length;
-			lines.push(truncateToWidth(`  ${th.fg("muted", `${completed}/${total} completed`)}`, width));
-			lines.push("");
-
-			for (const todo of this.todos) {
-				const icon = statusIcon(todo.status, th);
-				const id = th.fg("accent", `#${todo.id}`);
-				const text = statusText(todo.status, todo.text, th);
-				lines.push(truncateToWidth(`  ${icon} ${id} ${text}`, width));
-			}
-		}
-
-		lines.push("");
-		lines.push(truncateToWidth(`  ${th.fg("dim", "Press Escape to close")}`, width));
-		lines.push("");
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
+		const body = treeLines(this.phases, this.theme, true);
+		if (!body.length) body.push(this.theme.fg("dim", "No todos"));
+		this.pageSize = Math.max(1, this.rows() - 8);
+		this.maxScroll = Math.max(0, body.length - this.pageSize);
+		this.scroll = Math.min(this.scroll, this.maxScroll);
+		// 统一留一列左边距；treeLines 本身不带边距（工具结果走 pi 的 outputPad）。
+		return [
+			this.theme.fg("accent", "Todos"),
+			this.theme.fg("muted", progressText(this.phases)),
+			"",
+			...body.slice(this.scroll, this.scroll + this.pageSize),
+			"",
+			this.theme.fg(
+				"dim",
+				`↑/↓ PgUp/PgDn: scroll · Esc: close · ${this.scroll + 1}–${Math.min(body.length, this.scroll + this.pageSize)}/${body.length}`,
+			),
+		].map((line) => fit(line === "" ? line : ` ${line}`, width));
 	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
+	invalidate(): void {}
 }
 
 export default function (pi: ExtensionAPI) {
-	// In-memory state (reconstructed from session on load)
-	let todos: Todo[] = [];
-	let nextId = 1;
-
-	/**
-	 * Reconstruct state from session entries.
-	 * Scans tool results for this tool and applies them in order.
-	 */
-	const reconstructState = (ctx: ExtensionContext) => {
-		todos = [];
-		nextId = 1;
-
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== "message") continue;
-			const msg = entry.message;
-			if (msg.role !== "toolResult" || msg.toolName !== "todo") continue;
-
-			const details = msg.details as TodoDetails | undefined;
-			// 参数校验失败的 toolResult 的 details 是空对象 `{}`（无 todos 字段），
-			// 必须跳过，否则 details.todos.map 会抛「reading 'map'」。
-			if (details && Array.isArray(details.todos)) {
-				todos = details.todos.map((t) => normalizeTodo(t));
-				nextId = details.nextId;
-			}
-		}
-	};
-
-	// 渲染常驻 widget 的内容（editor 上方）：首行进度条 + 每条 todo
-	const renderWidgetLines = (theme: Theme, width: number): string[] => {
-		const total = todos.length;
-		const completed = todos.filter((t) => t.status === "completed").length;
-		const inProgress = todos.filter((t) => t.status === "in_progress").length;
-		const barWidth = 20;
-		// 三段式进度条：completed 记满格、in_progress 记半格（进度条惯例：进行中 ≈ 半程）
-		const completedCells = total > 0 ? Math.round((barWidth * completed) / total) : 0;
-		const progressCells = total > 0 ? Math.round((barWidth * (completed + inProgress * 0.5)) / total) : 0;
-		const inProgressCells = Math.max(0, progressCells - completedCells);
-		const emptyCells = Math.max(0, barWidth - completedCells - inProgressCells);
-		const bar =
-			theme.fg("success", "█".repeat(completedCells)) +
-			theme.fg("muted", "▓".repeat(inProgressCells)) + // 浅灰：正在进行
-			theme.fg("dim", "░".repeat(emptyCells));
-		const pct = total > 0 ? Math.round(((completed + inProgress * 0.5) / total) * 100) : 0;
-
-		const lines: string[] = [];
-		lines.push(
-			truncateToWidth(
-				` ${theme.fg("accent", "Todos")} ${bar} ${theme.fg("muted", `${completed}/${total} · ${pct}%`)}`,
-				width,
-			),
-		);
-		for (const t of todos) {
-			const icon = statusIcon(t.status, theme);
-			const id = theme.fg("accent", `#${t.id}`);
-			const text = statusText(t.status, t.text, theme);
-			lines.push(truncateToWidth(` ${icon} ${id} ${text}`, width));
-		}
-		lines.push(""); // 与下方 powerline 状态栏 / 输入框之间留一行边距
-		return lines;
-	};
-
-	// widget 的上下顺序 = 「首次插入 aboveEditor Map 的顺序」（TUI 侧 setWidget 同 key 是
-	// 先 delete 再 set，会把自己挪到 Map 末尾 → 渲染在最下面，紧贴输入框）。
-	// 旧实现每次状态变化都重新 setWidget，于是 todo 总排在 powerline
-	// （powerline-status / powerline-top，session_start 时安装）之后，看起来就是
-	// 「在输入框上面、但在状态栏下面」。
-	//
-	// 修法：只在 session 开始时注册一次（本扩展比 npm:pi-powerline-footer 先加载，
-	// 因此先占住 Map 的靠前位置），之后状态变化只 requestRender 刷新内容，永不重新插入。
-	// 无 todo 时 render 返回空数组（而不是删掉 widget），这样位置不会丢。
+	let state = emptyTodoState();
+	let touchedPhases: string[] = [];
+	// mid-run nudge 的两个计数器，每个 user prompt 重置。
+	let mutationsSinceTouch = 0;
+	let nudgesThisCycle = 0;
 	let tuiRef: { requestRender(): void } | undefined;
 	let widgetInstalled = false;
 
+	const renderWidget = (theme: Theme, width: number): string[] => {
+		const tasks = allTasks(state.phases);
+		if (!tasks.length) return [];
+		const counts = todoCounts(tasks);
+		const active = tasks.filter((task) => task.status === "in_progress").length;
+		const closedCells = Math.round((20 * counts.closed) / counts.total);
+		const progressCells = Math.round((20 * (counts.closed + active * 0.5)) / counts.total);
+		const bar =
+			theme.fg("success", "█".repeat(closedCells)) +
+			theme.fg("muted", "▓".repeat(progressCells - closedCells)) +
+			theme.fg("dim", "░".repeat(20 - progressCells));
+		return [
+			`${theme.fg("accent", "Todos")} ${bar} ${theme.fg("muted", progressText(state.phases))}`,
+			...treeLines(state.phases, theme, false, touchedPhases),
+			"",
+		].map((line) => fit(line === "" ? line : ` ${line}`, width));
+	};
+
+	// 同 key setWidget 会把组件移到 aboveEditor 队尾；只安装一次，空清单仍保留位置。
 	const refreshWidget = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return;
 		if (widgetInstalled) {
 			tuiRef?.requestRender();
 			return;
@@ -261,10 +274,9 @@ export default function (pi: ExtensionAPI) {
 			(tui, theme) => {
 				tuiRef = tui;
 				return {
-					render: (width: number) => (todos.length === 0 ? [] : renderWidgetLines(theme, width)),
+					render: (width: number) => renderWidget(theme, width),
 					invalidate: () => {},
 					dispose: () => {
-						// UI reset / reload 时被清掉 → 允许下次 session_start 重新占位
 						tuiRef = undefined;
 						widgetInstalled = false;
 					},
@@ -274,297 +286,215 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
-	// 全量快照文本（发给 LLM 的纯文本格式）。add/set 的 tool result 与 system prompt 注入共用。
-	// 对齐 cc/codex 的「全量替换」语义：每次操作后历史里都留一份完整清单，而非只有增量日志。
-	const snapshotText = (): string => {
-		if (todos.length === 0) return "No todos";
-		const completed = todos.filter((t) => t.status === "completed").length;
-		const lines = todos.map((t) => `#${t.id} [${t.status}] ${t.text}`);
-		return `Todo list (${completed}/${todos.length} completed):\n${lines.join("\n")}`;
-	};
-
-	// 常驻注入：仅当本插件的 todo 工具在当前提示里激活时才追加 guide。
-	// before_agent_start 每个 user turn 触发一次，pi 从基础选项重建 sections 后与 transcript
-	// 里模型已有的 sections 做 diff，因此每个发给 LLM 的请求都带着这段（等价于常驻）。
-	// 另做两处「状态感知」注入（互斥分支）：
-	// - 有未完成项：把全量快照带进本 turn 的 system prompt，开局即知有活没干完，
-	//   避免清单沉在历史深处被遗忘（长 agentic loop 场景的第一道保险）。
-	// - 全部完成但列表仍挂着：追加一句 nudge 让模型在开无关新任务前主动 clear
-	//   （只提示，不自动清——「全完成」不代表用户要开新活，同任务追问时
-	//   自动清会丢掉刚做完的清单上下文）。
+	// 静态 guide + 紧凑的状态摘要。摘要是「轮开头一定看得见」的唯一保障
+	// （没有收工拦截兜底），但只放一行计数 + 当前任务，详情让模型自己 view：
+	// 既有可见性，又不把全量清单每轮重述一遍。顺便重置本轮 nudge 预算。
 	//
-	// 实现（pi 0.86+）：改写 systemPromptOptions.sections，而**不**返回 { systemPrompt }。
-	// 返回 systemPrompt 等价于 forceSystemPrompt——整段 prompt 被不透明覆盖：后续扩展对
-	// sections 的修改全部失效，且每轮重建开头的 system 消息、绕过 transcript delta 机制。
-	// 改 sections 后 pi 只把「变了的 section」作为 system 补丁追加进 transcript，缓存前缀得以保留：
-	// - todo_guide 静态，只在 todo 工具首次激活时进一次；工具停用时 section 缺席 → 自动撤回。
-	// - todo_state 随清单变化（每个 user turn 至多一次补丁）；清单清空时缺席 → 自动撤回。
-	pi.on("before_agent_start", async (event) => {
+	// 清单为空且是会话首条 user 消息时，改为返回一条 eager prelude（建议先铺计划）。
+	// 两者天然互斥：有清单才有 todo_state，没清单才谈 eager，不会重复施压。
+	// pi 把 handler 返回的消息放在 user 消息**之后**（agent-session.js 1605–1624），
+	// 与 omp 的 prependMessages 相反；强制 tool_choice pi 没有接口，所以只对齐
+	// omp 的 preferred 档位（建议、不强制）。
+	pi.on("before_agent_start", async (event, ctx) => {
+		mutationsSinceTouch = 0;
+		nudgesThisCycle = 0;
 		const options = event.systemPromptOptions;
-		const active = options.selectedTools?.includes("todo") ?? false;
-		if (!active) return;
-
-		options.sections[TODO_GUIDE_SECTION] = TODO_GUIDE;
-
-		if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
-			options.sections[TODO_STATE_SECTION] =
-				`**Note:** All ${todos.length} todos from the previous task are completed. ` +
-				"If the user's new request is unrelated, call `todo clear` before starting " +
-				"(or clear and re-populate for the new task). Don't carry a stale completed list forward.";
-		} else if (todos.length > 0) {
-			options.sections[TODO_STATE_SECTION] =
-				`**Note:** There are unfinished todos from earlier work:\n\n${snapshotText()}\n\n` +
-				"Continue from the `in_progress` item unless the user's new request changes priorities. " +
-				"Keep statuses up to date as you work; if the list no longer matches what you're doing, clean it up.";
+		if (!options.selectedTools?.includes("todo")) return;
+		options.sections.todo_guide = TODO_GUIDE;
+		const counts = todoCounts(allTasks(state.phases));
+		if (counts.total === 0) {
+			// 只在会话开局推一把：本次 user 消息此时还未进分支（pi 先 emit 再 push），
+			// 所以分支里没有 user 消息 = 首条。以问号/叹号结尾的是提问而非派活，不推。
+			const firstPrompt = !ctx.sessionManager
+				.getBranch()
+				.some((entry) => entry.type === "message" && entry.message.role === "user");
+			if (!firstPrompt || /[?？!！]$/.test(event.prompt.trimEnd())) return;
+			return {
+				message: {
+					customType: "todo-eager-prelude",
+					display: false,
+					content: [{ type: "text" as const, text: EAGER_PRELUDE }],
+				},
+			};
 		}
+		if (counts.open === 0 && counts.blocked === 0) {
+			options.sections.todo_state =
+				`The previous plan is fully closed (${counts.closed}/${counts.total}). ` +
+				"If the new request is unrelated, clear it or init a new plan.";
+			return;
+		}
+		options.sections.todo_state =
+			`Unfinished plan from earlier work: ${planSummary(state.phases)} ` +
+			"Call todo view for the full plan. Reconcile stale items with done/drop; it is fine to stop and hand back to the user.";
 	});
 
-	// 反应式 reminder（②）：context 事件在**每次 LLM call 前**触发——含 agentic loop 中途，
-	// 这是 before_agent_start（每 user turn 一次）覆盖不到的。返回的 messages 是深拷贝，
-	// 只影响本次请求 payload、不写入 session（瞬时注入，不会在历史里累积）。
-	// 条件：有未完成项 && 距上次 todo 调用与距本 turn user 消息都超过 GAP && 冷却已过。
-	// （sinceUser 门槛：turn 开头的 system prompt 已由上方分支带上快照，只需覆盖深入 loop 之后）
-	// 注入在消息列表末尾：注意力位置最好，且不动前缀、对 prompt cache 友好。
-	// role:"custom" 的消息由 convertToLlm 转成 user 角色发给 provider。
-	let lastRemindedAt = -1; // 上次注入时的消息总数（用作冷却基准）
+	// compaction 会把承载计划的工具结果摘要掉，模型可能当场失去对清单的视野；
+	// 而 before_agent_start 只在 user prompt 时触发，补不上这个窗口（压缩后的自动续跑不走那里）。
+	// 所以在 session_compact 当场补一条：有计划就补状态摘要，没计划就重申 eager。
+	// 用 triggerTurn:false（进 _pendingCustomMessages，本轮末尾 flush），不自己拉起一轮。
+	pi.on("session_compact", async () => {
+		if (!pi.getActiveTools().includes("todo")) return;
+		const counts = todoCounts(allTasks(state.phases));
+		const text =
+			counts.total === 0
+				? EAGER_PRELUDE
+				: "<system-reminder>\nCompaction dropped earlier context, including the todo results that carried " +
+					`the plan. The plan itself is intact: ${planSummary(state.phases)} ` +
+					"Call todo view for the full plan before continuing.\n</system-reminder>";
+		pi.sendMessage(
+			{ customType: "todo-compaction-reminder", display: false, content: [{ type: "text", text }] },
+			{ triggerTurn: false },
+		);
+	});
 
-	pi.on("context", async (event) => {
-		const msgs = event.messages;
-		if (msgs.length < lastRemindedAt) lastRemindedAt = -1; // 换分支/压缩后长度回退，重置冷却
+	// 计数信号：任何 todo 调用清零，成功的修改类工具累加。
+	pi.on("tool_result", async (event) => {
+		if (event.toolName === "todo") mutationsSinceTouch = 0;
+		else if (!event.isError && MUTATING_TOOLS.has(event.toolName)) mutationsSinceTouch++;
+	});
 
-		if (todos.length === 0 || todos.every((t) => t.status === "completed")) return;
-		if (lastRemindedAt >= 0 && msgs.length - lastRemindedAt < REMINDER_COOLDOWN) return;
-
-		// 从尾部扫：距上次 todo 工具结果 / 距最近一条 user 消息的距离（没找到按无穷大算）
-		let sinceTodo = Number.POSITIVE_INFINITY;
-		let sinceUser = Number.POSITIVE_INFINITY;
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			const m = msgs[i];
-			if (sinceTodo === Number.POSITIVE_INFINITY && m.role === "toolResult" && m.toolName === "todo") {
-				sinceTodo = msgs.length - 1 - i;
-			}
-			if (sinceUser === Number.POSITIVE_INFINITY && m.role === "user") {
-				sinceUser = msgs.length - 1 - i;
-			}
-			if (sinceTodo !== Number.POSITIVE_INFINITY && sinceUser !== Number.POSITIVE_INFINITY) break;
-		}
-		if (sinceTodo < REMINDER_GAP || sinceUser < REMINDER_GAP) return;
-
-		lastRemindedAt = msgs.length;
-		const reminder: AgentMessage = {
-			role: "custom",
-			customType: "todo-reminder",
-			content: [
+	// mid-run nudge：只追加一条极简提醒，**永不返回 continue**。
+	// turn_end 每轮 assistant 消息都触发，但不给 continue 就不会延长 run、也拦不住收工。
+	// 本轮没调工具 = 模型正在收工，这时不插话（提醒会躺到下个 user prompt 才被看到，
+	// 而我们刻意不拦收工）。内容不带清单：状态由最近一次工具结果承载，nudge 只负责催对账。
+	pi.on("turn_end", async (event) => {
+		if (event.toolResults.length === 0) return;
+		if (mutationsSinceTouch < NUDGE_MUTATION_THRESHOLD || nudgesThisCycle >= NUDGE_MAX_PER_CYCLE) return;
+		if (!pi.getActiveTools().includes("todo")) return;
+		const open = allTasks(state.phases).filter(isActionable).length;
+		if (open === 0) return;
+		mutationsSinceTouch = 0;
+		nudgesThisCycle++;
+		return {
+			entries: [
 				{
-					type: "text",
-					// 快照放前、指令放后；只说「对账」不催进度；结尾软化词防脱敏（对齐 cc 措辞）
-					text:
-						`<system-reminder>\n${snapshotText()}\n\n` +
-						"The `todo` tool hasn't been used in a while. If any of these items are already done, " +
-						"mark them completed (`todo set`); keep exactly one item in_progress. If the list no " +
-						"longer matches the work, clean it up. This is just a gentle reminder — ignore if not " +
-						"applicable.\n</system-reminder>",
+					type: "custom_message" as const,
+					customType: "todo-nudge",
+					display: false,
+					content:
+						`<system-reminder>\n${open} todo item${open === 1 ? "" : "s"} still open. ` +
+						"If you finished a task since the last todo update, mark it done now so progress stays visible; " +
+						"otherwise keep working.\n</system-reminder>",
 				},
 			],
-			display: false,
-			timestamp: Date.now(),
 		};
-		return { messages: [...msgs, reminder] };
 	});
 
-	// Reconstruct state on session events
-	pi.on("session_start", async (_event, ctx) => {
-		reconstructState(ctx);
+	const restore = (ctx: ExtensionContext) => {
+		state = restoreTodos(ctx.sessionManager.getBranch());
+		touchedPhases = [];
+		mutationsSinceTouch = 0;
+		nudgesThisCycle = 0;
 		refreshWidget(ctx);
-		lastRemindedAt = -1;
-	});
-	pi.on("session_tree", async (_event, ctx) => {
-		reconstructState(ctx);
-		refreshWidget(ctx);
-		lastRemindedAt = -1;
-	});
+	};
 
-	// Register the todo tool for the LLM
+	pi.on("session_start", async (_event, ctx) => restore(ctx));
+	pi.on("session_tree", async (_event, ctx) => restore(ctx));
+
 	pi.registerTool({
 		name: "todo",
 		label: "Todo",
 		description:
-			"Manage a todo list. Actions: list, add (text), set (id + status), clear. Status values: pending, in_progress, completed.",
-		parameters: TodoParams,
-
+			"Manage a two-level phase/task plan. init replaces phases [{name,items[]}], and also accepts a flat items[] (optionally with phase) as a single-phase plan; append adds items to a phase. start requires id; done/drop/rm target id, phase, or all when neither is given. block/unblock require id or phase; block accepts reason. view returns all IDs; clear removes the whole plan. Fields that don't apply are ignored; for done/drop/block/unblock/rm pass either id or phase. Mutations are atomic and auto-start the earliest pending task if none is active. Status: pending/in_progress/completed/abandoned/blocked; IDs stay unique across init/clear on the current branch.",
+		parameters: TodoSchema,
+		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			switch (params.action) {
-				case "list":
-					return {
-						content: [{ type: "text", text: snapshotText() }],
-						details: { action: "list", todos: [...todos], nextId } as TodoDetails,
-					};
-
-				case "add": {
-					if (!params.text) {
-						return {
-							content: [{ type: "text", text: "Error: text required for add" }],
-							details: { action: "add", todos: [...todos], nextId, error: "text required" } as TodoDetails,
-						};
-					}
-					const newTodo: Todo = { id: nextId++, text: params.text, status: "pending" };
-					todos.push(newTodo);
-					refreshWidget(ctx);
-					// content 回显全量快照（进 LLM 上下文）；TUI 侧 renderResult 只显示增量行，不受影响
-					return {
-						content: [{ type: "text", text: `Added todo #${newTodo.id}: ${newTodo.text}\n\n${snapshotText()}` }],
-						details: { action: "add", todos: [...todos], nextId } as TodoDetails,
-					};
-				}
-
-				case "set": {
-					if (params.id === undefined) {
-						return {
-							content: [{ type: "text", text: "Error: id required for set" }],
-							details: { action: "set", todos: [...todos], nextId, error: "id required" } as TodoDetails,
-						};
-					}
-					if (!params.status) {
-						return {
-							content: [{ type: "text", text: "Error: status required for set" }],
-							details: {
-								action: "set",
-								todos: [...todos],
-								nextId,
-								error: "status required",
-							} as TodoDetails,
-						};
-					}
-					const todo = todos.find((t) => t.id === params.id);
-					if (!todo) {
-						return {
-							content: [{ type: "text", text: `Todo #${params.id} not found` }],
-							details: {
-								action: "set",
-								todos: [...todos],
-								nextId,
-								error: `#${params.id} not found`,
-							} as TodoDetails,
-						};
-					}
-					todo.status = params.status;
-					refreshWidget(ctx);
-					// content 回显全量快照（进 LLM 上下文）；TUI 侧 renderResult 只显示增量行，不受影响
-					return {
-						content: [{ type: "text", text: `Todo #${todo.id} → ${todo.status}\n\n${snapshotText()}` }],
-						details: { action: "set", todos: [...todos], nextId } as TodoDetails,
-					};
-				}
-
-				case "clear": {
-					const count = todos.length;
-					todos = [];
-					nextId = 1;
-					refreshWidget(ctx);
-					return {
-						content: [{ type: "text", text: `Cleared ${count} todos` }],
-						details: { action: "clear", todos: [], nextId: 1 } as TodoDetails,
-					};
-				}
-
-				default:
-					return {
-						content: [{ type: "text", text: `Unknown action: ${params.action}` }],
-						details: {
-							action: "list",
-							todos: [...todos],
-							nextId,
-							error: `unknown action: ${params.action}`,
-						} as TodoDetails,
-					};
+			let result: ReturnType<typeof applyTodo>;
+			try {
+				result = applyTodo(state, params); // throw 由 pi 转为失败 toolResult，状态不提交
+			} catch (error) {
+				// 失败提醒：错误文本本身没说「计划未变、用户看不到进度」，补上这层语义。
+				// 用 triggerTurn:false 而不是 deliverAs:"nextTurn"——后者在 pi 里要等到下个 user
+				// prompt 才投递（_pendingNextTurnMessages），对 mid-run 失败太晩；前者进
+				// _pendingCustomMessages，本轮工具结果落盘后 flush，下一次 LLM call 即可见。
+				pi.sendMessage(
+					{
+						customType: "todo-error-reminder",
+						display: false,
+						content: [
+							{
+								type: "text",
+								text:
+									"<system-reminder>\nThe todo call failed, so the plan is unchanged and its progress is not visible to the user.\n" +
+									`Failure: ${error instanceof Error ? error.message : String(error)}\n` +
+									"Fix the arguments and call todo again before continuing.\n</system-reminder>",
+							},
+						],
+					},
+					{ triggerTurn: false },
+				);
+				throw error;
 			}
+			if (params.action !== "view") {
+				state = result.state;
+				touchedPhases = result.touchedPhases;
+				refreshWidget(ctx);
+			}
+			const details: TodoDetails = {
+				version: 2,
+				action: params.action,
+				...cloneState(state),
+				touchedPhases: [...result.touchedPhases],
+			};
+			return {
+				content: [
+					{
+						type: "text",
+						// 始终全展开：工具结果是状态的唯一权威载体。
+						text: (result.message ? `${result.message}\n\n` : "") + snapshotText(state.phases),
+					},
+				],
+				details,
+			};
 		},
-
-		renderCall(args, theme, _context) {
-			let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", args.action);
-			if (args.text) text += ` ${theme.fg("dim", `"${args.text}"`)}`;
+		renderCall(args, theme) {
+			// 流式参数可能不完整；旧 add/set/toggle 历史也须可渲染。
+			const old = args as unknown as { text?: unknown; status?: unknown };
+			let text =
+				theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", plainTodoText(String(args.action ?? "")));
 			if (args.id !== undefined) text += ` ${theme.fg("accent", `#${args.id}`)}`;
-			if (args.status) text += ` ${theme.fg("muted", `→ ${args.status}`)}`;
+			if (typeof args.phase === "string") text += ` ${plainTodoText(args.phase)}`;
+			if (Array.isArray(args.phases)) text += theme.fg("dim", ` (${args.phases.length} phases)`);
+			if (Array.isArray(args.items)) text += theme.fg("dim", ` (+${args.items.length} tasks)`);
+			if (typeof old.text === "string") text += ` ${plainTodoText(old.text)}`;
+			if (typeof old.status === "string") text += ` → ${plainTodoText(old.status)}`;
 			return new Text(text, 0, 0);
 		},
-
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as TodoDetails | undefined;
-			// 参数校验失败的 result.details 是空对象 `{}`，直接回退到原始文本渲染。
-			if (!details || !Array.isArray(details.todos)) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "", 0, 0);
-			}
-
-			if (details.error) {
-				return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			}
-
-			// 兼容旧会话：details.todos 可能是 done 布尔格式，统一规范化
-			const todoList = details.todos.map((t) => normalizeTodo(t));
-
-			switch (details.action) {
-				case "list": {
-					if (todoList.length === 0) {
-						return new Text(theme.fg("dim", "No todos"), 0, 0);
-					}
-					let listText = theme.fg("muted", `${todoList.length} todo(s):`);
-					const display = expanded ? todoList : todoList.slice(0, 5);
-					for (const t of display) {
-						const icon = statusIcon(t.status, theme);
-						const itemText = statusText(t.status, t.text, theme);
-						listText += `\n${icon} ${theme.fg("accent", `#${t.id}`)} ${itemText}`;
-					}
-					if (!expanded && todoList.length > 5) {
-						listText += `\n${theme.fg("dim", `... ${todoList.length - 5} more`)}`;
-					}
-					return new Text(listText, 0, 0);
-				}
-
-				case "add": {
-					const added = todoList[todoList.length - 1];
-					return new Text(
-						theme.fg("success", "✓ Added ") +
-							theme.fg("accent", `#${added.id}`) +
-							" " +
-							theme.fg("muted", added.text),
-						0,
-						0,
-					);
-				}
-
-				case "set": {
-					// content 现在带全量快照（给 LLM 的），UI 只取首行增量（清单本身有 widget/展开可看）
-					const text = result.content[0];
-					const msg = text?.type === "text" ? (text.text.split("\n")[0] ?? "") : "";
-					return new Text(theme.fg("success", "✓ ") + theme.fg("muted", msg), 0, 0);
-				}
-
-				case "clear":
-					return new Text(theme.fg("success", "✓ ") + theme.fg("muted", "Cleared all todos"), 0, 0);
-
-				default: {
-					// 兜底：兼容旧会话遗留的未知 action（如早期版本的 "toggle"）。
-					// 缺了它，switch 落空会返回 undefined，reload 重渲染历史时会让 TUI 崩溃退出。
-					const text = result.content[0];
-					return new Text(text?.type === "text" ? text.text : "", 0, 0);
-				}
-			}
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as unknown as { error?: string; touchedPhases?: unknown } | undefined;
+			if (details?.error) return new Text(theme.fg("error", plainTodoText(details.error)), 0, 0);
+			const snapshot = readTodoSnapshot(result.details);
+			const content = result.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			if (!snapshot) return new Text(content.split("\n").map(plainTodoText).join("\n"), 0, 0);
+			const touched = Array.isArray(details?.touchedPhases)
+				? details.touchedPhases.filter((name): name is string => typeof name === "string")
+				: [];
+			const lines = treeLines(snapshot.phases, theme, expanded, touched);
+			if (!lines.length) return new Text(theme.fg("dim", "No todos"), 0, 0);
+			return new Text([theme.fg("muted", plainTodoText(content.split("\n")[0] ?? "")), ...lines].join("\n"), 0, 0);
 		},
 	});
 
-	// Register the /todos command for users
 	pi.registerCommand("todos", {
-		description: "Show all todos on the current branch",
+		description: "Show all phases and tasks on the current branch",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/todos requires interactive mode", "error");
 				return;
 			}
-
-			await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-				return new TodoListComponent(todos, theme, () => done());
-			});
+			await ctx.ui.custom<void>(
+				(tui, theme, _kb, done) =>
+					new TodoListComponent(
+						cloneState(state).phases,
+						theme,
+						() => tui.terminal.rows,
+						() => tui.requestRender(),
+						done,
+					),
+			);
 		},
 	});
 }

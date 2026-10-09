@@ -10,7 +10,7 @@
 | 📂 `fuzzy-file-finder` | Extension | 接管 `@` 的全部交互：目录树浏览 + 全库模糊补全 | 原地弹窗 · 目录/文件统一匹配 · 已吸收 `fuzzy-at-files.ts` · `fd` 加速 |
 | 🌳 `tree-nav` | Extension | lazygit 风格会话树导航，user 轮次分支一目了然 | `/nav` 弹大 overlay · enter 跳转 · 打字搜索 · 跳前可选 summarize |
 | 🤖 `afang-subagent` | Extension | 把任务委派给独立 pi 子进程（上下文隔离） | single/parallel/chain · `background:true` 异步 · `subagent_tasks` 工具 · 自包含 agent+prompt |
-| ✅ `todo` | Extension | 三态任务清单 + editor 上方常驻进度条 widget | `list`/`add`/`set`/`clear` · 随对话分支自动正确 · `/todos` 弹窗 |
+| ✅ `todo` | Extension | phase → task 分层计划 + editor 上方常驻进度 widget | 批量初始化/追加 · 五态任务 · 自动推进 · 分支恢复 · 复选框树形渲染 · `/todos` 全量查看 |
 | 🎨 `gruvbox-dark` | Theme | gruvbox 经典深色暖色调主题 | 高对比 · 长会话不疲劳 · 搭配 powerline 状态栏效果最佳 |
 
 `package.json` 里的 `pi` manifest 声明了上述资源，pi 安装本包时自动加载。
@@ -55,11 +55,46 @@ fork 自 pi 官方 subagent 示例、自维护演进。注册 `subagent` 工具�
 
 ### ✅ todo
 
-fork 自 pi 官方 todo 示例、自维护演进。三态任务清单，**editor 上方常驻 widget 显示三段式进度**，一眼看出还剩多少。
+fork 自 pi 官方 todo 示例、自维护演进。任务按 **phase → task 两层**组织，phase 的进度由子任务推导；editor 上方常驻 widget 展示当前计划。
 
-- 注册 `todo` 工具给 LLM（`list` / `add` / `set`+`status` / `clear`）；状态存于工具结果 `details`，**随对话分支自动正确**，`/reload` 兼容历史旧数据
-- editor 上方 widget：三段式进度条 `█`（完成）/ `▓`（进行中·浅灰）/ `░`（未开始） + 三态图标 `○`（pending）/ `◼`（in_progress）/ `✓`（completed）
-- `/todos` 命令弹窗查看当前分支清单
+- **批量规划**：`init` 一次替换整份计划；单 phase 计划也可以扁平写成 `items: [...]`（可选带 `phase` 指定名字，缺失时为 `Tasks`）—— 模型常见写法，自动合成而不逼它重试。`append` 批量追加到某个 phase，缺失时创建该 phase。
+- **五种状态**：`○ pending` / `◼ in_progress` / `✓ completed` / `− abandoned` / `! blocked`。阻塞可以记录 `reason`；已完成或放弃的任务不会被 phase 级 `block` 重新打开。
+- **自动推进**：成功修改后，全清单最多一项 `in_progress`；没有进行中项时，按 phase/task 顺序启动首个 pending，跳过 blocked。`done` 后一般无需再调用 `start`。
+- **稳定 ID 和原子操作**：用回执里的数字 ID 定位任务，或用 phase 名定位整组；当前分支内 `init` / `clear` / `rm` 都不复用 ID。一次操作校验失败就整体丢弃，ID 也不会消耗。任务文本在同一 phase 内不能重复。
+- **恢复与兼容**：完整快照保存在工具结果 `details.phases`，加载会话和切换分支时恢复。旧 `details.todos`（包括 `done` 布尔格式）恢复为默认 `Tasks` phase；旧错误结果不会覆盖有效状态。`view` 只读，不推进指针。
+- **渲染（向 omp 对齐）**：任务行用 **ASCII 复选框** `[x]` / `[ ]`，状态靠**颜色 + 删除线**区分—— completed 是 success 色打勾 + 删除线，abandoned 是 error 色空框 + 删除线，in_progress 是 accent 色空框（**不换符号**，所以纵向扫视时方框列对齐），blocked 是 warning 色空框 + `(blocked: 理由)`，pending 变暗。任务按**树形连接线** `├─` / `└─` 挂在 phase 下，「还有 N 条」就是最后那个 `└─` 行。phase 头是「编号 + 名称 + ` · closed/total`」，活跃阶段加粗 accent、其余 muted，**不放状态图标**；**单 phase 时不显示 phase 头**（扁平 init 产生的 `Tasks` 不再多一行废话）。保留与 omp 不同的两点：用阿拉伯数字而非罗马数字（中文语境更直观、宽度稳定），以及**显示任务 ID** `#4`（omp 按原文定位所以没 ID，我们有，显示出来便于对话里指代）。
+- **折叠预览的「行走窗口」**：末尾的已关闭任务领头（额外加、不占未完成配额），从当前任务往后铺至 8 条，`… N more tasks` 只数没装下的**未完成**项。这样即使乱序完成，也总有一行打勾行可见。与 omp 的唯一偏离：窗口没铺满时（当前任务靠末尾）向前多拉几条已关闭任务填满，比留空白有信息量。
+- **显示层次**：widget 和折叠回执展开当前 phase、最近操作涉及的 phase（以及无活跃任务但有 blocked 的 phase）；其余 phase 只留一行头。`completed + abandoned` 计为 closed，blocked 单独统计。`/todos` 支持方向键、PgUp/PgDn 滚动查看完整清单，展开工具结果也可查看全部任务。三处渲染（widget / 工具结果 / `/todos`）**共用同一套 `taskLine` 与 `treeLines`**，不会出现两边对不上的情况。
+- **模型上下文（三处注入，全部只是告知，不干预控制流）**：工具结果**始终全展开**分层快照（总体进度 + 当前任务 + 完整 phase 树），它是状态的**唯一权威载体**。
+  - `before_agent_start`：静态 `todo_guide` + 紧凑的 `todo_state`（一行计数 + 当前任务，约 30 token，详情让模型自己 `view`）。轮开头一定看得见未完成计划，但不把全量清单每轮重述。每个 user prompt 触发一次（跟工具调用次数无关）。
+  - **eager prelude**：清单为空且是会话**首条** user 消息时，注入一条隐藏建议（先用一次 `init` 铺好分阶段计划）。以 `?` / `？` / `!` / `！` 结尾的 prompt 是提问而非派活，不推；已有清单改走 `todo_state`，两者天然互斥、不重复施压。只对齐 omp 的 `preferred` 档位（建议、不强制）—— pi 没有强制 `tool_choice` 的接口，而且 pi 把 handler 消息放在 user 消息**之后**（omp 是之前）。
+  - `session_compact`：压缩会把**承载计划的工具结果**摘要掉，而 `before_agent_start` 只在 user prompt 时触发、补不上自动续跑那个窗口。所以当场补一条：有计划补状态摘要，没计划重申 eager。同样用 `triggerTurn: false`，不自己拉起一轮。
+  - `turn_end`：**mid-run nudge**，按「修改类工具」（`bash`/`edit`/`write` 等，失败不计）调用次数 ≥ 12 触发，每个 user prompt 最多 2 次，任何 `todo` 调用清零计数。内容只有一句「还有 N 项未完成」约 30 token，**不带清单**。读文件/搜索再多也不触发；本轮没调工具（模型正在收工）也跳过。**只追加 `entries`、永不返回 `continue`**。
+  - 调用失败时：补一条隐藏提醒（计划未变、用户看不到进度、修正参数后重试）。用 `triggerTurn: false` 而非 `deliverAs: "nextTurn"` —— 后者在 pi 里要等到下个 user prompt 才投递，对 mid-run 失败太晩。
+- **刻意不做控制流干预**：不因「还有 todo 未完成」而拦住收工，何时结束完全由模型自己定。曾按 omp 的 `checkCompletion` 做过 `agent_before_settle` 拦截 + 自动续跑（带 blocked 豁免、次数上限、子 agent 禁用等六个出口），实测后**整体撑销**：它必须先判断「模型是不是在等用户回答」，而这只能靠关键词/正则启发式；漏判的后果是强行续跑、让模型替用户做决定——错在危险方向。实测反例：「要麻烦你确认一下…」不带「请」也不以问号结尾，就被漏判。自然语言里「我在等你」的说法无穷，补正则是打地鼠，**不要再尝试**。
+
+模型可见参数为 `action` 加可选 `phases` / `items` / `id` / `phase` / `reason`，不再声明旧的 `add` / `set` / `list` 操作；历史调用仍可恢复、渲染。
+
+| action | 参数 | 作用 |
+|---|---|---|
+| `init` | `phases: [{name, items: string[]}]`，或扁平 `items` (+可选 `phase`) | 替换计划；`phases: []` 清空 | 
+| `append` | `phase`, `items: string[]` | 追加一批任务 |
+| `start` | `id` | 指定当前任务，原进行中项回到 pending；也可重新打开已关闭任务 |
+| `done` / `drop` | `id` 或 `phase`，都不传则作用于全部 | 完成 / 放弃 |
+| `block` / `unblock` | 必须传 `id` 或 `phase`；`block` 可带 `reason` | 阻塞 / 解除阻塞（随后照常自动推进） |
+| `rm` | `id` 或 `phase`，都不传则删除全部 | 删除目标任务及空 phase |
+| `view` / `clear` | 无 | 查看完整计划 / 清空整份计划 |
+
+**参数宽容度**：不适用于当前 action 的字段一律忽略（如 `done` 带 `reason`、`view` 带 `items`），只有三类「目标歧义」会报错：`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase`；`clear` 带了目标（会提示改用 `rm`，避免误清整份计划）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
+
+```json
+{"action":"init","phases":[{"name":"调研","items":["核对接口","确认边界"]},{"name":"实现","items":["完成改动","验证行为"]}]}
+```
+
+新会话中上述任务分配 `#1`–`#4`，`#1` 自动开始；`{"action":"done","id":1}` 会推进到 `#2`。实际操作以最新回执中的 ID 为准。复用旧会话或重新规划时 ID 会继续增长。
+
+状态与集成测试：`bun test tests/todo.test.ts`（需要本机 pi 类型/运行时包可解析）。
+
 - **与 `pi-powerline-footer` 的层叠顺序**：`aboveEditor` widget 的上下顺序由「首次 `setWidget` 的插入顺序」决定（同 key 重复 `setWidget` 会被挪到最下面）。本扩展只在 `session_start` 注册一次、之后靠 `requestRender` 刷新内容，因此稳定停在 powerline 状态栏**之上**。
   前提是本扩展比 `pi-powerline-footer` **先收到 `session_start`**，而事件派发顺序 = 扩展加载顺序 = pi 的发现顺序：
   ① 项目级 `.pi/extensions/` → ② 全局 `~/.pi/agent/extensions/` → ③ `settings.json` 的 `packages`（按数组顺序）。
