@@ -13,5 +13,8 @@ tmp/
 # private local dev notes (per-machine dev workflow, symlink list)
 AGENTS.md
 
+# third-party repos vendored for read-only reference only (never published from here)
+third_party/
+
 # OS junk
 .DS_Store
