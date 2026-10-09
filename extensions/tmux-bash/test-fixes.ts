@@ -12,6 +12,12 @@
 //  11. 非交互加固 + stdin 模式：默认 stdin=/dev/null、分页器/TERM/编辑器被缴；命令自带的 VAR=x 仍能赢；
 //      stdin:"tty" 下保留真 TTY 且不加固；PI_TMUX_BASH_HARDEN_ENV=0 可全关
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
+// ⚠️ 用例 11（非交互加固）必须在**干净环境**里跑：若你是从 pi 的 bash 工具里调用本测试，
+//    当前进程已经带着加固后的 TERM=dumb / PAGER=cat / CI=true…，子进程继承后
+//    「hardenEnv=false 不注入加固值」这条断言会假阳性失败。清掉再跑：
+//      env -u TERM -u PAGER -u CI -u EDITOR -u GIT_TERMINAL_PROMPT -u LESS -u GIT_PAGER \
+//        bun extensions/tmux-bash/test-fixes.ts
+//    （同源教训见 AGENTS.md：别用当前会话的 bash 工具验证 wrapper 行为。）
 // 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/* 软链接（node_modules 已 gitignore）。
 // pi 1.0 起是 managed install，包在带版本号的 release 目录下，**每次 pi update 后都要重链**：
 //   REL=~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)/node_modules
