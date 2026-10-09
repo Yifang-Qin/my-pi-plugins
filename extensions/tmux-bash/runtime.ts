@@ -31,7 +31,14 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { COMPLETION_CUSTOM_TYPE, WINDOW_OPTIONS, frameBgNotify, type TmuxBashOptions } from "./config.js";
+import {
+	COMPLETION_CUSTOM_TYPE,
+	WINDOW_OPTIONS,
+	frameBgNotify,
+	nonInteractiveEnvEntries,
+	type StdinMode,
+	type TmuxBashOptions,
+} from "./config.js";
 import { applyCarriageReturns, collapseCarriageReturns, stripAnsi } from "../shared/terminal-text.js";
 import {
 	attachHint,
@@ -143,7 +150,16 @@ export function formatSessionEnvExports(sessionEnv: SessionEnv | undefined): str
 	}).join("\n");
 }
 
-// 生成一次性 wrapper 脚本的字符串（纯函数，便于单测 / bash -n 校验）。
+// 生成非交互 env 加固的 export 行（语义与层次见 config.ts 的 NON_INTERACTIVE_ENV 注释）。
+// stdinMode === "tty" 表示调用方明确要交互（准备让人 attach 进去敲键盘）→ 不加固。
+export function formatHardeningExports(options: TmuxBashOptions, stdinMode: StdinMode): string {
+	if (!options.hardenEnv || stdinMode === "tty") return "";
+	return nonInteractiveEnvEntries()
+		.map(([key, value]) => `export ${key}=${shellQuote(value)}`)
+		.join("\n");
+}
+
+// 生成一次性 wrapper 脚本的字符串（纯函数，便于单测 / `bash -n` 校验）。
 // 哨兵文件命名：<id>.<window_id>（id 在前，便于 watcher 按 id 前缀匹配）；
 // 对应输出文件 <id>.<window_id>.out。脚本内部用 display-message 解析自己的
 // window_id，与 Node 从 new-window -P 拿到的应当一致。
@@ -154,7 +170,16 @@ export function buildWrapperScript(params: {
 	command: string;
 	displayCommand: string;
 	envExports: string;
+	/** 非交互 env 加固的 export 行；空串 = 不加固。只在命令子 shell 内生效。 */
+	hardeningExports?: string;
+	/** 命令的 stdin："null" → `< /dev/null`（对齐内置 bash）；"tty" → 继承 pane PTY。 */
+	stdinMode?: StdinMode;
 }): string {
+	// 加固导出放在子 shell 内、命令之前：既覆盖 ambient 继承值，又不污染末尾保留窗口的登录 shell；
+	// 而命令文本跑在最后，所以 `VAR=x cmd` / 命令内的 export 仍能赢过加固。
+	const hardening = params.hardeningExports ? `${params.hardeningExports}\n` : "";
+	// 对齐内置 bash 的 `stdio: ["ignore", …]`：读 stdin 的命令拿 EOF 而不是挂在 pane PTY 上等按键。
+	const stdinRedirect = params.stdinMode === "tty" ? "" : "< /dev/null ";
 	return `#!/usr/bin/env bash
 __run_dir=${shellQuote(params.runDir)}
 __id=${shellQuote(params.id)}
@@ -167,8 +192,8 @@ __out_file="$__exit_file.out"
 printf '$ %s\\n' ${shellQuote(params.displayCommand)}
 ${params.envExports}
 (
-${params.command}
-) 2>&1 | tee -a "$__out_file"
+${hardening}${params.command}
+) ${stdinRedirect}2>&1 | tee -a "$__out_file"
 __rc=\${PIPESTATUS[0]}
 # 先写 .tmp 再 mv，保证 fs.watch 看到的是完整的哨兵文件（原子出现）；同样局部 umask 收紧权限，mv 会保留 0o600。
 ( umask 077; printf '%s\\n' "$__rc" > "$__exit_file.tmp" )
@@ -184,6 +209,7 @@ function writeScript(
 	command: string,
 	displayCommand: string,
 	sessionEnv?: SessionEnv,
+	stdinMode: StdinMode = "null",
 ): string {
 	const scriptPath = join(state.scriptDir!, `${id}.sh`);
 	const script = buildWrapperScript({
@@ -194,6 +220,8 @@ function writeScript(
 		displayCommand,
 		// session 元数据放在 process.env 导出之后，覆盖任何 stale 继承值。
 		envExports: [formatEnvExports(state), formatSessionEnvExports(sessionEnv)].filter(Boolean).join("\n"),
+		hardeningExports: formatHardeningExports(state.options, stdinMode),
+		stdinMode,
 	});
 	// 脚本里内联了导出的环境变量（可能含密钥），且只需 owner 执行/预检读取 → 0o700，不给 group/other。
 	writeFileSync(scriptPath, script, { mode: 0o700 });
@@ -277,13 +305,14 @@ export function startBackgroundCommand(
 	cwd: string,
 	_origin?: string, // “background”（显式后台）/ “foreground-timeout”（自动转后台），仅供调用方语义标记。
 	sessionEnv?: SessionEnv,
+	stdinMode: StdinMode = "null",
 ): StartResult {
 	const { options } = state;
 	ensureSession(options, cwd);
 
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = command.replace(/\s+/g, " ").trim();
-	const scriptPath = writeScript(state, id, command, displayCommand, sessionEnv);
+	const scriptPath = writeScript(state, id, command, displayCommand, sessionEnv, stdinMode);
 	const syntaxError = checkBashSyntax(scriptPath, command);
 	if (syntaxError) {
 		// 抛错交给 index.ts 的 catch → 「Failed to execute command: …」（isError）。
@@ -408,6 +437,7 @@ export async function runForegroundBash(
 		signal?: AbortSignal;
 		onUpdate?: (partial: ToolTextResult) => void;
 		sessionEnv?: SessionEnv;
+		stdinMode?: StdinMode;
 	},
 ): Promise<ToolTextResult> {
 	const { options } = state;
@@ -416,7 +446,7 @@ export async function runForegroundBash(
 	const id = randomBytes(4).toString("hex");
 	const displayCommand = params.command.replace(/\s+/g, " ").trim();
 	// 前台窗口与「自动转后台」复用同一 wrapper 脚本（同 id），故 session 元数据在此一次性写入即可。
-	const scriptPath = writeScript(state, id, params.command, displayCommand, params.sessionEnv);
+	const scriptPath = writeScript(state, id, params.command, displayCommand, params.sessionEnv, params.stdinMode);
 	const syntaxError = checkBashSyntax(scriptPath, params.command);
 	if (syntaxError) {
 		// 对齐内置 bash 行为：语法错误 = stderr 正文 + 「Command exited with code 2」（bash 对

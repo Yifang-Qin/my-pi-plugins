@@ -104,7 +104,7 @@ function formatRunningLimit(
 	return ` · ${describeLimit(limit)} · ${remaining}`;
 }
 
-// 内置 bash 形状（command + timeout）保持不变，仅新增 background 开关。见 BUILTIN-BASH-REFERENCE.md §2/§7。
+// 内置 bash 形状（command + timeout）保持不变，仅新增 background / stdin 两个可选参数。见 BUILTIN-BASH-REFERENCE.md §2/§7。
 const BashParams = Type.Object({
 	command: Type.String({ description: "The shell command to execute" }),
 	timeout: Type.Optional(
@@ -117,6 +117,12 @@ const BashParams = Type.Object({
 		Type.Boolean({
 			description:
 				"Start immediately in the background and return at once. Use for dev servers, watchers, or tasks you explicitly want detached. Do not wait or poll after starting it; completion is delivered automatically.",
+		}),
+	),
+	stdin: Type.Optional(
+		Type.Union([Type.Literal("null"), Type.Literal("tty")], {
+			description:
+				'stdin for the command. "null" (default) connects /dev/null, so commands that read stdin (bare `cat`, a REPL, `npm init`) get EOF immediately instead of hanging. Use "tty" only when a human will `tmux attach` and type into the window; it also skips the non-interactive environment hardening (pagers, TERM=dumb, editor/credential prompt blockers).',
 		}),
 	),
 });
@@ -229,6 +235,7 @@ export default function (pi: ExtensionAPI): void {
 			"Set bash background:true to detach immediately (dev servers, watchers, long builds).",
 			"Once bash reports a background job, NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished. Continue only with independent useful work; otherwise end your turn immediately. Its completion notification will automatically trigger a new turn when the session is idle.",
 			"Use bg list/logs only for deliberate inspection, never as a waiting strategy; use bg kill to stop a background job.",
+			"Commands run non-interactively: stdin is /dev/null and pagers/editors/credential prompts are disabled, so interactive commands fail fast instead of hanging. Pass stdin:\"tty\" only when a human will attach to the tmux window and type.",
 		],
 		parameters: BashParams,
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -237,7 +244,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			try {
 				if (params.background) {
-					const r = startBackgroundCommand(state, params.command, undefined, ctx.cwd, "background", buildSessionEnv(ctx));
+					const r = startBackgroundCommand(state, params.command, undefined, ctx.cwd, "background", buildSessionEnv(ctx), params.stdin);
 					updateStatus(state, ctx);
 					return {
 						content: [
@@ -263,6 +270,7 @@ export default function (pi: ExtensionAPI): void {
 					signal,
 					onUpdate,
 					sessionEnv: buildSessionEnv(ctx),
+					stdinMode: params.stdin,
 				});
 				updateStatus(state, ctx);
 				return result;

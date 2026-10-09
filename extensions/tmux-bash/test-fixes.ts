@@ -9,6 +9,8 @@
 //   8. 生命周期方案 A：reload → 会话/窗口/.out 一律不动（热重载对后台任务透明），仅清 scriptDir
 //   9. 生命周期方案 A：new/resume/fork → 只杀离任 pi 会话的窗口，不动会话与其他 pi 会话的窗口
 //  10. gcStaleSessions：按 pid 存活性回收 `<prefix>-<pid>` 残留会话；活 pid / 非数字后缀 / pin 住的不动
+//  11. 非交互加固 + stdin 模式：默认 stdin=/dev/null、分页器/TERM/编辑器被缴；命令自带的 VAR=x 仍能赢；
+//      stdin:"tty" 下保留真 TTY 且不加固；PI_TMUX_BASH_HARDEN_ENV=0 可全关
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
 // 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/* 软链接（node_modules 已 gitignore）。
 // pi 1.0 起是 managed install，包在带版本号的 release 目录下，**每次 pi update 后都要重链**：
@@ -449,6 +451,56 @@ else {
 	check("gc → 本进程自己的会话不动", hasSession(gcState.options.sessionName));
 }
 for (const name of gcSessions) dropSession(name);
+
+// 11. 非交互 env 加固 + stdin 模式。
+//     背景：wrapper 的 `| tee` 只把 stdout/stderr 变成管道，stdin 以前直接继承 tmux pane 的 PTY
+//     （`[ -t 0 ]` 为真）→ `cat` 无参、REPL、`read` 这类命令会挂死等按键，而 pi 内置 bash 用
+//     `stdio: ["ignore", …]` 是立即 EOF —— 属于与内置 bash 的行为偏离，此处锁住修复。
+const hardenState = createState(loadOptions());
+resetRunDir(hardenState, `test-harden-${Date.now()}`);
+const runText = async (command: string, stdinMode?: "null" | "tty"): Promise<string> => {
+	const r = await runForegroundBash(hardenState, { command, cwd: process.cwd(), timeoutSec: 15, stdinMode });
+	return (r.content[0]?.text ?? "").trim();
+};
+
+const probe = 'echo "tty0=$([ -t 0 ] && echo yes || echo no) TERM=$TERM PAGER=$PAGER GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT EDITOR=$EDITOR CI=$CI"';
+const hardened = await runText(probe);
+check("默认 → stdin 不再是 TTY（对齐内置 bash）", /tty0=no/.test(hardened), hardened);
+check("默认 → TERM=dumb", /TERM=dumb/.test(hardened), hardened);
+check("默认 → PAGER=cat（覆盖继承的 less）", /PAGER=cat/.test(hardened), hardened);
+check("默认 → git 凭证提示关闭、EDITOR 被缴", /GIT_TERMINAL_PROMPT=0/.test(hardened) && /EDITOR=true/.test(hardened), hardened);
+check("默认 → CI=true", /CI=true/.test(hardened), hardened);
+
+// 最关键的一条：读 stdin 的命令必须立即 EOF 返回，而不是挂到超时。
+const catStart = Date.now();
+const catResult = await runForegroundBash(hardenState, { command: "cat", cwd: process.cwd(), timeoutSec: 10 });
+const catMs = Date.now() - catStart;
+check("默认 → `cat`（无参）立即 EOF 返回而非挂死", catMs < 8000 && !catResult.isError, `${catMs}ms isError=${catResult.isError}`);
+
+// 用户意图通道：命令文本跑在加固导出之后，所以 `VAR=x cmd` 仍然赢。
+const overridden = await runText('PAGER=less TERM=xterm-256color bash -c \'echo "PAGER=$PAGER TERM=$TERM"\'');
+check(
+	"命令自带的 VAR=x 仍能覆盖加固值",
+	/PAGER=less/.test(overridden) && /TERM=xterm-256color/.test(overridden),
+	overridden,
+);
+
+// stdin:"tty" → 真 TTY（保留 attach 接管能力）且不加固。
+const ttyMode = await runText(probe, "tty");
+check('stdin:"tty" → stdin 是真 TTY', /tty0=yes/.test(ttyMode), ttyMode);
+check('stdin:"tty" → 跳过加固（TERM 不被改成 dumb）', !/TERM=dumb/.test(ttyMode), ttyMode);
+
+// 全局开关：PI_TMUX_BASH_HARDEN_ENV=0。
+const noHardenState = createState(loadOptions());
+noHardenState.options.hardenEnv = false;
+resetRunDir(noHardenState, `test-noharden-${Date.now()}`);
+const unhardened = (
+	await runForegroundBash(noHardenState, { command: probe, cwd: process.cwd(), timeoutSec: 15 })
+).content[0]?.text.trim() ?? "";
+check("hardenEnv=false → 不注入加固值", !/TERM=dumb/.test(unhardened) && !/PAGER=cat/.test(unhardened), unhardened);
+check("hardenEnv=false → stdin 仍然是 /dev/null（两个开关相互独立）", /tty0=no/.test(unhardened), unhardened);
+cleanup(noHardenState, "quit");
+cleanup(hardenState, "quit");
 
 cleanup(state, "quit");
 dropSession(state.options.sessionName); // 隔离 session 可能从未创建；cleanup("quit") 已拆除时这里是 no-op

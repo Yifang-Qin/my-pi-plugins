@@ -156,6 +156,60 @@ server 会**比创建它的 pi 进程、甚至比终端程序活得更久**，�
 pid 仍存活（另一个 pi 实例）、非数字后缀（`pi-bg-notes`）、或用 `PI_TMUX_BASH_SESSION` 钉死了会话名
 时一律不动。**旧版遗留的裸 `pi-bg` 会话不在命名空间内**，需手动 `tmux kill-session -t pi-bg` 清掉一次。
 
+## 非交互执行与 stdin
+
+程序判断「能否跟人交互」有四条**独立**信道，分开治：
+
+| 信道 | 探测方式 | 治法 |
+|---|---|---|
+| ① `isatty(fd)` | 系统调用，env 改不了 | stdout/stderr 由 `\| tee` 管道天然不是 tty；stdin 由下述 `stdin` 参数控制 |
+| ② `TERM` | 读环境变量 | 加固为 `TERM=dumb`，curses/全屏 UI 直接降级或拒绘 |
+| ③ 程序自带的非交互旋钮 | 读环境变量 | 加固注入（分页器/编辑器/凭证/包管理器，表在 `config.ts` 的 `NON_INTERACTIVE_ENV`） |
+| ④ `open("/dev/tty")` | 直接找**控制终端**，绕过 fd 重定向 | **有意不治**（见下） |
+
+### stdin（`stdin` 参数）
+
+| 值 | 行为 |
+|---|---|
+| `"null"`（默认） | `< /dev/null`。**对齐 pi 内置 bash** 的 `stdio: ["ignore", …]`：`cat`（无参）、`python`/`node` 进 REPL、`npm init`、`read` 立即拿到 EOF |
+| `"tty"` | 继承 tmux pane 的 PTY，给「人 `tmux attach` 进去敲键盘」用；**同时跳过 env 加固**（要 tty 就是打算交互，对齐 omp 的 PTY 路径不加固） |
+
+改这一条的理由：wrapper 的 `( … ) 2>&1 \| tee` 只重定向了 1/2，**stdin 以前直接继承 pane 的 PTY**（`[ -t 0 ]`
+为真）。于是读 stdin 的命令拿不到 EOF，**挂在那里等没人敲的键盘** → 吃满 120s 前台窗口 → 自动转后台 →
+而模型被明确告知「别 poll 后台任务」→ **静默停滞**。这是与内置 bash 的行为偏离，已修正。
+
+### 加固的层次
+
+加固 export 导出在 ambient `process.env` **之后**，且**只在命令子 shell 内**生效：
+
+```bash
+export PAGER=less            # ← ambient（从用户 shell 继承）
+export TERM=xterm-256color
+(
+export PAGER='cat'           # ← 加固：覆盖 ambient
+export TERM='dumb'
+<command>                    # ← 命令跑在最后：`PAGER=less cmd` 仍然赢
+) < /dev/null 2>&1 | tee -a "$out"
+```
+
+三点设计理由：
+
+- **压在 ambient 之上**：否则用户 shell 里的 `PAGER=less` 会把加固打败，加固形同虚设（与 omp 的
+  `buildNonInteractiveEnv()` 层次一致：加固在 ambient 之上、显式 caller env 之下）。
+- **用户意图通道 = 命令文本本身**：命令最后执行，所以 `VAR=x cmd` 与命令内的 `export` 依旧生效。
+- **作用域限于子 shell**：不污染 wrapper 末尾用于保留窗口的 `exec $SHELL -l`，否则 `autoClose=false`
+  时 attach 进去会得到一个 `TERM=dumb` 的残废 shell。
+
+全局开关 `PI_TMUX_BASH_HARDEN_ENV=0` 关掉加固（不影响 stdin 重定向，两者独立）；`CI=true` 另有
+`PI_BASH_NO_CI` 逃生口（与 omp 同名同义）。
+
+### 有意不治：`/dev/tty`
+
+`sudo` 讨密码、`ssh` 首连的 host-key 确认这类**直接 `open("/dev/tty")`** 的提示，env 和 fd 重定向都拦不住，
+唯一解法是让进程**没有控制终端**（setsid；内置 bash 的 `detached: true` 就是这么做的）。但那会**废掉
+本扩展「可 attach 接管」的核心优势**，所以不做。缓解：`SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` 能让
+ssh 秒失败而不是挂住；`sudo` 仍会挂（用 `sudo -n`，或提前配好免密）。
+
 ## 产物权限与回收
 
 **权限收紧**（wrapper 脚本内联了导出的环境变量，可能含密钥）：
@@ -187,6 +241,7 @@ pid 仍存活（另一个 pi 实例）、非数字后缀（`pi-bg-notes`）、�
 | `PI_TMUX_BASH_SESSION_PREFIX` | `pi-bg` | 会话名前缀，实际会话名为 `<prefix>-<pid>`（每个 pi 进程一个） |
 | `PI_TMUX_BASH_DIR` | `$TMPDIR/pi-tmux-bash` | runDir 根目录（存脚本、`.out`、哨兵文件） |
 | `PI_TMUX_BASH_FOREGROUND_TIMEOUT` | `120`（秒） | 前台同步等待窗口；未显式 `timeout` 时跑满此时长仍未结束则自动转后台（不杀） |
+| `PI_TMUX_BASH_HARDEN_ENV` | `true` | 是否对非交互命令注入 env 加固（分页器/`TERM=dumb`/编辑器/凭证提示开关）；见「非交互执行与 stdin」 |
 | `PI_TMUX_BASH_AUTOCLOSE` | `true` | 命令完成后是否自动关闭 tmux 窗口（`false` 则跑完仍可 attach） |
 | `PI_TMUX_BASH_MAX_LINES` | pi 默认（2000） | 读日志保留的最大行数 |
 | `PI_TMUX_BASH_MAX_BYTES` | pi 默认（50KB） | 读日志保留的最大字节数 |
@@ -313,6 +368,8 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
 - **占位窗口**：首次会建一个 `pi-bg` 占位 shell 窗口，保证所有任务窗口关闭后会话仍存活；
   `bg action=list` 已按标签过滤掉它。注意它的**名字不再等于会话名**（会话名带 pid 后缀），这顺带
   削弱了 `new-window` 的 target 歧义，但 `tmux.ts` 里 `-t <session>:` 的尾冒号写法仍是必须的。
+- **直接走 `/dev/tty` 的提示仍会挂**：`sudo` 密码、`ssh` 首连 host-key 确认能绕过 env 与 fd 重定向，
+  只能靠 setsid 堵住，而那会废掉 attach 接管，所以有意不做（见「非交互执行与 stdin」）。
 - `execFileSync` 同步调用 tmux、`fs.watch` 跨平台可靠性等，量大时可考虑加兜底轮询。
 
 ## 本地开发

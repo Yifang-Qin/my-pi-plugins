@@ -64,9 +64,10 @@ Type.Object({
 | `command` | `string`，必填 | 同 | ✅ |
 | `timeout`（秒） | 可选；到点**杀死**进程 | 可选；到点**硬杀，退出码 124，不转后台** | ✏️ 语义见 §6/§7 |
 | `background` | —（无此参数） | 可选 `boolean`；立即后台、不等待 | ✏️ 新增，见 §7 |
+| `stdin` | —（固定 `"ignore"`） | 可选 `"null"`（默认）/ `"tty"` | ✏️ 新增；默认值与内置等价，见 §7.10 |
 
 `command` / `timeout` 的字段名、类型、可选性保持不变（模型看到的 schema 兼容），仅**新增**
-`background` 开关——这正是 `index.ts` 注释「形状保持不变（§2），仅新增 background 开关（§7）」的含义。
+`background` / `stdin` 两个可选参数——这就是 `index.ts` 注释「形状保持不变（§2）」的含义。
 
 ---
 
@@ -199,13 +200,13 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    `window missing`；因此默认 autoClose 关闭已完成窗口后，最终状态与日志仍可查询。终态历史最多
    保留 100 条，单次列表最多输出 50 条并优先活跃任务（合并了早期 skeleton 的
    `bg_start/bg_logs/bg_list/bg_kill`）。
-5. **进程生命周期与产物回收**：命令交给 tmux server 持有，`session_shutdown` 故意不杀窗口/会话
-   （避免粗暴中断）——pi 运行期间的 `/reload` / 切换会话 / 意外崩溃不中断任务。但 `cleanup`
-   会按 `SessionShutdownEvent.reason`（`quit`/`reload`/`new`/`resume`/`fork`）**回收磁盘产物**：
-   `quit`（pi 真退）删当前会话整个 runDir（含 `.out`）；其它 reason（进程仍在）只删 scriptDir、
-   保留 `.out`；同时扫 `outputDir` 回收历史会话产物（按目录名 pid 探活：pi已死或 pid==本进程
-   → 删，属于另一存活 pi 实例→ 保留）。**定位：后台任务的受管生命周期 = pi 进程生命周期（到 pi
-   退出 / reload 为止）**。内置 bash 无此场景（Node 自持子进程，随 pi 退出而终止，无磁盘产物）。
+5. **进程生命周期与产物回收（2026-10 改为方案 A）**：命令交给 tmux server 持有，pi 运行期间的
+   `/reload` / 切换会话不中断任务，但**任务生命周期严格不超过 pi 进程**：每个 pi 进程独占一个 tmux 会话
+   `pi-bg-<pid>`；`session_shutdown` 按 `reason` 拆除——`quit` kill 整个会话并删当前 runDir；
+   `new`/`resume`/`fork` 只 kill 离任 pi 会话标签的窗口并删 runDir；`reload` 一律不动（只清 scriptDir）。
+   `kill -9`/崩溃残留由 `session_start` 的 `gcStaleSessions()` 按 pid 存活性回收。另扫 `outputDir` 回收
+   历史 runDir（pid 已死或 == 本进程 → 删；属于另一存活 pi 实例 → 保留）。这在语义上反而**向内置
+   bash 靠拢**（内置 Node 自持子进程，随 pi 退出而终止）。改此语义的事故与理由见 README「会话生命周期」。
    产物权限一并收紧：runDir/scriptDir `0o700`、wrapper `.sh` `0o700`（含导出环境变量，可能含密钥）、
    `.out`/哨兵 `0o600`（子 shell 局部 `umask 077`，不污染用户命令自建文件）。
 6. **`bash -n` 语法预检（新增，有意偏离）**：内置 bash 直接把命令交给 bash 运行，语法错误由
@@ -247,6 +248,21 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
    脚本一次性生成，切换模型/思考级别后下一条命令即生效（与内置一致；转后台任务复用同一 wrapper，
    env 在启动时固化，符合语义）。注：`PI_REASONING_LEVEL` 取 `ctx.thinkingLevel`（最接近的可取值，
    不含 `off`），与内置「effective reasoning level」在极端情况下可能略有出入。
+10. **stdin 接法（对齐内置，2026-10 修正）**：内置 `spawn(…, { stdio: ["ignore", "pipe", "pipe"],
+    detached: true })` —— stdin 是 `/dev/null`，且 `detached`（setsid）让进程没有控制终端。本插件的
+    wrapper 以前只用 `| tee` 重定向了 1/2，**stdin 继承 tmux pane 的 PTY**，于是 `cat`（无参）/ REPL /
+    `read` / `npm init` 在内置里秒拿 EOF，在这里却挂到前台窗口耗尽、转成无人关注的后台任务。现在默认
+    `stdin: "null"` → `( … ) < /dev/null`，与内置等价；显式 `stdin: "tty"` 保留 pane PTY，给人工 attach
+    接管用。**setsid 有意不对齐**：断掉控制终端会废掉 attach 接管，代价是直连 `/dev/tty` 的提示
+    （`sudo` 密码）仍会挂住——内置里它们会秒失败。
+11. **非交互 env 加固（新增，有意偏离）**：内置只传 `getShellEnv()`（`process.env` + pi bin 目录进 PATH），
+    不加任何非交互变量——因为它无控制终端、stdin 是 `/dev/null`，程序自然走非交互分支。本插件
+    **保留了控制终端**（见上条），所以在命令子 shell 内补一层 `config.ts` 的 `NON_INTERACTIVE_ENV`
+    （`PAGER=cat` / `TERM=dumb` / `GIT_TERMINAL_PROMPT=0` / `EDITOR=true` / `SSH_ASKPASS_REQUIRE=force` /
+    `CI=true` / 各包管理器无人值守开关…，参考 omp 的 `non-interactive-env.ts`），让程序自己放弃交互。
+    层次：压在 ambient `process.env` 之上、命令文本之下（`VAR=x cmd` 仍赢）；`stdin: "tty"` 时不加固；
+    `PI_TMUX_BASH_HARDEN_ENV=0` 全局关闭、`PI_BASH_NO_CI` 只关 `CI=true`。副作用：`TERM=dumb` +
+    `NO_COLOR` 会让输出少了颜色与进度条——内置本来就 `stripAnsi` 全剥、不显颜色，属对齐而非退步。
 
 竞态处理：自动转后台的切换点先 `state.jobs.set(...)` 登记再复查哨兵文件，消除「恰在切换瞬间
 完成」导致 `fs.watch` 漏发通知的窗口（见 `runForegroundBash`）。
@@ -263,7 +279,7 @@ number of seconds`；超过 `2^31-1` 毫秒 → `Invalid timeout: maximum is {N}
 - [ ] **`details` 结构与内置不同**（§4）：内置暴露 `{ truncation, fullOutputPath }`，本插件用
       `{ exitCode, outputFile, truncated, durationMs }`。若有下游依赖内置 details 形状，需再对齐。
 - [ ] **跨 `/reload` 不恢复 job 表**：reload 前启动的任务完成时不再自动通知（reason=="reload" 时
-      `cleanup` 只删 scriptDir、保留 `.out`，任务仍在 tmux 里跑、日志仍在，可 `bg action=list` 或
+      `cleanup` 不动窗口、只删 scriptDir、保留 `.out`，任务仍在 tmux 里跑、日志仍在，可 `bg action=list` 或
       tmux 手动查）。可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
 - [ ] **后台 job 的窗口死亡检测**：前台循环已检测（§7.7），但转后台/`background:true` 后只靠
       哨兵文件——被外部 `kill-window` 的后台任务不会发完成通知，job 表残留计数（经本插件
