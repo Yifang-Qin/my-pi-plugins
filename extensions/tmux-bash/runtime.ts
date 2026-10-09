@@ -36,7 +36,10 @@ import { applyCarriageReturns, collapseCarriageReturns, stripAnsi } from "../sha
 import {
 	attachHint,
 	ensureSession,
+	killSession,
 	killWindow,
+	killWindowsForPiSession,
+	listSessions,
 	listTaskWindows,
 	newWindow,
 	setWindowOptions,
@@ -863,14 +866,27 @@ export function listWindowsForSession(state: RuntimeState) {
 }
 
 // 会话结束/reload 时清理：关掉 watcher 和定时器，清空 job 表，并回收磁盘上的临时产物。
-// 注意：故意不杀 tmux 窗口/会话——后台任务应当在 pi 退出后继续存活。
+// 生命周期语义（方案 A，2026-10 定案）：**任务生命周期不得超过 pi 进程**，pi 退出即连根拆掉 tmux 会话。
+// 旧语义是「故意不杀窗口/会话，让后台任务活过 pi 退出」，它实际上站不住：autoClose 回收、完成通知、
+// .out 读取全靠 pi 进程里的 watcher，pi 一走，窗口就成了无人回收、无人观测的僵尸（新会话按自己的
+// piSessionId 过滤，根本看不见它们），而旧代码又在 quit 时把它们的 .out 删了 —— 两条理由自相矛盾。
 //
-// 磁盘回收策略（前提：正常使用下后台任务生命周期含于 pi 进程生命周期内）：
+// tmux 侧拆除（按 reason 分流）：
+//   · "quit"（pi 进程退出）→ kill 整个会话，连带所有仍在跑的命令。
+//   · "new" | "resume" | "fork"（同进程内换 pi 会话）→ 只杀归属于离任 pi 会话的任务窗口
+//     （切换后它们永远不会再被任何列表选中）；tmux 会话本身留给下一个 pi 会话用。
+//   · "reload"（/reload 热重载，同进程同 pi 会话）→ **窗口与任务一律不动**，重载后靠 tmux 窗口
+//     标签恢复任务表。
+//   · undefined（理论上不该出现）→ 按 reload 保守处理。
+// `kill -9` / 崩溃不会触发 session_shutdown，那种残留会话由 gcStaleSessions() 下次启动时按 pid 回收。
+//
+// 磁盘回收策略：
 //   1) 当前 runDir：
-//        · reason === "quit"（pi 真正退出）→ 整个删掉（含 .out），因为进程一走任务即结束。
-//        · 其它（reload/new/resume/fork，pi 进程仍在）→ 只删 scriptDir、保留 .out（可能还有
-//          后台任务在写 / 用户想 attach 复看）；该旧 runDir 会在后续某次 shutdown 作为
-//          「本进程遗留的旧 runDir」被回收。
+//        · "quit" / "new" / "resume" / "fork" → 整个删掉（含 .out）；对应窗口已在上面被杀，
+//          .out 不再有人读也不再有人写。
+//        · "reload"（pi 进程仍在、后台任务还在跑）→ 只删 scriptDir、保留 .out；wrapper 已 exec，
+//          POSIX 下 unlink 不影响已打开的 fd，正在跑的脚本不会袭。该旧 runDir 会在后续某次
+//          shutdown 作为「本进程遗留的旧 runDir」被回收。
 //   2) 其它 runDir（历史会话产物），按目录名里的创建 pid 判定：
 //        · pid 已不存在 → 那个 pi 实例早退出了，残骸，删。
 //        · pid === 本进程 pid → 本进程之前会话遗留、已孤立的旧 runDir，删。
@@ -884,14 +900,20 @@ export function cleanup(state: RuntimeState, reason?: string): void {
 	state.pendingTimers.clear();
 	state.jobs.clear();
 
+	// 0) tmux 侧拆除（语义见函数头注释）。
+	const quitting = reason === "quit";
+	const switching = reason === "new" || reason === "resume" || reason === "fork";
+	if (quitting) killSession(state.options);
+	else if (switching) killWindowsForPiSession(state.options, state.piSessionId);
+
 	const currentName = state.runDir ? basename(state.runDir) : null;
 
 	// 1) 当前 runDir。
 	if (state.runDir && existsSync(state.runDir)) {
-		if (reason === "quit") {
+		if (quitting || switching) {
 			rmDirQuiet(state.runDir);
 		} else if (state.scriptDir && existsSync(state.scriptDir)) {
-			rmDirQuiet(state.scriptDir); // 保留 .out，仅清脚本目录
+			rmDirQuiet(state.scriptDir); // reload：保留 .out，仅清脚本目录
 		}
 	}
 
@@ -922,6 +944,36 @@ function rmDirQuiet(dir: string): void {
 	} catch {
 		/* ignore */
 	}
+}
+
+// 回收「崩溃残留」的会话：名字形如 `<sessionPrefix>-<pid>` 但 pid 已死的 tmux 会话。
+//
+// 为何需要：cleanup() 只在 session_shutdown 里跑，而 `kill -9`、OOM、终端被杀等场景**不会**触发
+// 该事件；没有这道 GC，按 pid 命名就从「一个永生会话」变成「每个死 pid 一个永生会话」，泄漏更坏。
+// 与 runDir 的回收规则同构（都是按创建者 pid 存活性判定）。
+//
+// 安全边界：
+//   · pid 仍存活 → 跳过（那是另一个正在跑的 pi 实例，绝不能杀）。pid 复用也只会让我们「少杀」。
+//   · 用户用 PI_TMUX_BASH_SESSION 钉死了会话名 → 整个 GC 关闭（无法安全推断前缀，也可能是多实例有意共用）。
+//   · 只匹配 `前缀-纯数字` 全量名 → 旧版的裸 `pi-bg`、测试用 `pi-bg-decoy-123`、用户自建的
+//     `pi-bg-notes` 等都不会被误杀。旧版遗留的裸 `pi-bg` 需手动 `tmux kill-session -t pi-bg`。
+export function gcStaleSessions(state: RuntimeState): number {
+	const { options } = state;
+	if (options.sessionPinned) return 0;
+	const pattern = new RegExp(`^${escapeRegExp(options.sessionPrefix)}-(\\d+)$`);
+	let killed = 0;
+	for (const name of listSessions(options)) {
+		if (name === options.sessionName) continue; // 本进程自己的
+		const pid = Number(pattern.exec(name)?.[1]);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		if (pid === process.pid || pidAlive(pid)) continue;
+		if (killSession(options, name)) killed++;
+	}
+	return killed;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // runDir 目录名格式：<base64url(sessionId)>-<pid>-<hex>。base64url 可能含 '-'，故从后往前取：

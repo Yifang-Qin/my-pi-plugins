@@ -4,6 +4,11 @@
 //   3. 前台输出边界标准化：CR 进度条折叠为最终行，危险 ANSI 不穿透到 TUI
 //   4. 后台完成通知走 steer，自然完成会刷新 TUI 状态，且 autoClose 后 bg list 仍保留 completed + exitCode
 //   5. autoClose=false 时窗口保留，且内存 job 丢失后能从 tmux 终态标签恢复 completed/exitCode
+//   6. 任务窗口必须落在 options.sessionName 这个会话里（new-window 的 target 歧义回归）
+//   7. 生命周期方案 A：quit → 连根拆掉整个 tmux 会话，在跑的任务进程真的死掉，runDir 全删
+//   8. 生命周期方案 A：reload → 会话/窗口/.out 一律不动（热重载对后台任务透明），仅清 scriptDir
+//   9. 生命周期方案 A：new/resume/fork → 只杀离任 pi 会话的窗口，不动会话与其他 pi 会话的窗口
+//  10. gcStaleSessions：按 pid 存活性回收 `<prefix>-<pid>` 残留会话；活 pid / 非数字后缀 / pin 住的不动
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
 // 依赖：bun + tmux + 仓库根目录有 node_modules/@earendil-works/* 软链接（node_modules 已 gitignore）。
 // pi 1.0 起是 managed install，包在带版本号的 release 目录下，**每次 pi update 后都要重链**：
@@ -14,8 +19,9 @@
 //   done
 //   ln -sfn "$REL/typebox" node_modules/typebox
 //   ln -sfn "$REL/@types/node" node_modules/@types/node
-// 注意：测试 4/5 用的是**共享** tmux 会话（loadOptions() 默认 sessionName=pi-bg），会在你日常
-// 使用的那个 pi-bg 会话里临时建窗口并自行清理；跑完如有残留窗口可 `tmux list-windows -a` 复查。
+// 注意：测试 4〜10 用 loadOptions() 的默认会话名，而它现在是 `pi-bg-<pid>`（pid = 本 bun 进程）——
+// 与你日常使用的 pi 会话天然隔离，不再互相干扰（早期共用裸 `pi-bg` 时，「单跑用例过 / 成套
+// 跑失败」就是这个原因）。跑完如有残留窗口可 `tmux list-windows -a` 复查。
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,6 +35,7 @@ import {
 	cleanup,
 	createState,
 	formatSessionEnvExports,
+	gcStaleSessions,
 	listJobsForSession,
 	normalizeForegroundOutput,
 	reconcileCompletedJobs,
@@ -38,7 +45,47 @@ import {
 	startBackgroundCommand,
 	startWatcher,
 } from "./runtime.ts";
-import { listTaskWindows, killWindow } from "./tmux.ts";
+import { listTaskWindows, killWindow, windowExists } from "./tmux.ts";
+
+// —— tmux / 进程层的测试小工具 —— //
+const tmuxQuiet = (args: string[]): boolean => {
+	try {
+		execFileSync("tmux", args, { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+};
+const hasSession = (name: string): boolean => tmuxQuiet(["has-session", "-t", name]);
+const makeSession = (name: string, windowName?: string): boolean =>
+	tmuxQuiet(["new-session", "-d", "-s", name, "-c", process.cwd(), ...(windowName ? ["-n", windowName] : [])]);
+const dropSession = (name: string): boolean => tmuxQuiet(["kill-session", "-t", name]);
+// 窗口里 wrapper bash 的 pid；kill-window 会把整个 pane 进程组打掉，所以它消失 = 任务真的死了。
+const panePid = (windowId: string): number => {
+	try {
+		return Number(
+			execFileSync("tmux", ["display-message", "-p", "-t", windowId, "#{pane_pid}"], { encoding: "utf-8" }).trim(),
+		);
+	} catch {
+		return NaN;
+	}
+};
+// 等文件出现：startBackgroundCommand 建完窗口立即返回，wrapper 还要几毫秒才创建 .out。
+const waitForFile = async (path: string, ms = 5000): Promise<boolean> => {
+	const deadline = Date.now() + ms;
+	while (!existsSync(path) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+	return existsSync(path);
+};
+
+const pidGone = (pid: number): boolean => {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return false;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code !== "EPERM";
+	}
+};
 
 let failed = 0;
 function check(name: string, cond: boolean, extra?: string) {
@@ -287,21 +334,16 @@ killWindow(retainedState.options, retained.windowId);
 cleanup(retainedState, "quit");
 
 // 6. 任务窗口必须落在 options.sessionName 这个会话里（new-window 的 target 歧义回归测试）。
-//    坑：new-window 的 -t 是 target-window，不含 ':' 时 tmux 先按「当前会话里的窗口名」匹配；
-//    ensureSession 建的占位窗口恰好也叫 pi-bg（= 会话名），于是只要存在第二个 tmux 会话且它
-//    不是「当前会话」，裸 `-t pi-bg` 就会把窗口建到那个会话里 → listTaskWindows/killWindow
-//    全部找不到，后台任务变成游离窗口。修复是把 target 写成 `<session>:`。
-//    这里刻意造出歧义现场：额外会话 + 占位窗口同名 + 让它成为最近使用的会话。
-const decoySession = `pi-bg-decoy-${Date.now()}`;
-try {
-	execFileSync("tmux", ["new-session", "-d", "-s", decoySession, "-n", "pi-bg", "-c", process.cwd()], {
-		stdio: "ignore",
-	});
-} catch {
-	/* 建不出诱饵会话就退化成普通用例，不影响其余断言 */
-}
+//    坑：new-window 的 -t 是 target-window，不含 ':' 时 tmux 先按「当前会话里的窗口名」匹配，
+//    只要存在第二个 tmux 会话、里面有个窗口名恰好等于我们的**会话名**，且它是 tmux 眼里的
+//    「当前会话」，裸 `-t <name>` 就会把窗口建到那个会话里 → listTaskWindows/killWindow 全找不到，
+//    后台任务变成游离窗口。修复是把 target 写成 `<session>:`。
+//    这里刻意造出歧义现场：额外会话 + 其窗口名 == 本会话名 + 让它成为最近使用的会话。
+//    （会话名改成 pi-bg-<pid> 后，占位窗口名 pi-bg 不再与会话名重名，故诱饵窗口名要显式用会话名。）
 const targetState = createState(loadOptions());
 targetState.options.autoCloseOnComplete = false;
+const decoySession = `pi-bg-decoy-${Date.now()}`;
+makeSession(decoySession, targetState.options.sessionName); // 建不出来就退化成普通用例
 const targetSession = `test-target-${Date.now()}`;
 resetRunDir(targetState, targetSession);
 const targeted = startBackgroundCommand(targetState, "sleep 0.1", undefined, process.cwd());
@@ -328,18 +370,88 @@ check(
 );
 killWindow(targetState.options, targeted.windowId);
 cleanup(targetState, "quit");
-try {
-	execFileSync("tmux", ["kill-session", "-t", decoySession], { stdio: "ignore" });
-} catch {
-	/* 诱饵会话可能从未创建 */
+dropSession(decoySession); // 诱饵会话可能从未创建
+
+// —— 生命周期（方案 A：任务生命周期不得超过 pi 进程）—— //
+
+// 7. quit：连根拆掉整个 tmux 会话 —— 在跑的任务**进程**也必须死，不得成为无人回收的游离窗口。
+const quitState = createState(loadOptions());
+quitState.options.autoCloseOnComplete = false;
+resetRunDir(quitState, `test-quit-${Date.now()}`);
+const quitJob = startBackgroundCommand(quitState, "sleep 300", undefined, process.cwd());
+const quitPanePid = panePid(quitJob.windowId);
+const quitRunDir = quitState.runDir!;
+check("quit 前：会话与任务窗口均存在", hasSession(quitState.options.sessionName) && windowExists(quitState.options, quitJob.windowId));
+check("quit 前：任务进程在跑", Number.isInteger(quitPanePid) && !pidGone(quitPanePid), String(quitPanePid));
+cleanup(quitState, "quit");
+check("quit → 整个 tmux 会话被拆除", !hasSession(quitState.options.sessionName));
+check("quit → 在跑的任务窗口随之消失", !windowExists(quitState.options, quitJob.windowId));
+check("quit → 任务进程真的被杀死（不是只关窗口）", pidGone(quitPanePid), String(quitPanePid));
+check("quit → runDir 整个删除", !existsSync(quitRunDir));
+
+// 8. reload：同进程同 pi 会话的热重载，对后台任务必须完全透明（只清 scriptDir）。
+const reloadState = createState(loadOptions());
+reloadState.options.autoCloseOnComplete = false;
+resetRunDir(reloadState, `test-reload-${Date.now()}`);
+const reloadJob = startBackgroundCommand(reloadState, "sleep 300", undefined, process.cwd());
+const reloadPanePid = panePid(reloadJob.windowId);
+const reloadScriptDir = reloadState.scriptDir!;
+check("reload 前：.out 已创建", await waitForFile(reloadJob.outputFile));
+cleanup(reloadState, "reload");
+check("reload → tmux 会话保留", hasSession(reloadState.options.sessionName));
+check("reload → 任务窗口保留", windowExists(reloadState.options, reloadJob.windowId));
+check("reload → 任务进程继续跑", !pidGone(reloadPanePid), String(reloadPanePid));
+check("reload → .out 保留（重载后还要继续读）", existsSync(reloadJob.outputFile));
+check("reload → 仅 scriptDir 被清理", !existsSync(reloadScriptDir));
+killWindow(reloadState.options, reloadJob.windowId);
+
+// 9. new/resume/fork：只杀离任 pi 会话的窗口（按 @pi_bg_session 标签定向），
+//    tmux 会话保留给下一个 pi 会话，其他 pi 会话的窗口不能被误杀。
+const switchState = createState(loadOptions());
+switchState.options.autoCloseOnComplete = false;
+resetRunDir(switchState, `test-switch-A-${Date.now()}`);
+const leavingJob = startBackgroundCommand(switchState, "sleep 300", undefined, process.cwd());
+const otherState = createState(loadOptions());
+otherState.options.autoCloseOnComplete = false;
+resetRunDir(otherState, `test-switch-B-${Date.now()}`);
+const bystanderJob = startBackgroundCommand(otherState, "sleep 300", undefined, process.cwd());
+const leavingPanePid = panePid(leavingJob.windowId);
+cleanup(switchState, "new");
+check("new → 离任 pi 会话的任务窗口被杀", !windowExists(switchState.options, leavingJob.windowId));
+check("new → 该任务进程随之死掉", pidGone(leavingPanePid), String(leavingPanePid));
+check("new → tmux 会话保留（给下一个 pi 会话用）", hasSession(switchState.options.sessionName));
+check("new → 其他 pi 会话的窗口不受影响", windowExists(otherState.options, bystanderJob.windowId));
+cleanup(otherState, "quit");
+
+// 10. gcStaleSessions：`kill -9`/崩溃不走 session_shutdown，残留会话靠启动时按 pid 存活性回收。
+const gcPrefix = `pi-bg-gctest-${Date.now()}`;
+const gcState = createState(loadOptions());
+gcState.options.sessionPrefix = gcPrefix;
+gcState.options.sessionName = `${gcPrefix}-${process.pid}`;
+gcState.options.sessionPinned = false;
+// 死 pid：让一个 bash 打印自己的 pid 并立即退出，返回时该 pid 已不存在。
+const deadPid = Number(execFileSync("bash", ["-c", "echo $$"], { encoding: "utf-8" }).trim());
+const deadSession = `${gcPrefix}-${deadPid}`;
+const livePidSession = `${gcPrefix}-1`; // pid 1 = launchd，存活但没权限 → 走 pidAlive 的 EPERM 分支
+const namedSession = `${gcPrefix}-notes`; // 非纯数字后缀 → 不属于我们的命名空间
+const gcSessions = [deadSession, livePidSession, namedSession, gcState.options.sessionName];
+const gcReady = gcSessions.every((name) => makeSession(name));
+if (!gcReady) check("gcStaleSessions 测试环境就绪", false, "建不出测试会话");
+else {
+	gcState.options.sessionPinned = true;
+	check("PI_TMUX_BASH_SESSION 钉死会话名 → GC 整体关闭", gcStaleSessions(gcState) === 0 && hasSession(deadSession));
+	gcState.options.sessionPinned = false;
+	const gcKilled = gcStaleSessions(gcState);
+	check("gc → 死 pid 的残留会话被回收", !hasSession(deadSession));
+	check("gc → 只杀了这一个", gcKilled === 1, String(gcKilled));
+	check("gc → 活 pid（另一个 pi 实例）的会话不动", hasSession(livePidSession));
+	check("gc → 非「前缀-数字」命名的会话不动", hasSession(namedSession));
+	check("gc → 本进程自己的会话不动", hasSession(gcState.options.sessionName));
 }
+for (const name of gcSessions) dropSession(name);
 
 cleanup(state, "quit");
-try {
-	execFileSync("tmux", ["kill-session", "-t", state.options.sessionName], { stdio: "ignore" });
-} catch {
-	/* 隔离 session 可能从未创建 */
-}
+dropSession(state.options.sessionName); // 隔离 session 可能从未创建；cleanup("quit") 已拆除时这里是 no-op
 
 console.log(failed === 0 ? "\n全部通过 🎉" : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);

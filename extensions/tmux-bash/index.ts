@@ -21,6 +21,7 @@ import { openBgPanel } from "./bg-panel.js";
 import {
 	cleanup,
 	createState,
+	gcStaleSessions,
 	listJobsForSession,
 	listWindowsForSession,
 	markJobKilled,
@@ -203,13 +204,17 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		resetRunDir(state, ctx.sessionManager.getSessionId());
+		// 每个 pi 进程一个 tmux 会话，退出时由 cleanup() 拆掉；但 kill -9 / 崩溃不走 session_shutdown，
+		// 所以启动时按 pid 存活性回收上一轮残留的 `<prefix>-<pid>` 会话。
+		gcStaleSessions(state);
 		startWatcher(state, pi, () => updateStatus(state, ctx));
 		updateStatus(state, ctx);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
-		// 不杀 tmux 任务，让后台命令在 pi 退出后继续跑；reason 决定磁盘产物如何回收（见 cleanup）。
+		// 方案 A：任务生命周期不得超过 pi 进程 —— quit 时连根拆掉整个 tmux 会话（含在跑的命令），
+		// 换 pi 会话时杀掉离任会话的窗口，reload 则原样不动。具体分流见 cleanup() 头注释。
 		cleanup(state, event.reason);
 	});
 

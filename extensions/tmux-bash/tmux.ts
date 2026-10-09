@@ -34,12 +34,36 @@ function tmuxSafe(opts: TmuxBashOptions, args: string[]): string | null {
 }
 
 // 运行 tmux 子命令，失败时抛出（用于「必须成功」的建窗口等操作）。
+// 错误信息里带上 tmux 自己的 stderr —— execFileSync 的 err.message 只有干巴巴的
+// "Command failed: …"，而真正可操作的原因（protocol version mismatch / no server running /
+// index in use）全在 stderr 里，丢掉它会让上层只能报「Failed to execute command」。
 function tmuxExec(opts: TmuxBashOptions, args: string[]): string {
-	return execFileSync(opts.tmuxBinary, args, {
-		encoding: "utf-8",
-		timeout: 10_000,
-		stdio: ["ignore", "pipe", "pipe"],
-	}).trim();
+	try {
+		return execFileSync(opts.tmuxBinary, args, {
+			encoding: "utf-8",
+			timeout: 10_000,
+			stdio: ["ignore", "pipe", "pipe"],
+		}).trim();
+	} catch (err) {
+		throw new Error(describeTmuxFailure(opts, args, err));
+	}
+}
+
+// 把 tmux 失败翻译成一句可操作的话。protocol version mismatch 是「server 比 client 老」的典型
+// 症状：tmux 升级后旧 server 仍在跑，client 拒绝通信；此时 `tmux -V`（纯 client）照样成功，
+// 所以 tmuxAvailable() 探不出来，必须在这里点名。
+function describeTmuxFailure(opts: TmuxBashOptions, args: string[], err: unknown): string {
+	const stderr = (() => {
+		const raw = (err as { stderr?: Buffer | string } | null)?.stderr;
+		if (!raw) return "";
+		return (typeof raw === "string" ? raw : raw.toString("utf-8")).trim();
+	})();
+	const base = `tmux ${args.join(" ")} failed`;
+	const detail = stderr || (err instanceof Error ? err.message : String(err));
+	if (/protocol version mismatch/i.test(stderr)) {
+		return `${base}: ${detail}\nThe running tmux server is older than the ${opts.tmuxBinary} binary (typically after upgrading tmux). Run \`${opts.tmuxBinary} kill-server\` to restart it; tmux-bash will recreate its session on the next command.`;
+	}
+	return `${base}: ${detail}`;
 }
 
 export function tmuxAvailable(opts: TmuxBashOptions): boolean {
@@ -50,11 +74,42 @@ export function sessionExists(opts: TmuxBashOptions): boolean {
 	return tmuxSafe(opts, ["has-session", "-t", opts.sessionName]) !== null;
 }
 
-// 确保共享后台会话存在。第一次会创建一个 detached 会话（附带一个占位 shell 窗口，
+// 占位窗口名。注意它**不再等于会话名**（会话名现在带 pid 后缀），这本身就削弱了 new-window
+// 的 target 歧义；但 newWindow 里的尾冒号写法仍是必须的，别因此回退（见该函数注释）。
+const PLACEHOLDER_WINDOW_NAME = "pi-bg";
+
+// 确保本 pi 进程的后台会话存在。第一次会创建一个 detached 会话（附带一个占位 shell 窗口，
 // 保证即使所有任务窗口都关闭后会话依然存活，可继续 attach）。
+// 会话名按 pid 派生（见 config.ts），因此这里创建出来的 tmux server 必然是当前 pi 进程的后代；
+// 会话由 cleanup() 在 pi 退出时连根拆除，不留给下一个 pi 实例复用。
 export function ensureSession(opts: TmuxBashOptions, cwd: string): void {
 	if (sessionExists(opts)) return;
-	tmuxExec(opts, ["new-session", "-d", "-s", opts.sessionName, "-c", cwd, "-n", "pi-bg"]);
+	tmuxExec(opts, ["new-session", "-d", "-s", opts.sessionName, "-c", cwd, "-n", PLACEHOLDER_WINDOW_NAME]);
+}
+
+// 列出 tmux server 上所有会话名（server 未启动 / tmux 不可用时返回空数组）。
+export function listSessions(opts: TmuxBashOptions): string[] {
+	const raw = tmuxSafe(opts, ["list-sessions", "-F", "#{session_name}"]);
+	if (!raw) return [];
+	return raw.split("\n").filter(Boolean);
+}
+
+// 拆掉整个会话（连带其中所有任务窗口 → 所有仍在跑的命令被杀）。
+// 会话不存在时返回 false（kill-session 非零退出），调用方不必区分。
+export function killSession(opts: TmuxBashOptions, sessionName = opts.sessionName): boolean {
+	return tmuxSafe(opts, ["kill-session", "-t", sessionName]) !== null;
+}
+
+// 杀掉归属于某个 pi 会话（@pi_bg_session 标签）的全部任务窗口，保留会话本身与占位窗口。
+// 用于 pi 进程内的会话切换（new/resume/fork）：切换后这些窗口再也不会被任何列表选中
+// （listTaskWindows 按当前 piSessionId 过滤），留着就是无主的僵尸任务。
+export function killWindowsForPiSession(opts: TmuxBashOptions, piSession: string): number {
+	if (!piSession) return 0;
+	let killed = 0;
+	for (const window of listTaskWindows(opts, piSession)) {
+		if (killWindow(opts, window.id)) killed++;
+	}
+	return killed;
 }
 
 // 在会话里新开一个窗口执行脚本，返回稳定的 #{window_id}（如 @123）。

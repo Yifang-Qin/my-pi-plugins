@@ -21,8 +21,22 @@ const bool = (v: string | undefined, fallback: boolean): boolean => {
 export interface TmuxBashOptions {
 	/** tmux 可执行文件（可用 PI_TMUX_BASH_TMUX 覆盖）。 */
 	tmuxBinary: string;
-	/** 共享的后台 tmux 会话名（所有 pi 会话共用，按窗口标签区分归属）。 */
+	/**
+	 * 后台 tmux 会话名。默认 `${sessionPrefix}-${process.pid}` —— **每个 pi 进程一个独立会话**。
+	 *
+	 * 为什么不是固定名（如早期的裸 `pi-bg`）：固定名 + 「占位窗口让会话永不消亡」会让 tmux server
+	 * 比创建它的 pi 进程、甚至比终端程序活得更久，后续 pi 会话都复用它，于是继承它**诞生那一刻的
+	 * 进程上下文**。实测事故（2026-10，详见 README「会话生命周期」）：server 由 5 天前某次跑在
+	 * 「Documents 权限被拒」终端里的 pi 创建 → 之后所有会话的 bash 都对 ~/Documents 报
+	 * `Operation not permitted`，而 pi 自身的 read 工具正常（macOS TCC 按 responsible process 归属）。
+	 * 同源风险还有：tmux 升级后 client/server `protocol version mismatch`、跨实例窗口泄漏、
+	 * 测试与日常会话互相串台。按 pid 命名后，server 必然是当前 pi 进程的后代。
+	 */
 	sessionName: string;
+	/** 会话名前缀（默认 `pi-bg`，PI_TMUX_BASH_SESSION_PREFIX 覆盖）。用于回收崩溃残留会话。 */
+	sessionPrefix: string;
+	/** 用户用 PI_TMUX_BASH_SESSION 显式钉死了会话名 → 放弃按 pid 的残留回收（无法安全推断前缀）。 */
+	sessionPinned: boolean;
 	/** runDir / .out / 退出码哨兵文件的根目录（PI_TMUX_BASH_DIR 覆盖）。 */
 	outputDir: string;
 	/** 完成后是否自动关闭 tmux 窗口。false 时命令跑完仍可 attach 查看。 */
@@ -41,9 +55,15 @@ export interface TmuxBashOptions {
 const DEFAULT_ENV_DENYLIST = ["PWD", "OLDPWD", "SHLVL", "_", "TMUX", "TMUX_PANE"] as const;
 
 export function loadOptions(): TmuxBashOptions {
+	// PI_TMUX_BASH_SESSION：显式钉死会话名（可让多个 pi 实例共用一个会话，自担上述风险）。
+	// 不设时按 pid 派生，保证「一个 pi 进程 ↔ 一个 tmux 会话」。
+	const pinnedSession = process.env.PI_TMUX_BASH_SESSION?.trim();
+	const sessionPrefix = process.env.PI_TMUX_BASH_SESSION_PREFIX?.trim() || "pi-bg";
 	return {
 		tmuxBinary: process.env.PI_TMUX_BASH_TMUX?.trim() || "tmux",
-		sessionName: process.env.PI_TMUX_BASH_SESSION?.trim() || "pi-bg",
+		sessionName: pinnedSession || `${sessionPrefix}-${process.pid}`,
+		sessionPrefix,
+		sessionPinned: Boolean(pinnedSession),
 		outputDir: process.env.PI_TMUX_BASH_DIR?.trim() || join(tmpdir(), "pi-tmux-bash"),
 		autoCloseOnComplete: bool(process.env.PI_TMUX_BASH_AUTOCLOSE, true),
 		maxLines: num(process.env.PI_TMUX_BASH_MAX_LINES, DEFAULT_MAX_LINES),
