@@ -13,6 +13,9 @@ tmp/
 # private local dev notes (per-machine dev workflow, symlink list)
 AGENTS.md
 
+# private dev note: line-by-line alignment checklist against pi's built-in bash (kept locally, not published)
+extensions/tmux-bash/BUILTIN-BASH-REFERENCE.md
+
 # third-party repos vendored for read-only reference only (never published from here)
 third_party/
 

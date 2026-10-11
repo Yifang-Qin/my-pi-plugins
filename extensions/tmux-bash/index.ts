@@ -1,15 +1,18 @@
-// tmux-bash — 用 tmux 后台化覆盖 pi 内置 bash：
+// tmux-bash — overrides pi's built-in bash with tmux-backed backgrounding:
 //
-//   - 覆盖内置 bash（同名 registerTool 完全替换）：命令始终在 detached tmux 窗口里跑，
-//     execute 前台同步等待并「流式转发」输出；未显式 timeout 时等 PI_TMUX_BASH_FOREGROUND_TIMEOUT
-//     秒（默认 120s）超时「自动转后台」（不杀命令），完成后经 steer 自动通知模型；
-//     显式 timeout 时保留内置「硬超时杀死（退出码 124）」语义，不转后台。
-//   - background:true 立即后台，不等待（取代旧的 bg_start，用于 dev server / watcher 等）。
-//   - 新增 bg 管理工具（action=list/logs/kill）管理转后台/显式后台的任务。
+//   - Overrides the built-in bash (a same-named registerTool fully replaces it): commands always run in a
+//     detached tmux window; execute waits in the foreground and "streams" the output. Without an explicit
+//     timeout it waits PI_TMUX_BASH_FOREGROUND_TIMEOUT seconds (default 120s) and then "automatically moves
+//     to the background" (the command is not killed), notifying the model via steer on completion;
+//     with an explicit timeout it keeps the built-in "hard kill on timeout (exit code 124)" semantics and
+//     does not move to the background.
+//   - background:true detaches immediately without waiting (replaces the old bg_start; for dev servers / watchers, etc.).
+//   - Adds a bg management tool (action=list/logs/kill) for jobs that were moved to the background or started there.
 //
-// 覆盖时对齐内置 bash 的所有形状（结果 content / details / isError / 错误文案 / 截断），
-// 逐条清单见同目录 BUILTIN-BASH-REFERENCE.md。进程交给 tmux server 持有，pi 重启/reload/
-// 退出都不影响后台任务。
+// The override mirrors every "shape" of the built-in bash (result content / details / isError / error
+// messages / truncation). Processes are owned by the tmux server, so /reload and session switches do not
+// interrupt background jobs; a job's lifetime never exceeds the pi process, though (quitting pi tears down
+// its tmux session).
 
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -160,7 +163,7 @@ function renderBackgroundedBody(lines: string[], theme: Theme): string | null {
 	return out.join("\n");
 }
 
-// 内置 bash 形状（command + timeout）保持不变，仅新增 background / stdin 两个可选参数。见 BUILTIN-BASH-REFERENCE.md §2/§7。
+// The built-in bash shape (command + timeout) is unchanged; only the optional background / stdin parameters are added.
 const BashParams = Type.Object({
 	command: Type.String({ description: "The shell command to execute" }),
 	timeout: Type.Optional(
