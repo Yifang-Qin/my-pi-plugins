@@ -1,39 +1,42 @@
 # fuzzy-file-finder
 
-fzf/telescope 风格的文件选择器,作为**多文件子目录扩展**加载(pi 把本目录的
-`index.ts` 当成一个扩展,`jiti` 在运行时解析相对导入,无需打包或 submodule)。
+**English** | [简体中文](README-CN.md)
 
-## 模块
+An fzf/telescope-style file picker, loaded as a **multi-file directory extension** (pi treats this
+directory's `index.ts` as one extension, and `jiti` resolves relative imports at runtime, so there is no
+bundling and no submodule).
 
-| 文件 | 职责 |
+## Modules
+
+| File | Responsibility |
 |---|---|
-| `index.ts` | 扩展入口。注册 `/find-file` 命令 + 在 `session_start` 加一个 autocomplete provider 包装器，接管 `@` 的全部交互：词首裸 `@` 弹查找器；`@query`（已打字）走内联子序列模糊下拉（吸收自原 `fuzzy-at-files.ts` 独立扩展）；其他委托回内置链。缓存文件清单（session_start 时预热） |
-| `finder-overlay.ts` | `ctx.ui.custom()`（编辑器槽位模式）用的 TUI 组件：搜索框 + 双模式（空查询=目录树浏览，打字=扁平模糊列表）+ 键位。列表区固定高度，打字时布局不振荡 |
-| `files.ts` | 数据层：`fd --no-ignore`（退回 `git ls-files --cached --others`）全量列文件，经写死黑名单（`node_modules`/`.git`/`.env*` 等）过滤 + 从文件清单提取目录前缀 + `fuzzyFilter` 子序列模糊排序 |
-| `tree.ts` | 目录树模型（`buildTree` / `flattenVisible`），浏览模式使用 |
+| `index.ts` | Extension entry. Registers the `/find-file` command and, in `session_start`, adds an autocomplete provider wrapper that takes over everything `@` does: a bare `@` at the start of a word opens the finder; `@query` (already typed) goes through an inline subsequence-fuzzy dropdown (absorbed from the former standalone `fuzzy-at-files.ts` extension); everything else is delegated back to the built-in chain. Caches the file list (warmed up at session_start) |
+| `finder-overlay.ts` | The TUI component used by `ctx.ui.custom()` (editor-slot mode): search box + two modes (empty query = directory tree browsing, typing = flat fuzzy list) + key bindings. The list area has a fixed height so the layout doesn't jitter while typing |
+| `files.ts` | Data layer: lists all files with `fd --no-ignore` (falling back to `git ls-files --cached --others`), filters them through a hard-coded blocklist (`node_modules`/`.git`/`.env*`, etc.), extracts directory prefixes from the file list, and ranks with the `fuzzyFilter` subsequence fuzzy matcher |
+| `tree.ts` | Directory tree model (`buildTree` / `flattenVisible`), used by browse mode |
 
-## 分阶段
+## Phases
 
-- **阶段 1（已完成）**：`/find-file` → 扁平模糊列表 → 插入 `@path`。
-- **阶段 2（已完成）**：空搜索框 = 可折叠目录树浏览（→/← 展开折叠、enter 在目录上切换、在文件上选中、tab 选中当前节点）；打字切到全库扁平模糊列表，删空又回到树（保留展开状态）。整棵树由内存文件清单构建，展开/折叠零 IO。
-- **阶段 3（已完成）**：词首 `@` 自动弹 overlay，替代内置内联下拉。**走 autocomplete provider 层，不用 `CustomEditor`**。踩坑与结论：
-  - 先试过 `CustomEditor` + `setEditorComponent` 拦 `handleInput`：逻辑本身没问题，但被 **`pi-powerline-footer` 抢占**——它无条件用自己的 `BashModeEditor` 占据编辑器（`setEditorComponent`），且只从被包装的编辑器里取 autocomplete provider，**不把按键转发给它的 `handleInput`**，所以我们的拦截成了死代码，表现就是「一直是内联下拉」。
-  - 加载顺序：`~/.pi/agent/extensions/`（本扩展）先于 settings 里 `packages`（powerline）加载，所以 powerline 后包装、后胜出。
-  - 换路子：pi-tui 的 `Editor` 把 `@` 硬编码成补全触发符（`DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS`），唯二的拦截点是 `handleInput` 或 **autocomplete provider 链**。powerline 会保留 provider 链（`ModeAwareAutocompleteProvider` 非 bash 模式时委托回来），所以我们改在 `addAutocompleteProvider` 里：命中**词首裸 `@`**（`^@` 或 ` @`/`\t@`，后面还没打字）就 `ctx.ui.custom` 弹查找器，并返回**空 items** 让编辑器收起内联下拉。这条路对 powerline 与原生 pi 都成立。
-  - **不要用 `{ overlay: true }`**（结论形成于 powerline < 0.9；0.9.0 起 powerline 已移除自管 fixed-editor、改由 pi 原生 fullscreen 负责，下述 compositor 问题不复存在。编辑器槽位渲染仍是更贴近内置选择器的做法，暂不改动；若想改回 overlay 需在 pi 1.0 fullscreen 下重新验证）：pi-tui overlay 会让 powerline 的 fixed-editor compositor 进入「overlay visible」分支——`terminal.rows` 跳回全高、`tui.render` 返回完整缓冲区，pi-tui 因此 full clear + 重印全部对话历史（表现为「历史跳变、输入框被抹掉、内容下移」）。改成**编辑器槽位渲染**（`ctx.ui.custom()` 默认模式）后，compositor 把组件画在底部固定 cluster 里，聊天视口不动；原生 pi 下行为等同内置选择器。
-  - 插入：`@` 已在缓冲区里（就是触发的那一下），选中后只补插尾巴 `path `/`dir/`（`mention.slice(1)`）→ 得到 `@path `/`@dir/`；取消（esc）→ 留下裸 `@`（键不丢，也是打字面 `@`/邮箱、或回落到内联模糊下拉的逃生口）。
-  - `@foo`（已打字）、`a@`（词中，如邮箱）都不拦，原样委托给 provider 链。
-  - 必须在 `session_start` 里 `addAutocompleteProvider`：`/reload` 会清空 provider 包装器再以 `reason:"reload"` 重触发 `session_start`，装在这里才会被重装。
-- **阶段 4（已完成）**：过滤模式并入目录候选。此前候选清单只有文件（`fd --type f` / `git ls-files`），一打字目录就彻底消失；现在从文件清单提取全部目录前缀（零 IO，与树的数据来源一致），目录带 `/` 后缀与文件一起参与模糊匹配、按分数混排，选中插入 `@dir/`。空目录依然不可见（与浏览模式一致）。
-- **阶段 5（已完成）**：合并原独立扩展 `fuzzy-at-files.ts`。`@query`（已打字）不再委托回内置的“连续子串”匹配，而是由同一个 provider 直接串内联子序列模糊下拉（`@patf` 命中 `path/to/file`）；无命中时仍回落内置链。好处：共享一份文件清单/缓存/黑名单，session 预热只跑一次 `fd`；词边界统一用 PATH_DELIMITERS（空格/tab/`"`/`'`/`=`），裸 `@` 开查找器与 `@query` 内联模糊的判定不再分裂；两个扩展间“裸 `@` 互相让路”的隐式握手也不需要了。取消查找器（esc）后继续打字即落入内联模糊，逃生口行为不变。
+- **Phase 1 (done)**: `/find-file` → flat fuzzy list → insert `@path`.
+- **Phase 2 (done)**: an empty search box = collapsible directory tree browsing (→/← expand/collapse, enter toggles on a directory and selects on a file, tab selects the current node); typing switches to a repo-wide flat fuzzy list, and clearing the box returns to the tree (expansion state is preserved). The whole tree is built from the in-memory file list, so expanding/collapsing involves zero IO.
+- **Phase 3 (done)**: a bare `@` at the start of a word automatically opens the picker, replacing the built-in inline dropdown. **It works at the autocomplete provider layer, not with `CustomEditor`**. Pitfalls and conclusions:
+  - We first tried `CustomEditor` + `setEditorComponent` to intercept `handleInput`: the logic itself was fine, but it was **pre-empted by `pi-powerline-footer`**, which unconditionally takes over the editor with its own `BashModeEditor` (`setEditorComponent`), takes the autocomplete provider only from the wrapped editor, and **does not forward key presses to its `handleInput`**. Our interception became dead code, and the symptom was "always the inline dropdown".
+  - Load order: `~/.pi/agent/extensions/` (this extension) loads before the `packages` in settings (powerline), so powerline wraps later and wins.
+  - A different route: pi-tui's `Editor` hard-codes `@` as a completion trigger (`DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS`), and the only two interception points are `handleInput` or the **autocomplete provider chain**. Powerline preserves the provider chain (`ModeAwareAutocompleteProvider` delegates back when not in bash mode), so we hook in via `addAutocompleteProvider` instead: on a **bare `@` at the start of a word** (`^@` or ` @`/`\t@` with nothing typed after it) we open the finder with `ctx.ui.custom` and return **empty items** so the editor closes the inline dropdown. This works with both powerline and native pi.
+  - **Don't use `{ overlay: true }`** (this conclusion was reached with powerline < 0.9; since 0.9.0 powerline has removed its self-managed fixed editor and pi's native fullscreen mode handles it, so the compositor problem described below no longer exists. Editor-slot rendering is still closer to the built-in picker, so it is left unchanged; going back to an overlay would need re-verification under pi 1.0 fullscreen): a pi-tui overlay sends powerline's fixed-editor compositor into the "overlay visible" branch — `terminal.rows` jumps back to full height and `tui.render` returns the full buffer, so pi-tui does a full clear and reprints the whole conversation history (seen as "history jumps, the input box is wiped, content shifts down"). With **editor-slot rendering** (the default mode of `ctx.ui.custom()`), the compositor draws the component in the fixed cluster at the bottom and the chat viewport doesn't move; under native pi it behaves like the built-in selector.
+  - Insertion: the `@` is already in the buffer (it is the keystroke that triggered the picker), so after selection only the tail `path `/`dir/` is inserted (`mention.slice(1)`), giving `@path `/`@dir/`. Cancelling (esc) leaves a bare `@` (the key isn't lost, and it is also the escape hatch for typing a literal `@`/an email address or falling back to the inline fuzzy dropdown).
+  - `@foo` (already typed) and `a@` (mid-word, e.g. an email address) are not intercepted and are delegated unchanged to the provider chain.
+  - `addAutocompleteProvider` must be called in `session_start`: `/reload` clears the provider wrappers and then re-fires `session_start` with `reason:"reload"`, so installing it there is what gets it reinstalled.
+- **Phase 4 (done)**: directory candidates are merged into filter mode. Previously the candidate list contained only files (`fd --type f` / `git ls-files`), so directories vanished as soon as you typed; now all directory prefixes are extracted from the file list (zero IO, the same data source as the tree), and directories, with a trailing `/`, take part in fuzzy matching together with files, mixed by score; selecting one inserts `@dir/`. Empty directories remain invisible (consistent with browse mode).
+- **Phase 5 (done)**: merged the former standalone extension `fuzzy-at-files.ts`. `@query` (already typed) no longer delegates back to the built-in "contiguous substring" matching; the same provider now serves the inline subsequence-fuzzy dropdown directly (`@patf` matches `path/to/file`), and still falls back to the built-in chain when nothing matches. Benefits: one shared file list / cache / blocklist, so the session warm-up runs `fd` only once; word boundaries consistently use PATH_DELIMITERS (space/tab/`"`/`'`/`=`), so the decisions for "bare `@` opens the finder" and "`@query` inline fuzzy" no longer diverge; and the implicit handshake between the two extensions, where each yielded to the other on a bare `@`, is no longer needed. After cancelling the finder (esc), continuing to type falls into inline fuzzy, so the escape hatch is unchanged.
 
-## 交互
+## Interaction
 
-- 触发：运行 `/find-file`，或在编辑器里于词首打 `@`。查找器渲染在编辑器位置（底部），不是悬浮 overlay。
-- 内联模糊（不开查找器）：直接打 `@query` 时在内置下拉里子序列模糊匹配全库文件（`@patf` 命中 `path/to/file`，`@src idx` 命中 `src/.../index.ts`），enter/tab 插入 `@path`。
-- 浏览模式：↑↓ 移动、→/← 展开折叠或跳父目录、enter 目录切换/文件选中、**tab 选中当前节点**（目录插入 `@dir/`，文件插入 `@path `）、esc 取消。
-- 过滤模式：打字过滤（目录与文件一起匹配，目录带 `/` 后缀）、↑↓ 移动、enter/tab 选中（目录插入 `@dir/`，文件插入 `@path `）、esc 取消。
+- Trigger: run `/find-file`, or type `@` at the start of a word in the editor. The finder is rendered at the editor's position (at the bottom), not as a floating overlay.
+- Inline fuzzy (without opening the finder): typing `@query` directly does subsequence-fuzzy matching of repo-wide files in the built-in dropdown (`@patf` matches `path/to/file`, `@src idx` matches `src/.../index.ts`); enter/tab inserts `@path`.
+- Browse mode: ↑↓ move, →/← expand/collapse or jump to the parent directory, enter toggles a directory / selects a file, **tab selects the current node** (a directory inserts `@dir/`, a file inserts `@path `), esc cancels.
+- Filter mode: type to filter (directories and files are matched together, directories with a trailing `/`), ↑↓ move, enter/tab selects (a directory inserts `@dir/`, a file inserts `@path `), esc cancels.
 
-## 依赖
+## Requirements
 
-需要 `fd`(缺失时退回 `git ls-files`,故至少要在 git 仓库内)。仅在交互式 TUI 模式可用。
+Requires `fd` (falls back to `git ls-files` when it is missing, so you must at least be inside a git repo). Available in interactive TUI mode only.

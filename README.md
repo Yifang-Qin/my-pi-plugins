@@ -1,153 +1,155 @@
 # my-pi-plugins
 
-个人 [pi](https://pi.dev) coding-agent 配置，做成一个原生 pi package，用 `pi install` / `pi remove` 直接安装卸载。
+**English** | [简体中文](README-CN.md)
 
-## 📦 包含内容
+A personal [pi](https://pi.dev) coding-agent setup, packaged as a native pi package: install and remove it with `pi install` / `pi remove`.
 
-| 名称 | 类型 | 一句话定位 | 关键能力 |
+## 📦 What's included
+
+| Name | Type | In one line | Key features |
 |---|---|---|---|
-| 🧩 `tmux-bash` | Extension | 用 tmux 后台化覆盖内置 bash，长命令不再卡 | 子目录扩展 · 三种使用模式 · 配套 `bg` 工具 · 彩色状态行 |
-| 📂 `fuzzy-file-finder` | Extension | 接管 `@` 的全部交互：目录树浏览 + 全库模糊补全 | 原地弹窗 · 目录/文件统一匹配 · 已吸收 `fuzzy-at-files.ts` · `fd` 加速 |
-| 🌳 `tree-nav` | Extension | lazygit 风格会话树导航，user 轮次分支一目了然 | `/nav` 弹大 overlay · enter 跳转 · 打字搜索 · 跳前可选 summarize |
-| 🤖 `afang-subagent` | Extension | 把任务委派给独立 pi 子进程（上下文隔离） | single/parallel/chain · `background:true` 异步 · `subagent_tasks` 工具 · 自包含 agent+prompt |
-| ✅ `todo` | Extension | phase → task 分层计划 + editor 上方常驻进度 widget | 批量初始化/追加 · 五态任务 · 自动推进 · 分支恢复 · 复选框树形渲染 · `/todos` 全量查看 |
-| 🎨 `gruvbox-dark` | Theme | gruvbox 经典深色暖色调主题 | 高对比 · 长会话不疲劳 · 搭配 powerline 状态栏效果最佳 |
+| 🧩 `tmux-bash` | Extension | Overrides the built-in bash with tmux backgrounding so long commands no longer block | Directory extension · three usage modes · companion `bg` tool · colored status line |
+| 📂 `fuzzy-file-finder` | Extension | Takes over everything `@` does: directory tree browsing + repo-wide fuzzy completion | In-place popup · unified directory/file matching · absorbs `fuzzy-at-files.ts` · `fd`-accelerated |
+| 🌳 `tree-nav` | Extension | lazygit-style session tree navigator that makes user-turn branches obvious | `/nav` opens a large overlay · enter to jump · type to search · optional summarize before jumping |
+| 🤖 `afang-subagent` | Extension | Delegates tasks to isolated pi subprocesses (context isolation) | single/parallel/chain · `background:true` async · `subagent_tasks` tool · self-contained agents + prompts |
+| ✅ `todo` | Extension | Phase → task hierarchical plan + a persistent progress widget above the editor | Batch init/append · five task states · auto-advance · branch restore · checkbox tree rendering · `/todos` full view |
+| 🎨 `gruvbox-dark` | Theme | Classic dark, warm-toned gruvbox theme | High contrast · easy on the eyes in long sessions · best with the powerline status bar |
 
-`package.json` 里的 `pi` manifest 声明了上述资源，pi 安装本包时自动加载。
+The `pi` manifest in `package.json` declares the resources above, and pi loads them automatically when this package is installed.
 
-## 详细介绍
+## Details
 
 ### 🧩 tmux-bash
 
-覆盖 pi 内置 bash：把长命令丢到 detached tmux 窗口跑，**前台流式转发输出**，不再被内置 bash 的同步等待卡住。
+Overrides pi's built-in bash: long commands run in a detached tmux window while **output is streamed back in the foreground**, so you are no longer stuck behind the built-in bash's synchronous wait.
 
-- **三种使用模式**：不设 `timeout` 时前台等 ~120s（`PI_TMUX_BASH_FOREGROUND_TIMEOUT` 可覆盖）未结束**自动转后台**（**不杀命令**），完成后自动通知；显式 `timeout` 到点硬杀（退出码 **124**，不转后台）；`background:true` 立即分离
-- 配套 `bg` 工具（`list` / `logs` / `kill`）管理后台任务；结果末尾附彩色状态行 `✓ done · 1.2s` / `✗ exit 1`
-- 进程交给 tmux server 持有，pi 重启 / `/reload` / 退出都不影响后台任务
-- **依赖系统安装 `tmux`**（缺了 bash 工具会直接报不可用）
+- **Three usage modes**: without `timeout`, it waits in the foreground for ~120s (override with `PI_TMUX_BASH_FOREGROUND_TIMEOUT`); if the command is still running, it is **automatically moved to the background** (**the command is not killed**) and you get a notification on completion. An explicit `timeout` is a hard kill at the deadline (exit code **124**, no backgrounding). `background:true` detaches immediately.
+- A companion `bg` tool (`list` / `logs` / `kill`) manages background jobs; results end with a colored status line such as `✓ done · 1.2s` / `✗ exit 1`.
+- Processes are owned by the tmux server, so restarting pi, `/reload`, or exiting does not affect background jobs.
+- **Requires `tmux` to be installed** (without it the bash tool reports that it is unavailable).
 
 ### 📂 fuzzy-file-finder
 
-fzf / telescope 风格的文件选择器，**接管编辑器里 `@` 的全部交互**。
+An fzf / telescope-style file picker that **takes over everything `@` does in the editor**.
 
-- **词首裸 `@`**：在光标位置就地打开选择器（**不用 overlay 模式**，避免与 pi-powerline-footer fixed editor 冲突导致全屏重印）；也可走 `/find-file` 命令
-- **空搜索框=目录树浏览**（`→` / `←` 展开折叠、`tab` 选目录）；**打字=全库模糊列表**（目录带 `/` 后缀一起匹配）；选中插入 `@path`，目录插入 `@dir/`
-- **`@query`（已打字）** 走 codex 风格子序列模糊内联下拉：例如 `@patf` 命中 `path/to/file`（已吸收原独立扩展 `fuzzy-at-files.ts`）
-- 索引全量（`--no-ignore`），但写死排除 `node_modules` / `.git` / `.env` 等不会手动引用的路径；加速可装 `fd`（缺了会回退 `git ls-files`）
+- **Bare `@` at the start of a word**: opens the picker in place at the cursor (**no overlay mode**, which avoids full-screen repaints caused by conflicts with the pi-powerline-footer fixed editor); it is also available as the `/find-file` command.
+- **Empty query = directory tree browsing** (`→` / `←` expand/collapse, `tab` selects a directory); **typing = repo-wide fuzzy list** (directories are matched together, with a trailing `/`). The selection is inserted as `@path`, and directories as `@dir/`.
+- **`@query` (already typed)** uses a codex-style subsequence fuzzy inline dropdown: e.g. `@patf` matches `path/to/file` (this absorbs the former standalone extension `fuzzy-at-files.ts`).
+- The index is complete (`--no-ignore`), but paths you would never reference by hand, such as `node_modules` / `.git` / `.env`, are hard-excluded. Install `fd` for speed (without it, it falls back to `git ls-files`).
 
 ### 🌳 tree-nav
 
-lazygit 风格会话树导航器：**以 user 轮次为一等公民、左侧分支泳道**展示整个会话结构，方便跳回任意历史分支。
+A lazygit-style session tree navigator: it shows the whole session structure with **user turns as first-class nodes and branch lanes on the left**, making it easy to jump back to any historical branch.
 
-- `/nav` 弹大 overlay，enter 跳转到任意历史 user 轮次（**跳前可选 summarize 被放弃分支**，把岔路压成一段摘要）
-- 中间 assistant / tool 节点默认折叠，可展开查看
-- 在 user 轮次里打字即搜索
+- `/nav` opens a large overlay; press enter to jump to any historical user turn (**optionally summarize the abandoned branch before jumping**, compressing the detour into a short summary).
+- Intermediate assistant / tool nodes are collapsed by default and can be expanded.
+- Typing while on a user turn searches.
 
 ### 🤖 afang-subagent
 
-fork 自 pi 官方 subagent 示例、自维护演进。注册 `subagent` 工具把任务委派给**独立 pi 子进程**（**上下文隔离**，主会话上下文不被污染），配套 `subagent_tasks` 工具（`list` / `status` / `result` / `cancel`）。
+Forked from pi's official subagent example and maintained independently. It registers a `subagent` tool that delegates tasks to **isolated pi subprocesses** (**context isolation**: the main session's context is not polluted), together with a `subagent_tasks` tool (`list` / `status` / `result` / `cancel`).
 
-- **三种模式**：`single`（单 agent）/ `parallel`（并发多 agent）/ `chain`（前一个结果喂下一个）
-- **`background:true` 后台异步**：完成时 followUp 通知（防抖合并），结果落盘 `<任务cwd>/.pi/subagent-results/<时间戳>-task-N-<agent>-<topic>.md`
-- agent 未指定 model 时**继承主会话当前模型**
-- **自包含 agent + prompt**：内建 agent 定义（`scout` / `planner` / `reviewer` / `worker`，扩展从自身 `agents/` 目录发现）与 workflow prompt（`/implement` / `/scout-and-plan` / `/implement-and-review`，`prompts/` 目录经 `resources_discover` 自动注册）都随扩展自包含加载，`pi install` 后开箱即用，无需拷贝或软链接任何文件
-- 想覆盖内建 agent 行为，在 `~/.pi/agent/agents/` 或项目 `.pi/agents/`（配 `agentScope: "both"`）放同名 `.md` 即可（**优先级 builtin < user < project**）；详见 `extensions/afang-subagent/README.md`
+- **Three modes**: `single` (one agent) / `parallel` (concurrent agents) / `chain` (each result feeds the next).
+- **`background:true` async mode**: a followUp notification (debounced and merged) arrives on completion, and the result is written to `<task cwd>/.pi/subagent-results/<timestamp>-task-N-<agent>-<topic>.md`.
+- When an agent doesn't specify a model, it **inherits the main session's current model**.
+- **Self-contained agents + prompts**: the built-in agent definitions (`scout` / `planner` / `reviewer` / `worker`, discovered by the extension from its own `agents/` directory) and the workflow prompts (`/implement` / `/scout-and-plan` / `/implement-and-review`, whose `prompts/` directory is registered automatically via `resources_discover`) all ship with the extension, so it works out of the box after `pi install` with no files to copy or symlink.
+- To override a built-in agent, put a same-named `.md` in `~/.pi/agent/agents/` or in the project's `.pi/agents/` (with `agentScope: "both"`); **precedence is builtin < user < project**. See `extensions/afang-subagent/README.md` for details.
 
 ### ✅ todo
 
-fork 自 pi 官方 todo 示例、自维护演进。任务按 **phase → task 两层**组织，phase 的进度由子任务推导；editor 上方常驻 widget 展示当前计划。
+Forked from pi's official todo example and maintained independently. Tasks are organized in **two levels, phase → task**; a phase's progress is derived from its subtasks, and a persistent widget above the editor shows the current plan.
 
-- **批量规划**：`init` 一次替换整份计划；单 phase 计划也可以扁平写成 `items: [...]`（可选带 `phase` 指定名字，缺失时为 `Tasks`）—— 模型常见写法，自动合成而不逼它重试。`append` 批量追加到某个 phase，缺失时创建该 phase。
-- **五种状态**：`○ pending` / `◼ in_progress` / `✓ completed` / `− abandoned` / `! blocked`。阻塞可以记录 `reason`；已完成或放弃的任务不会被 phase 级 `block` 重新打开。
-- **自动推进**：成功修改后，全清单最多一项 `in_progress`；没有进行中项时，按 phase/task 顺序启动首个 pending，跳过 blocked。`done` 后一般无需再调用 `start`。
-- **稳定 ID 和原子操作**：用回执里的数字 ID 定位任务，或用 phase 名定位整组；当前分支内 `init` / `clear` / `rm` 都不复用 ID。一次操作校验失败就整体丢弃，ID 也不会消耗。任务文本在同一 phase 内不能重复。
-- **恢复与兼容**：完整快照保存在工具结果 `details.phases`，加载会话和切换分支时恢复。旧 `details.todos`（包括 `done` 布尔格式）恢复为默认 `Tasks` phase；旧错误结果不会覆盖有效状态。`view` 只读，不推进指针。
-- **渲染（向 omp 对齐）**：任务行用 **ASCII 复选框** `[x]` / `[ ]`，状态靠**颜色 + 删除线**区分—— completed 是 success 色打勾 + 删除线，abandoned 是 error 色空框 + 删除线，in_progress 是 accent 色空框（**不换符号**，所以纵向扫视时方框列对齐），blocked 是 warning 色空框 + `(blocked: 理由)`，pending 变暗。任务按**树形连接线** `├─` / `└─` 挂在 phase 下，「还有 N 条」就是最后那个 `└─` 行。phase 头是「编号 + 名称 + ` · closed/total`」，活跃阶段加粗 accent、其余 muted，**不放状态图标**；**单 phase 时不显示 phase 头**（扁平 init 产生的 `Tasks` 不再多一行废话）。保留与 omp 不同的两点：用阿拉伯数字而非罗马数字（中文语境更直观、宽度稳定），以及**显示任务 ID** `#4`（omp 按原文定位所以没 ID，我们有，显示出来便于对话里指代）。
-- **折叠预览的「行走窗口」**：末尾的已关闭任务领头（额外加、不占未完成配额），从当前任务往后铺至 8 条，`… N more tasks` 只数没装下的**未完成**项。这样即使乱序完成，也总有一行打勾行可见。与 omp 的唯一偏离：窗口没铺满时（当前任务靠末尾）向前多拉几条已关闭任务填满，比留空白有信息量。
-- **显示层次**：widget 和折叠回执展开当前 phase、最近操作涉及的 phase（以及无活跃任务但有 blocked 的 phase）；其余 phase 只留一行头。`completed + abandoned` 计为 closed，blocked 单独统计。`/todos` 支持方向键、PgUp/PgDn 滚动查看完整清单，展开工具结果也可查看全部任务。三处渲染（widget / 工具结果 / `/todos`）**共用同一套 `taskLine` 与 `treeLines`**，不会出现两边对不上的情况。
-- **模型上下文（三处注入，全部只是告知，不干预控制流）**：工具结果**始终全展开**分层快照（总体进度 + 当前任务 + 完整 phase 树），它是状态的**唯一权威载体**。
-  - `before_agent_start`：静态 `todo_guide` + 紧凑的 `todo_state`（一行计数 + 当前任务，约 30 token，详情让模型自己 `view`）。轮开头一定看得见未完成计划，但不把全量清单每轮重述。每个 user prompt 触发一次（跟工具调用次数无关）。
-  - **eager prelude**：清单为空且是会话**首条** user 消息时，注入一条隐藏建议（先用一次 `init` 铺好分阶段计划）。以 `?` / `？` / `!` / `！` 结尾的 prompt 是提问而非派活，不推；已有清单改走 `todo_state`，两者天然互斥、不重复施压。只对齐 omp 的 `preferred` 档位（建议、不强制）—— pi 没有强制 `tool_choice` 的接口，而且 pi 把 handler 消息放在 user 消息**之后**（omp 是之前）。
-  - `session_compact`：压缩会把**承载计划的工具结果**摘要掉，而 `before_agent_start` 只在 user prompt 时触发、补不上自动续跑那个窗口。所以当场补一条：有计划补状态摘要，没计划重申 eager。同样用 `triggerTurn: false`，不自己拉起一轮。
-  - `turn_end`：**mid-run nudge**，按「修改类工具」（`bash`/`edit`/`write` 等，失败不计）调用次数 ≥ 12 触发，每个 user prompt 最多 2 次，任何 `todo` 调用清零计数。内容只有一句「还有 N 项未完成」约 30 token，**不带清单**。读文件/搜索再多也不触发；本轮没调工具（模型正在收工）也跳过。**只追加 `entries`、永不返回 `continue`**。
-  - 调用失败时：补一条隐藏提醒（计划未变、用户看不到进度、修正参数后重试）。用 `triggerTurn: false` 而非 `deliverAs: "nextTurn"` —— 后者在 pi 里要等到下个 user prompt 才投递，对 mid-run 失败太晩。
-- **刻意不做控制流干预**：不因「还有 todo 未完成」而拦住收工，何时结束完全由模型自己定。曾按 omp 的 `checkCompletion` 做过 `agent_before_settle` 拦截 + 自动续跑（带 blocked 豁免、次数上限、子 agent 禁用等六个出口），实测后**整体撑销**：它必须先判断「模型是不是在等用户回答」，而这只能靠关键词/正则启发式；漏判的后果是强行续跑、让模型替用户做决定——错在危险方向。实测反例：「要麻烦你确认一下…」不带「请」也不以问号结尾，就被漏判。自然语言里「我在等你」的说法无穷，补正则是打地鼠，**不要再尝试**。
+- **Batch planning**: `init` replaces the whole plan in one call; a single-phase plan can also be written flat as `items: [...]` (optionally with `phase` for its name, `Tasks` if omitted). This is a common way models write it, so it is synthesized automatically instead of forcing a retry. `append` adds a batch to a phase, creating the phase if it doesn't exist.
+- **Five states**: `○ pending` / `◼ in_progress` / `✓ completed` / `− abandoned` / `! blocked`. A block can record a `reason`; completed or abandoned tasks are not reopened by a phase-level `block`.
+- **Auto-advance**: after a successful mutation, at most one task in the whole list is `in_progress`; when none is in progress, the first pending task in phase/task order is started, skipping blocked ones. After `done` you normally don't need to call `start`.
+- **Stable IDs and atomic operations**: tasks are addressed by the numeric ID in the receipt, or a whole group by phase name; within the current branch, `init` / `clear` / `rm` never reuse IDs. If an operation fails validation, the whole operation is discarded and no IDs are consumed. Task text must be unique within a phase.
+- **Restore and compatibility**: the full snapshot is stored in the tool result's `details.phases` and restored when a session loads or a branch switches. Legacy `details.todos` (including the `done` boolean format) is restored into the default `Tasks` phase; old error results never overwrite a valid state. `view` is read-only and does not move the pointer.
+- **Rendering (aligned with omp)**: task rows use **ASCII checkboxes** `[x]` / `[ ]`, and state is conveyed by **color + strikethrough**. Completed is a success-colored check with strikethrough, abandoned is an error-colored empty box with strikethrough, in_progress is an accent-colored empty box (**the symbol doesn't change**, so the checkbox column stays aligned when scanning vertically), blocked is a warning-colored empty box + `(blocked: reason)`, and pending is dimmed. Tasks hang under their phase with **tree connectors** `├─` / `└─`, and the "N more" line is the final `└─` row. The phase header is "number + name + ` · closed/total`", with the active phase in bold accent and the rest muted, and **no status icon**; **with a single phase, the phase header is omitted** (so the `Tasks` phase produced by a flat init doesn't add a pointless line). Two deliberate differences from omp: Arabic instead of Roman numerals (more readable, stable width), and **task IDs are shown** as `#4` (omp addresses tasks by their original text and so has no IDs; we do, and showing them makes them easy to refer to in conversation).
+- **The collapsed preview's "walking window"**: trailing closed tasks lead (extra, not counted against the open-task quota), then it extends from the current task to 8 rows, and `… N more tasks` counts only **unfinished** tasks that didn't fit. This way a checked-off row is always visible even when tasks complete out of order. The only deviation from omp: when the window isn't full (the current task is near the end), a few more closed tasks are pulled in from before it to fill the space, which is more informative than leaving it blank.
+- **Display levels**: the widget and the collapsed receipt expand the current phase and the phase(s) touched by the latest operation (plus any phase that has no active task but has blocked tasks); other phases keep just a one-line header. `completed + abandoned` count as closed, while blocked is counted separately. `/todos` supports arrow keys and PgUp/PgDn to scroll through the full list, and expanding the tool result also shows every task. All three renderers (widget / tool result / `/todos`) **share the same `taskLine` and `treeLines`**, so they can never disagree.
+- **Model context (injected in three places, all purely informational and never interfering with control flow)**: the tool result **is always fully expanded** as a hierarchical snapshot (overall progress + current task + the full phase tree), and it is the **single authoritative carrier of state**.
+  - `before_agent_start`: a static `todo_guide` + a compact `todo_state` (one line of counts + the current task, about 30 tokens; for details the model calls `view` itself). The unfinished plan is always visible at the start of a turn without restating the whole list every turn. It fires once per user prompt (independent of how many tool calls follow).
+  - **eager prelude**: when the list is empty and this is the **first** user message of the session, a hidden suggestion is injected (lay out a phased plan with a single `init` first). Prompts ending in `?` / `？` / `!` / `！` are questions rather than assignments and are not nudged; once a list exists, `todo_state` takes over, so the two are naturally mutually exclusive and never pressure twice. It only matches omp's `preferred` tier (a suggestion, not a requirement), because pi has no interface to force `tool_choice` and because pi places handler messages **after** the user message (omp places them before).
+  - `session_compact`: compaction summarizes away **the tool results that carry the plan**, while `before_agent_start` only fires on a user prompt and can't cover the window of an automatic continuation. So a message is injected on the spot: a state summary if there is a plan, or a restated eager prelude if not. It also uses `triggerTurn: false` and never starts a turn on its own.
+  - `turn_end`: the **mid-run nudge** fires once the count of "mutating tools" (`bash`/`edit`/`write` etc.; failures don't count) reaches ≥ 12, at most 2 times per user prompt, and any `todo` call resets the counter. The content is a single line, "N items still unfinished" (about 30 tokens), **without the list**. Reading files or searching never triggers it, however much; it is also skipped when the model made no tool calls this turn (it is wrapping up). It **only appends `entries` and never returns `continue`**.
+  - On a failed call: a hidden reminder is added (the plan is unchanged, the user can't see progress, fix the arguments and retry). It uses `triggerTurn: false` rather than `deliverAs: "nextTurn"`, because in pi the latter isn't delivered until the next user prompt, which is too late for a mid-run failure.
+- **Deliberately no control-flow intervention**: it never blocks wrapping up because "todos are still unfinished"; when to stop is entirely up to the model. We once built an `agent_before_settle` interception + automatic continuation following omp's `checkCompletion` (with six exits: a blocked exemption, a count cap, disabled in subagents, and so on), and after testing **scrapped it entirely**: it first has to decide whether the model is waiting for a user's answer, which can only be done with keyword/regex heuristics, and a miss forces a continuation and has the model make decisions for the user, which fails in the dangerous direction. A real counterexample: "I'd need you to confirm…" has no "please" and doesn't end with a question mark, so it was missed. There are endless ways to say "I'm waiting on you" in natural language, so patching the regex is whack-a-mole; **don't try this again**.
 
-模型可见参数为 `action` 加可选 `phases` / `items` / `id` / `phase` / `reason`，不再声明旧的 `add` / `set` / `list` 操作；历史调用仍可恢复、渲染。
+The parameters visible to the model are `action` plus the optional `phases` / `items` / `id` / `phase` / `reason`; the legacy `add` / `set` / `list` actions are no longer declared, but historical calls can still be restored and rendered.
 
-| action | 参数 | 作用 |
+| action | Parameters | Effect |
 |---|---|---|
-| `init` | `phases: [{name, items: string[]}]`，或扁平 `items` (+可选 `phase`) | 替换计划；`phases: []` 清空 | 
-| `append` | `phase`, `items: string[]` | 追加一批任务 |
-| `start` | `id` | 指定当前任务，原进行中项回到 pending；也可重新打开已关闭任务 |
-| `done` / `drop` | `id` 或 `phase`，都不传则作用于全部 | 完成 / 放弃 |
-| `block` / `unblock` | 必须传 `id` 或 `phase`；`block` 可带 `reason` | 阻塞 / 解除阻塞（随后照常自动推进） |
-| `rm` | `id` 或 `phase`，都不传则删除全部 | 删除目标任务及空 phase |
-| `view` / `clear` | 无 | 查看完整计划 / 清空整份计划 |
+| `init` | `phases: [{name, items: string[]}]`, or flat `items` (+ optional `phase`) | Replace the plan; `phases: []` clears it |
+| `append` | `phase`, `items: string[]` | Append a batch of tasks |
+| `start` | `id` | Set the current task; the previously in-progress task goes back to pending; can also reopen a closed task |
+| `done` / `drop` | `id` or `phase`; if neither is given, applies to all | Complete / abandon |
+| `block` / `unblock` | `id` or `phase` is required; `block` can take a `reason` | Block / unblock (auto-advance then proceeds as usual) |
+| `rm` | `id` or `phase`; if neither is given, removes everything | Remove the target tasks and empty phases |
+| `view` / `clear` | none | View the full plan / clear the whole plan |
 
-**参数宽容度**：不适用于当前 action 的字段一律忽略（如 `done` 带 `reason`、`view` 带 `items`），只有三类「目标歧义」会报错：`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase`；`clear` 带了目标（会提示改用 `rm`，避免误清整份计划）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
+**Parameter leniency**: fields that don't apply to the current action are ignored (e.g. `reason` on `done`, `items` on `view`). Only three kinds of "ambiguous target" cause an error: `done`/`drop`/`block`/`unblock`/`rm` given both `id` and `phase`; `clear` given a target (it suggests using `rm` instead, to avoid accidentally clearing the whole plan); and `start` without an `id` (`phase` is meaningless for `start`, so it never silently matches a whole group). Task/phase names and blockers are sanitized of ANSI and have whitespace collapsed into a single line.
 
 ```json
-{"action":"init","phases":[{"name":"调研","items":["核对接口","确认边界"]},{"name":"实现","items":["完成改动","验证行为"]}]}
+{"action":"init","phases":[{"name":"Research","items":["Check the API","Confirm the boundaries"]},{"name":"Implement","items":["Make the change","Verify the behavior"]}]}
 ```
 
-新会话中上述任务分配 `#1`–`#4`，`#1` 自动开始；`{"action":"done","id":1}` 会推进到 `#2`。实际操作以最新回执中的 ID 为准。复用旧会话或重新规划时 ID 会继续增长。
+In a new session the tasks above get `#1`–`#4`, and `#1` starts automatically; `{"action":"done","id":1}` advances to `#2`. Always go by the IDs in the latest receipt. IDs keep growing when a session is reused or the plan is redone.
 
-状态与集成测试：`bun test tests/todo.test.ts`（需要本机 pi 类型/运行时包可解析）。
+State and integration tests: `bun test tests/todo.test.ts` (the local pi types/runtime packages must be resolvable).
 
-- **与 `pi-powerline-footer` 的层叠顺序**：`aboveEditor` widget 的上下顺序由「首次 `setWidget` 的插入顺序」决定（同 key 重复 `setWidget` 会被挪到最下面）。本扩展只在 `session_start` 注册一次、之后靠 `requestRender` 刷新内容，因此稳定停在 powerline 状态栏**之上**。
-  前提是本扩展比 `pi-powerline-footer` **先收到 `session_start`**，而事件派发顺序 = 扩展加载顺序 = pi 的发现顺序：
-  ① 项目级 `.pi/extensions/` → ② 全局 `~/.pi/agent/extensions/` → ③ `settings.json` 的 `packages`（按数组顺序）。
-  所以放在 `~/.pi/agent/extensions/`（本仓库的软链接装法）天然早于所有 `packages`，无需额外配置；
-  若改用 `pi install` 走 `packages`，则需让 `my-pi-plugins` 排在 `npm:pi-powerline-footer` **之前**。
+- **Stacking order with `pi-powerline-footer`**: the vertical order of `aboveEditor` widgets is determined by the insertion order of the *first* `setWidget` call (repeated `setWidget` calls with the same key are moved to the bottom). This extension registers once in `session_start` and refreshes content only via `requestRender`, so it reliably stays **above** the powerline status bar.
+  This assumes this extension **receives `session_start` before `pi-powerline-footer`**, and event dispatch order = extension load order = pi's discovery order:
+  ① project-level `.pi/extensions/` → ② global `~/.pi/agent/extensions/` → ③ `packages` in `settings.json` (in array order).
+  So an extension placed in `~/.pi/agent/extensions/` (for example symlinked from a local checkout) naturally loads before every entry in `packages`, with no extra configuration;
+  if you install it through `packages` with `pi install` instead, `my-pi-plugins` must be listed **before** `npm:pi-powerline-footer`.
 
 ### 🎨 gruvbox-dark
 
-gruvbox 经典深色 retro 暖色调主题。
+The classic dark, retro warm-toned gruvbox theme.
 
-- `bg` 深棕、accent 用柔和饱和的 `red` / `yellow` / `green` / `blue` 等
-- 高对比、长会话不易疲劳
-- 配合 `pi-powerline-footer` 状态栏视觉效果最佳
+- Dark brown `bg`, with soft, saturated `red` / `yellow` / `green` / `blue` accents.
+- High contrast, comfortable for long sessions.
+- Looks best together with the `pi-powerline-footer` status bar.
 
-## 安装
+## Installation
 
 ```bash
 pi install https://github.com/Yifang-Qin/my-pi-plugins
 ```
 
-安装后：
+After installing:
 
-- **扩展自动生效**：tmux 后台化 bash、`@` 模糊文件补全等扩展安装后立即起作用，无需其它操作。
-- **主题需选一次**：安装只是让 `gruvbox-dark` 出现在可选列表里，激活运行一次
-  `/theme gruvbox-dark`（或在 `~/.pi/agent/settings.json` 里设 `"theme": "gruvbox-dark"`）。
-  这是 pi 的机制——package 不能替用户强行选主题。
+- **Extensions take effect automatically**: the tmux-backed bash, `@` fuzzy file completion, and the other extensions work immediately with nothing else to do.
+- **Pick the theme once**: installing only makes `gruvbox-dark` appear in the list of available themes. Activate it by running
+  `/theme gruvbox-dark` once (or set `"theme": "gruvbox-dark"` in `~/.pi/agent/settings.json`).
+  This is how pi works: a package cannot force-select a theme for the user.
 
-## 新机器 Step by Step（只配插件与个性化，不含模型/key）
+## New machine, step by step (plugins and personalization only; no models/keys)
 
-1. **装 pi 本体**（见[官方文档](https://pi.dev)），可选外部依赖按需装：
-   `tmux`（tmux-bash 后台化必需，缺了 bash 工具会直接报不可用）、
-   `fd`（fuzzy-file-finder 加速，缺了会回退 `git ls-files`）、
-   `ffmpeg` + `yt-dlp`（pi-web-access 视频抽帧）。
-   macOS 用 `brew install tmux fd ffmpeg yt-dlp`，Linux 用对应包管理器（如 `apt install tmux fd-find`）。
-2. **装本配置包**
+1. **Install pi itself** (see the [official docs](https://pi.dev)), and optionally install external dependencies as needed:
+   `tmux` (required for tmux-bash backgrounding; without it the bash tool reports that it is unavailable),
+   `fd` (speeds up fuzzy-file-finder; without it, it falls back to `git ls-files`),
+   `ffmpeg` + `yt-dlp` (video frame extraction for pi-web-access).
+   On macOS use `brew install tmux fd ffmpeg yt-dlp`; on Linux use the matching package manager (e.g. `apt install tmux fd-find`).
+2. **Install this package**
 
    ```bash
    pi install https://github.com/Yifang-Qin/my-pi-plugins
    ```
 
-3. **装配套 npm 包**
+3. **Install the companion npm packages**
 
    ```bash
    pi install npm:pi-powerline-footer
    pi install npm:pi-web-access
    ```
 
-   `pi-powerline-footer` 跟随 latest 安装即可（当前 0.19.1，peer `>=0.81.0` 无上界，已在 pi 1.1.0 上验证）。
-   旧版曾固定 `pi-powerline-footer@0.7.0` 规避 0.8.0 fixed-editor 在 tmux 下的滚动拖影；该 pin 已解除——它在 pi
-   0.84+ 上会因 peer 不兼容导致启动异常，而且 powerline 0.9.0 起已移除自管 fixed-editor，固定输入框
-   由 pi 原生 fullscreen（pi 1.0 起默认）负责。背景见 [tmux-bash 兼容性说明](extensions/tmux-bash/README.md#与-pi-powerline-footer-的兼容性)。
+   Install `pi-powerline-footer` at latest (currently 0.19.1; peer `>=0.81.0` with no upper bound; verified on pi 1.1.0).
+   An older setup pinned `pi-powerline-footer@0.7.0` to avoid the scroll ghosting of the 0.8.0 fixed editor under tmux. That pin has been removed: on pi
+   0.84+ it breaks startup because of the peer incompatibility, and since powerline 0.9.0 its self-managed fixed editor is gone, with the fixed input box
+   now handled by pi's native fullscreen mode (the default since pi 1.0). For background, see the [tmux-bash compatibility notes](extensions/tmux-bash/README.md#compatibility-with-pi-powerline-footer).
 
-4. **个性化设置**：在 `~/.pi/agent/settings.json` 里加（或直接用 `/theme gruvbox-dark` 选主题）：
+4. **Personalize**: add the following to `~/.pi/agent/settings.json` (or simply pick the theme with `/theme gruvbox-dark`):
 
    ```json
    {
@@ -156,25 +158,25 @@ pi install https://github.com/Yifang-Qin/my-pi-plugins
    }
    ```
 
-5. **验证**：启动 pi，敲 `@` 应弹出模糊文件选择器，`/find-file`、`/nav`、`/todos` 命令可用，
-   底部出现 powerline 状态栏。
+5. **Verify**: start pi. Typing `@` should pop up the fuzzy file picker, the `/find-file`, `/nav`, and `/todos` commands should be available,
+   and the powerline status bar should appear at the bottom.
 
-## 卸载
+## Uninstalling
 
 ```bash
 pi remove https://github.com/Yifang-Qin/my-pi-plugins
 ```
 
-移除后扩展自动失效；若之前选中了本主题，pi 会自动回退到默认主题。
+After removal the extensions stop working automatically; if this theme was selected, pi falls back to the default theme.
 
-## 安装原理
+## How installation works
 
-pi 是「**登记引用 + 启动时按引用加载**」，不会把整个仓库拷进 `~/.pi`：
+pi works by **registering a reference and loading by reference at startup**; it does not copy the whole repo into `~/.pi`:
 
-- `pi install https://...`（或 `git:...`）把仓库 clone 到 `~/.pi/agent/git/<host>/<path>/`，
-  并在 `~/.pi/agent/settings.json` 的 `packages` 数组里登记一条引用。
-- 启动时 pi 读 `packages[]`，按每个包的 `pi` manifest 加载 `extensions/*.ts` 和
-  `themes/*.json`。扩展默认启用，主题加入可选列表。
-- `pi remove` 只删掉 `packages` 里的引用，不会在 `~/.pi` 留下散落文件。
+- `pi install https://...` (or `git:...`) clones the repo to `~/.pi/agent/git/<host>/<path>/`
+  and registers a reference in the `packages` array of `~/.pi/agent/settings.json`.
+- At startup pi reads `packages[]` and, following each package's `pi` manifest, loads `extensions/*.ts` and
+  `themes/*.json`. Extensions are enabled by default, and themes are added to the list of available ones.
+- `pi remove` only deletes the reference from `packages`; it leaves no stray files in `~/.pi`.
 
-用 `pi config` 可单独启用/禁用某个扩展或主题；用 `pi update --extensions` 更新已装包。
+Use `pi config` to enable/disable an individual extension or theme, and `pi update --extensions` to update installed packages.

@@ -1,215 +1,247 @@
-# tree-nav — 以 user 节点为中心的会话树导航器（lazygit 风格）
+# tree-nav — a user-centric session tree navigator (lazygit style)
 
-> pi 内置 `/tree` 把整棵对话树按"亲缘从远到近"横向缩进摊在输入框上方的小窗口里，
-> 深层线性对话会不断向右漂移、难读。本扩展用一个**大 overlay** 重做导航体验：
-> **user 轮次是一等公民**，中间的 assistant/tool 内容默认折叠，跳转按"回退到某轮提问"
-> 的直觉来组织。触发命令：`/nav`。
+**English** | [简体中文](README-CN.md)
 
----
-
-## 1. 需求（我们要解决什么）
-
-基于对真实使用行为的假设，跳转频率分三档：
-
-1. **高频**：跳回当前节点的**直系祖先 user 节点**（"往回退几轮"）——必须零摩擦。
-2. **中频**：跳到**其他 branch 上的 user 节点**（切换探索路线）。
-3. **极低频**：跳到任意 branch 下的某个 **assistant/tool 中间节点**（精细回溯）。
-
-由此定下四条设计目标：
-
-1. 用**大 overlay** 替代挤在输入框上方的局部小窗口。
-2. **高亮 user 节点**；两个 user 节点之间的 assistant/tool 内容**缩略折叠**。
-3. **user 节点作为一等公民**优先支持快速跳转；中间节点提供**手动展开**的细粒度下钻。
-4. 用启发式在视觉上**平衡这棵树**：让"当前节点→根"的祖先路径处在醒目位置，不同 branch 自适应布局。
+> pi's built-in `/tree` lays the whole conversation tree out in a small window above the input box,
+> indented horizontally by "distance from the root". Deep linear conversations keep drifting to the
+> right and become hard to read. This extension rebuilds the navigation experience in one **large
+> overlay**: **user turns are first-class citizens**, the assistant/tool content in between is
+> collapsed by default, and jumping is organized around the intuition of "roll back to an earlier
+> question". Command: `/nav`.
 
 ---
 
-## 2. 关键设计决策
+## 1. Requirements (what we are solving)
 
-### 2.1 为什么是 lazygit 式纵向泳道，而不是 2D tidy-tree
+Based on assumptions about real usage, jumps fall into three frequency tiers:
 
-真正的 2D 树布局（Reingold–Tilford）在画布上很美，但终端里每个"节点"是**一段文本**而非一个点，
-横向宽度极易爆炸、且不利于长文本预览。因此主视图采用 **纵向可滚动列表 + 分支泳道 gutter**
-（lazygit / tig 的思路）：每行一个 user 轮次，左侧用缩进/管线表达分支拓扑，高亮选中项的祖先链。
+1. **High frequency**: jump back to a **direct-ancestor user node** of the current node ("go back a few turns") — must be zero-friction.
+2. **Medium frequency**: jump to a **user node on another branch** (switch to a different line of exploration).
+3. **Very low frequency**: jump to an **assistant/tool intermediate node** under any branch (fine-grained backtracking).
 
-### 2.2 紧凑 branch 深度（核心）
+This yields four design goals:
 
-内置 `/tree` 的痛点是"深度=对话轮数"，线性对话也一路右移。本扩展的深度规则：
+1. Replace the small window squeezed above the input box with a **large overlay**.
+2. **Highlight user nodes**; the assistant/tool content between two user nodes is **collapsed into a compact summary**.
+3. Make **user nodes first-class** for fast jumping; intermediate nodes get fine-grained drill-down via **manual expansion**.
+4. Use heuristics to **visually balance the tree**: keep the "current node → root" ancestor path prominent, and lay out the other branches adaptively.
 
-> **线性链保持同一深度；只有在真正的分支点（某个 user 节点拥有 >1 个 user 子节点）才 +1。**
+---
 
-即 `childDepth = (parentUser 的 user 子节点数 > 1) ? parentDepth + 1 : parentDepth`。
-这样 20 轮线性对话全部停在 depth 0，只有真正分叉的地方才产生缩进——这正是"视觉平衡"的第一步。
+## 2. Key design decisions
 
-### 2.3 活动路径优先（active-first）
+### 2.1 Why lazygit-style vertical lanes instead of a 2D tidy tree
 
-- 计算 `leaf → root` 的 `activePath` 集合。
-- 遍历时，分支点上**含 activePath 的子树排在最前**，使"当前路径"始终位于顶部/左侧。
-- 行的字形区分：`◉` 当前轮次（accent 加粗）、`●` 在活动路径上、`○` 不在活动路径上；
-  泳道连接线 `├─`/`╰─`/`│` 在活动路径上用 accent、否则 dim。
-- **时间轨（time-rail）+ 响应摘要**：marker 坐在自己的 lane 列上；每个收起且有响应的轮次下方插一行
-  **连接行**，把该轮响应的摘要当作一条短支线挂在时间轴上：有同 lane 子轮时用 `├╴`（竖线从上一个圆点
-  正中间穿到下一个圆点，同时支出一条短线标注摘要），最新/叶子轮（如当前轮）用 `╰╴` 圆角收尾，让线干净
-  终止、不再拖一个悬空的 `╵` 断头。摘要文本 `N tool calls · M replies`（muted 色）——把以前放在行末、
-  会被长 prompt 截断的单个计数 `·N` 搬到这里，既不会被截断又能写得更详细。展开某轮时改由 segment 行自带的 `│`
-  承担连接、不再插连接行；无响应的轮次连接行只画纯 `│`。代价是线性对话收起时行数约翻倍（换取“线穿圆点”
-  + 摘要常驻）；连接行不可选中，`↑↓` 会自动跳过。
+A true 2D tree layout (Reingold–Tilford) looks great on a canvas, but in a terminal each "node" is a
+**piece of text**, not a point. Horizontal width blows up easily, and long text previews suffer. So the
+main view is a **vertically scrollable list + branch-lane gutter** (the lazygit / tig approach): one row
+per user turn, with indentation/pipes on the left expressing the branch topology, and the ancestor chain
+of the selected item highlighted.
 
-### 2.4 跳转语义（依赖 pi 的 `navigateTree`）
+### 2.2 Compact branch depth (the core idea)
 
-`ctx.navigateTree(targetId, { summarize })` 的行为（见源码 `agent-session.navigateTree`）：
+The pain point of the built-in `/tree` is that "depth = number of conversation turns", so even a linear
+conversation drifts rightward. The depth rule here:
 
-| 目标节点类型 | 结果 |
+> **A linear chain stays at the same depth; depth only increases by 1 at a real branch point (a user node with more than one user child).**
+
+That is, `childDepth = (parentUser has > 1 user children) ? parentDepth + 1 : parentDepth`.
+A 20-turn linear conversation therefore stays entirely at depth 0, and indentation appears only where
+the conversation really forks — this is the first step toward "visual balance".
+
+### 2.3 Active path first (active-first)
+
+- Compute the `activePath` set from `leaf → root`.
+- During traversal, at a branch point the **subtree containing the activePath is placed first**, so the
+  "current path" is always at the top/left.
+- Row glyphs: `◉` current turn (accent, bold), `●` on the active path, `○` not on the active path;
+  lane connectors `├─`/`╰─`/`│` use accent on the active path and dim otherwise.
+- **Time rail + response summary**: the marker sits on its own lane column; below every collapsed turn
+  that has a response, a **connector row** is inserted that hangs the response summary on the timeline
+  as a short side branch. If the turn has a same-lane child turn, it uses `├╴` (the vertical line runs
+  from the middle of the previous dot to the middle of the next one, while a short stub branches off to
+  label the summary); the newest/leaf turn (e.g. the current turn) ends with a rounded `╰╴`, so the line
+  terminates cleanly instead of trailing a dangling `╵` stub. The summary text is
+  `N tool calls · M replies` (muted color) — this moves the single count `·N` that used to sit at the end
+  of the row (and got cut off by long prompts) down here, where it can't be truncated and can be more
+  detailed. When a turn is expanded, the `│` carried by the segment rows takes over the connection and no
+  connector row is inserted; a turn without a response gets a connector row with just a plain `│`. The
+  cost is that a collapsed linear conversation takes roughly twice as many rows (in exchange for "line
+  through the dot" plus an always-visible summary); connector rows are not selectable, and `↑↓` skips
+  them automatically.
+
+### 2.4 Jump semantics (relies on pi's `navigateTree`)
+
+Behavior of `ctx.navigateTree(targetId, { summarize })` (see `agent-session.navigateTree` in the source):
+
+| Target node type | Result |
 |---|---|
-| **user 消息** | `leaf = target.parentId`，并返回该 user 文本作为 `editorText`——即**回退到这一轮之前、把 prompt 回填输入框**，可编辑重问。 |
-| 非 user 节点（assistant/tool/summary） | `leaf = target`——从该节点继续。 |
+| **user message** | `leaf = target.parentId`, and the user text is returned as `editorText` — i.e. **roll back to just before this turn and refill the prompt into the input box**, ready to edit and re-ask. |
+| non-user node (assistant/tool/summary) | `leaf = target` — continue from that node. |
 
-所以：**选中一个 user 轮次 = 回退重问**（点 1/2）；**展开后选中中间节点 = 落到该处**（点 3）。
-`summarize: false` 时不生成"放弃分支总结"，跳转最快，贴合 vibe coding 的秒回退习惯。
+So: **selecting a user turn = roll back and re-ask** (tiers 1/2); **expanding and selecting an
+intermediate node = land right there** (tier 3). With `summarize: false`, no "abandoned branch summary"
+is generated, which makes jumping fastest and fits the quick-rollback habit of vibe coding.
 
-### 2.5 隐藏"空草稿"分支（默认开启，`tab` 切换）
+### 2.5 Hiding "empty draft" branches (on by default, toggle with `tab`)
 
-痛点：双击 ESC 或 `/nav` 往回**回溯**改上一轮输入时，只要你重新提交，Pi 的 append-only 会话就会
-在树上留下一条**死支**（旧 prompt 那一段）。若这段分支**从头到尾没产生任何 assistant/tool 回合**
-（典型：改错别字，回退后重问），它对之后的审计毫无价值，纯属噪音。
+The pain point: when you **go back** (double ESC or `/nav`) to edit the previous input and then
+resubmit, Pi's append-only session leaves a **dead branch** (the old prompt's segment) on the tree. If
+that branch **never produced any assistant/tool turn from start to finish** (typically: fixing a typo,
+rolling back and re-asking), it has no value for later auditing and is pure noise.
 
-本扩展**不删本地文件**（顺着 append-only 设计），只在 `/nav` 的**显示层过滤**掉这类分支：
+This extension **does not delete anything from the local file** (staying with the append-only design);
+it only filters such branches out in `/nav`'s **display layer**:
 
-> **隐藏某个 user 轮 U，当且仅当：U 的整棵子树里不含任何"有价值内容"，且 U 不在当前 active path 上。**
+> **A user turn U is hidden if and only if: U's whole subtree contains no "valuable content", and U is not on the current active path.**
 
-- **"有价值内容"** = **toolResult** / **有实质产出的 assistant 轮**（发过 tool call 或有非空文本）/ `branch_summary` /
-  `compaction`。注意：**空的 assistant 轮不算**——“敲回车立即生成一个 assistant 轮、马上 ESC
-  变 `(aborted)`”（`stopReason: "aborted"`、无文本无 tool call）或 errored 空轮，都不算真实工作，不会挡隐藏。
-  一旦真发起过 tool call、或有了（哪怕部分的）文本回复，就保留（审计价值在）。`branch_summary` 按需求保留；
-  纯 user 轮 + 元数据（label / model / thinking 变更）不算有价值。
-- **递归判定整棵子树**：若 U 自己没响应、但其某个 user 子孙有真实响应，U 是"通往有效对话的必经祖先"，
-  保留。只有**整段子树都无价值**才隐藏——此时从最顶端那个 user 节点剪掉整棵子树（其后代必然也无价值、
-  也都 off-path），分支深度/泳道自然塌回线性。
-- **active-path 例外**：绝不隐藏"当前所在"的轮次。比如刚提交、assistant 还没回复就开 `/nav`，最新那轮
-  暂时"无响应"但在 active path 上，照常显示，避免"当前位置消失"。
-- **`tab` 显隐开关**（默认隐藏）：overlay 内按 `tab` 在"隐藏空草稿 / 显示全部"间切换，标题栏显示
-  `+N hidden` 提示被隐藏的数量；切换时尽量保留当前选中项、否则回落到当前轮。想翻出某条被隐藏的旧草稿
-  原文去 copy/跳转时，切到"显示全部"即可。
-- **降级**：若隐藏后一条都不剩（极少见，如 leaf 重置到 root、树里只剩草稿），`/nav` 自动以"显示全部"
-  打开，保证有东西可导航。
+- **"Valuable content"** = **toolResult** / **an assistant turn with real output** (issued a tool call or
+  has non-empty text) / `branch_summary` / `compaction`. Note: **an empty assistant turn does not count**
+  — "press Enter, an assistant turn is created immediately, then ESC turns it into `(aborted)`"
+  (`stopReason: "aborted"`, no text, no tool call), or an errored empty turn, is not real work and does
+  not prevent hiding. Once a tool call was actually issued, or there is any (even partial) text reply, the
+  turn is kept (it has audit value). `branch_summary` is kept by requirement; a bare user turn plus
+  metadata (label / model / thinking changes) is not valuable.
+- **The whole subtree is judged recursively**: if U has no response itself but one of its user
+  descendants has a real response, U is a "necessary ancestor of a meaningful conversation" and is kept.
+  Only when the **entire subtree is worthless** is it hidden — in that case the whole subtree is pruned
+  from its topmost user node (its descendants are necessarily worthless and off-path too), and the branch
+  depth/lanes naturally collapse back to linear.
+- **Active-path exception**: the turn you are currently on is never hidden. For example, if you open
+  `/nav` right after submitting, before the assistant has replied, the latest turn is temporarily
+  "response-less" but on the active path, so it is shown as usual — this avoids "the current position
+  disappears".
+- **`tab` show/hide toggle** (hidden by default): inside the overlay, press `tab` to switch between
+  "hide empty drafts / show all"; the title bar shows `+N hidden` to indicate how many are hidden.
+  When toggling, the current selection is preserved where possible, otherwise it falls back to the
+  current turn. To dig out the original text of a hidden old draft (to copy it or jump to it), switch to
+  "show all".
+- **Fallback**: if nothing at all is left after hiding (very rare, e.g. the leaf was reset to the root
+  and the tree contains only drafts), `/nav` opens in "show all" mode automatically so there is always
+  something to navigate.
 
-实现落点在数据层 `buildNavModel(roots, leafId, hideResponseless=true)`：过滤发生在"建 user 父子映射"
-的那次遍历里，跳过被隐藏的 user 节点，因此深度/泳道/`currentIndex`/段落折叠全部基于过滤后的模型，视图层
-几乎不用改。`index.ts` 同时构建隐藏视图与全量视图（`false`）两个模型交给 overlay，`tab` 只是切换用哪个。
+The implementation lives in the data layer, `buildNavModel(roots, leafId, hideResponseless=true)`: the
+filtering happens in the same traversal that builds the user parent/child map, skipping hidden user
+nodes, so depth/lanes/`currentIndex`/segment collapsing are all based on the filtered model and the view
+layer needs almost no changes. `index.ts` builds both a hidden-view model and a full-view model (`false`)
+and hands both to the overlay; `tab` just switches which one is used.
 
 ---
 
-## 3. 现状：pi 内置 `/tree` 摸底（复用与接线）
+## 3. Current state: surveying pi's built-in `/tree` (reuse and wiring)
 
-| 事项 | 位置 / 结论 |
+| Item | Location / conclusion |
 |---|---|
-| 内置组件 | `dist/modes/interactive/components/tree-selector.js`（`TreeSelectorComponent` + `TreeList`，约 1244 行） |
-| 打开入口 | `interactive-mode.js` `showTreeSelector()`（≈L3805），由 `/tree` 命令与 `app.session.tree` 键位触发 |
-| 跳转原语 | `agent-session.navigateTree()`（`agent-session.d.ts:568`），扩展侧为 `ctx.navigateTree()` |
-| 布局本质 | 纵向缩进树（`├ └ │ ─` + 折叠 `⊞ ⊟` + 活动点 `•`），带**水平视口平移**；深度在分支点/分支后首代 +1，单子链保持平坦；`maxVisibleLines = max(5, ⌊termRows/2⌋)` |
-| 已有过滤 | `default / no-tools / user-only / labeled-only / all`——**内置其实已有 `user-only`**，但 UI 呈现没做成一等体验 |
-| 分支段跳转 | `app.tree.foldOrUp`=`ctrl+left,alt+left`；`app.tree.unfoldOrDown`=`ctrl+right,alt+right`（**注意：用户以为的 `ctrl+u/l` 其实是 `filter.userOnly`/`filter.labeledOnly` 过滤键**） |
+| Built-in component | `dist/modes/interactive/components/tree-selector.js` (`TreeSelectorComponent` + `TreeList`, about 1244 lines) |
+| Entry point | `interactive-mode.js` `showTreeSelector()` (≈L3805), triggered by the `/tree` command and the `app.session.tree` keybinding |
+| Jump primitive | `agent-session.navigateTree()` (`agent-session.d.ts:568`); `ctx.navigateTree()` on the extension side |
+| Layout essence | Vertically indented tree (`├ └ │ ─` + fold markers `⊞ ⊟` + active dot `•`) with **horizontal viewport panning**; depth +1 at a branch point / the first generation after a branch, single-child chains stay flat; `maxVisibleLines = max(5, ⌊termRows/2⌋)` |
+| Existing filters | `default / no-tools / user-only / labeled-only / all` — **the built-in actually already has `user-only`**, but the UI doesn't present it as a first-class experience |
+| Branch-segment jumping | `app.tree.foldOrUp`=`ctrl+left,alt+left`; `app.tree.unfoldOrDown`=`ctrl+right,alt+right` (**note: the `ctrl+u/l` that users assume are actually the `filter.userOnly`/`filter.labeledOnly` filter keys**) |
 
-### 可复用的公开导出（`@earendil-works/pi-coding-agent` 主入口）
+### Reusable public exports (main entry of `@earendil-works/pi-coding-agent`)
 
-- 类型：`SessionTreeNode`、`SessionEntry`、`SessionMessageEntry` 等（`dist/index.d.ts:19`）。
-- 组件：`TreeSelectorComponent`、`UserMessageSelectorComponent`（`dist/index.d.ts:28`）——
-  可直接塞进 overlay 做原型；但内部布局参数化不足，最终自研组件更灵活。
-- 数据/UI 上下文：`ctx.sessionManager.getTree()/getLeafId()/getEntry()/getLabel()`、
-  `ctx.navigateTree()`、`ctx.fork()`、`pi.setLabel()`、`ctx.ui.custom({ overlay:true, overlayOptions })`。
-- TUI 积木（`@earendil-works/pi-tui`）：`Container/Box/Text/Spacer/SelectList/DynamicBorder`、
-  `matchesKey/Key`、`truncateToWidth/visibleWidth/wrapTextWithAnsi`；`tui.terminal.rows/columns` 取尺寸。
+- Types: `SessionTreeNode`, `SessionEntry`, `SessionMessageEntry`, etc. (`dist/index.d.ts:19`).
+- Components: `TreeSelectorComponent`, `UserMessageSelectorComponent` (`dist/index.d.ts:28`) —
+  can be dropped straight into an overlay for a prototype, but their internal layout is not
+  parameterized enough, so a custom component is more flexible in the end.
+- Data/UI context: `ctx.sessionManager.getTree()/getLeafId()/getEntry()/getLabel()`,
+  `ctx.navigateTree()`, `ctx.fork()`, `pi.setLabel()`, `ctx.ui.custom({ overlay:true, overlayOptions })`.
+- TUI building blocks (`@earendil-works/pi-tui`): `Container/Box/Text/Spacer/SelectList/DynamicBorder`,
+  `matchesKey/Key`, `truncateToWidth/visibleWidth/wrapTextWithAnsi`; use `tui.terminal.rows/columns` for dimensions.
 
-### 已知约束
+### Known constraints
 
-- **不能注册名为 `tree` 的命令**覆盖内置（`interactive-mode.js:391` 用 `builtinCommandNames` 过滤掉同名扩展命令）。故用 `/nav`。
-- overlay 标注 **experimental**；`render(width)` 逐行返回、每行不得超宽，滚动/裁剪自理（无 2D 画布）。
-- "放弃分支是否总结"的交互流程是 interactive-mode 手写的，不在 `navigateTree` 内；扩展侧需自己用 `ctx.ui.select` 补（已实现，见下）。
+- **A command named `tree` cannot be registered** to override the built-in (`interactive-mode.js:391` uses `builtinCommandNames` to filter out extension commands with the same name). Hence `/nav`.
+- The overlay is marked **experimental**; `render(width)` returns lines one by one, no line may exceed the width, and scrolling/clipping is on you (there is no 2D canvas).
+- The "summarize the abandoned branch?" flow is hand-written in interactive-mode, not inside `navigateTree`; the extension has to supply it itself via `ctx.ui.select` (done, see below).
 
 ---
 
-## 4. 架构与文件
+## 4. Architecture and files
 
 ```
 extensions/tree-nav/
-├── index.ts          # 入口：注册 /nav，取树→建模→开 overlay→navigateTree
-├── session-tree.ts   # 数据层（无运行时依赖，纯 import type）：把 SessionTreeNode[]
-│                     # 折叠成 user 中心模型（紧凑深度 / 活动路径 / 段落）
-├── nav-overlay.ts    # 视图层：Component+Focusable，大 overlay 渲染 + 键盘导航
-└── README.md         # 本文档
+├── index.ts          # Entry: register /nav, fetch the tree → build the model → open the overlay → navigateTree
+├── session-tree.ts   # Data layer (no runtime dependencies, type-only imports): collapses SessionTreeNode[]
+│                     # into a user-centric model (compact depth / active path / segments)
+├── nav-overlay.ts    # View layer: Component+Focusable, large-overlay rendering + keyboard navigation
+├── README.md         # this document
+└── README-CN.md      # Chinese version
 ```
 
-数据流：`getTree()+getLeafId()` → `buildNavModel()` → `NavModel{users[], currentIndex}`
-→ `NavOverlay` 渲染并预选当前轮 → 用户选中 `entryId` → `ctx.navigateTree(entryId, {summarize:false})`。
+Data flow: `getTree()+getLeafId()` → `buildNavModel()` → `NavModel{users[], currentIndex}`
+→ `NavOverlay` renders it and preselects the current turn → the user picks an `entryId` → `ctx.navigateTree(entryId, {summarize:false})`.
 
-`NavModel` 关键字段：
-- `users[]`：`{ id, depth(紧凑分支深度), onActivePath, isCurrent, isLastSibling, parentSameLane, label?, preview, segment[],
-  gutterCols, connectorCol, descGutterCols, laneContinues }`（`parentSameLane` 驱动时间轨向上连接；最后四个为泳道渲染信息）
-- `segment[]`：该 user 轮次的响应（沿 active-first 子链收集到下一个 user 节点为止的 assistant/tool 条目）
-- `currentIndex`：当前轮（leaf 最近的 user 祖先）在 `users` 中的下标
-
----
-
-## 5. 实现状态
-
-### 已实现
-
-- **`/nav` 大 overlay**（`width 90% / maxHeight 90% / center`），不覆盖内置 `/tree`（同名扩展命令会被 pi 过滤）。
-- **数据层**（`session-tree.ts`，纯 `import type`、运行时零依赖）：紧凑分支深度（线性链不缩进、
-  仅分支点 +1）、活动路径、active-first 排序、段落折叠模型。
-- **泳道 gutter**：`│ ├─ ╰─` 画管线，活动路径连接线用 accent；展开段落时非末位分支的 `│` 会延伸到下方兄弟分支。
-- **时间轨（time-rail）+ 响应摘要**：marker 坐在 lane 列上；收起且有响应的轮次下方插连接行，把摘要
-  当短支线挂在时间轴上：有子轮用 `├╴`、叶子轮（如最新轮）用 `╰╴` 圆角收尾（避免悬空 `╵` 断头）；文本
-  `summarizeSegment`：toolResult 计 tool call、assistant 消息计 reply。无响应轮的连接行只画纯 `│`。展开时
-  改由 segment 行的 `│` 承担。连接行在「有同 lane 子轮（`parentSameLane`）或有响应摘要」时插入，不可选中，
-  `move()` 经 `clampToSelectable` 跳过。
-- **一等 user 轮次列表**：`◉`当前/`●`活动路径/`○`旁支 字形、`[label]`、预览、可展开标记 `▸/▾`（响应条数摘要已移到连接行）；`→/space` 展开、`←` 收起。
-- **搜索**（B 方案）：打字即从泳道浏览切为扁平匹配列表，**仅搜 user 轮次**（+label），分词子串 AND、大小写不敏感；
-  命中高亮（accent 加粗，与中性正文区分）；内嵌 `Input` 并传播 `focused` 支持 IME；`esc` 先清查询回浏览、再按才关闭。
-- **跳转**：`ctx.navigateTree`，user 目标回退并回填 prompt（pi 包装器自带“编辑器非空不覆盖”守卫）；跳转前用 `ctx.ui.select`
-  询问是否 summarize 被放弃分支（`collectEntriesForBranchSummary` 判空、custom 走 `ctx.ui.editor`、无模型时降级）。
-- **键位**：`↑↓` 移动、`PgUp/PgDn` 翻页、`enter` 跳转、`tab` 切换隐藏空草稿/显示全部、`esc` 取消/先清搜索（早期的 `o` 展开键已去掉，以免挡输入）。
-- **隐藏空草稿分支**（默认开启，见 2.5）：`buildNavModel` 第三参 `hideResponseless` 控制；判定"有价值内容"= toolResult / 有实质产出的 assistant 轮（有 tool call 或非空文本，空的 aborted/errored 轮不算）/ branch_summary / compaction，递归整棵子树 + active-path 例外；`index.ts` 建隐藏/全量两模型，overlay 内 `tab` 切换、标题栏显示 `+N hidden`、隐藏后为空则自动显示全部。
-
-均已用合成 `SessionTreeNode` 树 + 驱动真实 `Input` 的冷烟测试验证（多层分支泳道连接、模式切换、高亮、esc 语义）。
-
-### 未来增强（暂不排期）
-
-- **视口自适应平衡**：分支多/深时按可视高度折叠远端分支、优先展开活动路径邻域——需求点 4 的完全体（目前只做到 active-first + 紧凑深度）。
-- **summarize**：总结中途无法取消（`abortBranchSummary` 未对扩展暴露，`navigateTree` 用内部 AbortController）；esc 目前取消整个跳转，可优化为退回 overlay。
-- **搜索**：可扩到 segment（assistant/tool）、“user 命中排前”排序、超大 session 加 debounce（当前每键即时过滤，几百条内无压力）。
-- **段落缩略**：`formatToolCall` 目前只覆盖 read/write/edit/bash/grep，可补齐更多工具。
-- **多根**（forked session 合并展示）对多 root 区分较弱（都堆在 depth 0）。
-- **已决定不做**：label 编辑 / `labeled-only` 视图；可配置项（默认过滤/字形主题/键位）。
-- **开放问题**：是否需要“跳到该轮 assistant 回答处”的变体；`/nav` 参数（如 `/nav labeled`）；overlay 是否固定高度铺满（现按内容高度、`maxHeight 90%` 封顶）。
+Key `NavModel` fields:
+- `users[]`: `{ id, depth (compact branch depth), onActivePath, isCurrent, isLastSibling, parentSameLane, label?, preview, segment[],
+  gutterCols, connectorCol, descGutterCols, laneContinues }` (`parentSameLane` drives the upward connection of the time rail; the last four are lane-rendering info)
+- `segment[]`: the responses of that user turn (the assistant/tool entries collected along the active-first child chain up to the next user node)
+- `currentIndex`: the index in `users` of the current turn (the user ancestor closest to the leaf)
 
 ---
 
-## 6. 开源先例（设计参考）
+## 5. Implementation status
 
-- **布局**：lazygit `pkg/gui/presentation/graph/graph.go`（commit 泳道）、pvigier《commit graph drawing algorithms》、`reingold-tilford` crate（tidy tree，本项目**不**作主视图）。
-- **LLM 对话树 TUI**：`queelius/ctk`（Textual 全屏 + SQLite）、`malbiruk/frond`（Rust，branch/merge）、
-  `SarthakB11/claude-code-tree`（Claude Code 的 session 树导航器，与本项目最同构）。
-- pi 生态暂无同类扩展；`examples/extensions/bookmark.ts` 仅用 `setLabel` 沾边。
+### Implemented
+
+- **`/nav` large overlay** (`width 90% / maxHeight 90% / center`); does not override the built-in `/tree` (an extension command with the same name would be filtered out by pi).
+- **Data layer** (`session-tree.ts`, type-only imports, zero runtime dependencies): compact branch depth (linear chains are not indented,
+  +1 only at branch points), active path, active-first ordering, segment-collapsing model.
+- **Lane gutter**: `│ ├─ ╰─` draw the pipes, and active-path connectors use accent; when a segment is expanded, the `│` of a non-last branch extends down to its sibling branches below.
+- **Time rail + response summary**: the marker sits on the lane column; below each collapsed turn that has a response, a connector row is inserted that
+  hangs the summary on the timeline as a short side branch: `├╴` when there is a child turn, a rounded `╰╴` for a leaf turn (e.g. the latest turn)
+  (avoiding a dangling `╵` stub); the text comes from
+  `summarizeSegment`: toolResult counts as a tool call, an assistant message counts as a reply. A response-less turn gets a connector row with just a plain `│`. When expanded,
+  the `│` of the segment rows takes over. A connector row is inserted when "there is a same-lane child turn (`parentSameLane`) or a response summary"; it is not selectable and
+  `move()` skips it via `clampToSelectable`.
+- **First-class user-turn list**: `◉` current / `●` active path / `○` side branch glyphs, `[label]`, preview, expandable marker `▸/▾` (the response-count summary has moved to the connector row); `→/space` expands, `←` collapses.
+- **Search** (option B): typing switches from lane browsing to a flat match list that **searches user turns only** (+label), with tokenized substring AND matching, case-insensitive;
+  hits are highlighted (accent bold, distinct from neutral body text); an embedded `Input` propagates `focused` to support IME; `esc` first clears the query and returns to browsing, and only a second press closes the overlay.
+- **Jumping**: `ctx.navigateTree`; a user target rolls back and refills the prompt (pi's wrapper has a built-in "don't overwrite a non-empty editor" guard); before jumping, `ctx.ui.select`
+  asks whether to summarize the abandoned branch (`collectEntriesForBranchSummary` checks for emptiness, custom instructions go through `ctx.ui.editor`, and it degrades gracefully when there is no model).
+- **Keys**: `↑↓` move, `PgUp/PgDn` page, `enter` jump, `tab` toggle hide empty drafts / show all, `esc` cancel / clear the search first (the early `o` expand key was removed so it doesn't get in the way of typing).
+- **Hiding empty-draft branches** (on by default, see 2.5): controlled by the third parameter `hideResponseless` of `buildNavModel`; "valuable content" = toolResult / an assistant turn with real output (has a tool call or non-empty text; empty aborted/errored turns don't count) / branch_summary / compaction, judged recursively over the whole subtree, with the active-path exception; `index.ts` builds the hidden and full models, `tab` toggles inside the overlay, the title bar shows `+N hidden`, and if nothing is left after hiding it automatically shows all.
+
+All of this was verified with cold smoke tests using synthetic `SessionTreeNode` trees plus a real driven `Input` (multi-level branch lane connectors, mode switching, highlighting, esc semantics).
+
+### Future enhancements (not scheduled)
+
+- **Viewport-adaptive balancing**: when branches are many/deep, fold distant branches based on the visible height and prioritize expanding the neighborhood of the active path — the full version of requirement 4 (so far only active-first + compact depth is done).
+- **summarize**: summarization can't be cancelled midway (`abortBranchSummary` is not exposed to extensions; `navigateTree` uses an internal AbortController); `esc` currently cancels the whole jump, which could be improved to return to the overlay.
+- **Search**: could be extended to segments (assistant/tool), sorting with "user hits first", and a debounce for huge sessions (it currently filters on every keystroke, which is fine up to a few hundred entries).
+- **Segment summaries**: `formatToolCall` currently covers only read/write/edit/bash/grep; more tools could be added.
+- **Multiple roots** (merged display of forked sessions) are only weakly distinguished (all piled up at depth 0).
+- **Decided not to do**: label editing / a `labeled-only` view; configuration options (default filter / glyph theme / keybindings).
+- **Open questions**: whether a variant that "jumps to the assistant answer of that turn" is needed; `/nav` arguments (e.g. `/nav labeled`); whether the overlay should have a fixed height that fills the screen (currently sized to its content, capped by `maxHeight 90%`).
 
 ---
 
-## 7. 启用方式（软链接，见仓库 AGENTS.md 约定）
+## 6. Open-source prior art (design references)
+
+- **Layout**: lazygit `pkg/gui/presentation/graph/graph.go` (commit lanes), pvigier's "commit graph drawing algorithms", the `reingold-tilford` crate (tidy tree, which this project does **not** use as its main view).
+- **LLM conversation-tree TUIs**: `queelius/ctk` (full-screen Textual + SQLite), `malbiruk/frond` (Rust, branch/merge),
+  `SarthakB11/claude-code-tree` (a session-tree navigator for Claude Code, the closest in spirit to this project).
+- The pi ecosystem has no comparable extension yet; `examples/extensions/bookmark.ts` only touches the topic via `setLabel`.
+
+---
+
+## 7. Enabling (symlink)
 
 ```bash
-# 在仓库根目录
+# From the repo root
 ln -sfn "$(pwd)/extensions/tree-nav" ~/.pi/agent/extensions/tree-nav
-# 在 pi 会话里
+# Inside a pi session
 /reload
 /nav
 ```
 
-> 真身在本仓库，`~/.pi/agent/extensions/tree-nav` 只是软链接。别在链接侧改内容或做 git。
+> The real files live in this repo; `~/.pi/agent/extensions/tree-nav` is only a symlink. Don't edit or run git on the link side.
 
 ---
 
-## 8. 测试
+## 8. Testing
 
-- 数据层是纯函数（仅 `import type`，运行时零依赖），可用合成 `SessionTreeNode` 树直接跑
-  `buildNavModel`，断言 `depth / onActivePath / isCurrent / segment / 顺序`。
-- 本仓库无 TS 工具链（pi 用 jiti 运行时转译，不做类型检查），改动后建议至少跑一次数据层冒烟测试。
+- The data layer is made of pure functions (type-only imports, zero runtime dependencies), so you can run
+  `buildNavModel` directly on a synthetic `SessionTreeNode` tree and assert `depth / onActivePath / isCurrent / segment / order`.
+- This repo has no TS toolchain (pi transpiles at runtime with jiti and does no type checking), so after changes it's advisable to run at least one data-layer smoke test.

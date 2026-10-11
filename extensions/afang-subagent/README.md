@@ -1,96 +1,93 @@
 # afang-subagent
 
-**我们自己维护的 pi 官方 subagent extension fork。** 以官方示例
+**English** | [简体中文](README-CN.md)
+
+**Our own maintained fork of pi's official subagent extension.** It starts from the official example
 [`examples/extensions/subagent`](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions/subagent)
-为起点独立演进，更多扩展功能待开发（见下方路线图）。
-
-## 路线图（待开发）
-
-- [x] 后台 / 异步执行（`background: true` fire-and-forget，主 agent 不阻塞；完成时
-      经共享的自管通知队列合并投递（确认送达才出队，Esc 不丢）；结果落盘 `~/.pi/agent/subagent-results/`）
-- [x] 递归深度护栏（`PI_SUBAGENT_DEPTH`，默认只允许主会话委派一层，见下方「与官方版的差异」）
-- [ ] 子 agent session 持久化与恢复（多轮追问同一子 agent）
-- [ ] 运行中 steering（中途向子 agent 追加指令）
-- [ ] workflow 的代码侧编排（DAG / 状态机，不依赖 prompt 模板）
-- [x] artifacts 落盘管理（后台任务结果自动写 `<任务cwd>/.pi/subagent-results/<时间戳>-<task-id>.md`，
-      写不进去时回退全局 `~/.pi/agent/subagent-results/`；建议在项目 .gitignore 里忽略该目录）
-- [x] 前台并行/chain/single 任务的运行时监控与单独终止（`/subagent` 面板 + per-child AbortController，见下方专节）
-
-## 后台模式设计要点
-
-- `subagent` 工具新增 `background: true`（仅 single 模式）：立即返回 `task-N`，子进程异步运行
-- 完成通知：custom message（`afang-subagent-notify`），每个任务只放 ~2KB preview + 结果文件路径；
-  经 `../shared/notify-queue.ts` 的**自管投递队列**发出（与 tmux-bash 共用）：主 agent 运行中完成的
-  任务先攒着，在 `turn_end` 合并成**一条**消息（steer，同一 turn 边界送达）；空闲时攒 300ms 后合并发出并
-  唤醒；pi 的 `message_end` 确认进入 transcript 才出队，所以用户按 Esc（pi 会清空 steering 队列）也不会
-  丢——退回后随下一次输入补投、不主动唤醒。多任务按完成先后排列，整条正文 24KB 预算，超出的任务降级为
-  一行索引（含 `subagent_tasks result` 与结果文件路径）。取代旧的「400ms 防抖 + 直接 steer」：后者在
-  `steeringMode: one-at-a-time`（pi 默认）下仍会被拆成一轮一条，且按 Esc 会静默丢通知。工具的静态 prompt guideline 与后台启动返回都会明确告诉模型：可以正常结束当前
-  turn，无需等待或轮询；若任务在会话仍活动、Agent 已空闲时完成，通知会自动拉起新 turn
-- 结果落盘：报告属于项目知识 → 优先写**任务工作目录**下的 `.pi/subagent-results/`，文件名带时间戳
-  防跨会话 task id 冲突，主 agent 后续用相对路径即可 read
-- 文件名含语义 slug：`<agent名>-<topic>` 拼接（topic 可选），
-  如 `20260720-133045-task-1-scout-tree-nav调研.md`，跨 session 翻历史报告一目了然；
-  `topic` 同时显示在 list / status / 完成通知 / 报告头里
-- `subagent_tasks` 管理工具：`list / status / result / cancel`
-- 上限 4 个并发后台任务，超出显式拒绝（不排队）
-- 生命周期：`session_shutdown` / `session_before_switch` / `session_before_fork` 杀全部子进程；
-  `/reload` 通过 globalThis PID 注册表清理上一实例遗留的子进程；Esc 中断主 run 不影响后台任务
-
-## 前台任务监控与单杀（`/subagent` 面板）
-
-并行 / chain / single 三种前台模式是**同步**跑在一次工具调用里的：过去只能靠 Esc 整体中断
-（一次杀光同批全部子 agent），既看不到「每个子 agent 各自的完成轨迹」，也无法「只掐掉其中一个」。
-现在补上了这套抓手（方案 A：保同步语义 + 共享 registry + 面板）：
-
-- **模块级 registry**（`liveTasks`）：每个前台子 agent 在 spawn 时就登记，带独立 `task-N` id、
-  状态、以及指向子进程流式结果的 live 引用——因此在 `execute()` 之外也能被「看见」。
-- **per-child AbortController**（`runTrackedAgent`）：每个子 agent 持有自己的中断开关，父级（工具）
-  signal 链接到全体（保留 Esc = 全杀）；单杀某一个只 abort 它自己，同批其余继续跑。并行 worker 把
-  「被 abort」收敛成一条 `cancelled` 结果返回而非抛出，故单杀不会连坐炸掉整批 `Promise.all`。
-- **`/subagent`（别名 `/sa`）面板**：overlay 交互，与 tmux-bash 的 `/bg` 面板同构——
-  - 列表视图：↑↓ 选择，Enter 看某个子 agent 的**完成轨迹**（工具调用时间线 + 文本 + 用量），
-    `x` 单杀（内联 y/n 确认），Esc/q 退出；每秒自刷新，运行中耗时/轮次实时增长。
-  - 轨迹视图：↑↓/PgUp/PgDn/Home/End 滚动（默认跟随尾部），`x` 杀当前查看的任务，Esc/q 返回。
-  - 前台 live 任务与后台 background 任务的**统一视图**（`kind` 列区分 parallel/chain/single/bg）。
-  - 因为扩展命令在流式期间也能立即触发，**并行还在同步跑的当口也能开面板挑一个杀掉**。
-- **`subagent_tasks` 工具同步扩容**：`list / status / result / cancel` 现在同时覆盖前台 live 任务
-  与后台任务，模型自己也能查状态、单独 cancel 某个并行子任务。
-
-前台任务被 kill **不额外通知** assistant：它那条聚合结果会在正在 await 的工具输出里显示为
-`aborted`，模型自然看得到（与后台任务 kill 需要独立通知不同）。registry 在每次新工具调用前清理
-已结束项、并在 session 切换/退出时清空，不会无限增长。
-
-> **`/reload` 双实例坑（务必遵守）**：pi 的 `/reload` 用 cache-busting query 重新 import 扩展入口
-> （`index.ts?v=<时间戳>`），于是 `index.ts` 会出现「带 query 的实例 A」。若面板再
-> `import ... from "./index.ts"`（无 query），运行时会解析出「无 query 的实例 B」，两个实例各有
-> 独立的 `liveTasks`/`bgTasks`——工具往 A 登记、面板读 B 的空表，表现为「面板永远显示没有运行中的
-> subagent」。因此：**面板绝不 import `index.ts`**。无状态的纯函数/类型放 `render-helpers.ts`
-> （只被相对 import、无可变状态，双实例也无害）；有状态的 `snapshot`/`kill` 由 `index.ts` 的命令
-> handler 以**依赖注入**方式把闭包传给 `openSubagentPanel`，保证面板读到的永远是 pi 入口那个实例。
-
-## 与官方版的差异
-
-- **递归深度护栏（`PI_SUBAGENT_DEPTH`）**：spawn 子 pi 时注入 `PI_SUBAGENT_DEPTH = 当前深度 + 1`
-  （主 session 深度 0）；达到上限（默认 1，可用 `PI_SUBAGENT_MAX_DEPTH` 覆盖）的子进程**不再注册**
-  `subagent` / `subagent_tasks` 工具，模型看不见工具即无法继续嵌套。默认效果：主 session →
-  subagent（深度 1，无 subagent 工具），因此 subagent 不可再派下一层。主 session 的工具描述会附加
-  提示，告知模型其子 agent 无法继续委派，避免写出依赖嵌套委派的任务。此前唯一的闸门是 `--tools`
-  白名单（worker 未限制工具，可无限递归）。
-- agent 未指定 `model` 时继承主会话当前模型**和 thinking level**（`ctx.model` / `ctx.thinkingLevel`；
-  官方示例 0.84.2 起同样继承）；显式指定 `model:` 的 agent 用该模型的默认思考档位
-- **内建 agent 注册进工具描述（system prompt 常驻可见）**：注册时扫描扩展自带 `agents/*.md`，
-  把名字 + description 写入 `subagent` 工具描述，模型冷启动即可"看菜下单"；描述随 `/reload`
-  重建，不会过期。user/project 定制仍为运行时动态发现，描述里只提示存放位置与查看方法
-- **无 mode 调用 = 列出可用 agent（一等公民行为，非报错）**：`subagent {}` 返回当前 scope 下
-  全部 agent（含 source 与 description）；`subagent {agentScope:"both"}` 连 project 层一起列出
-
-## 安装
-
-见仓库根目录 `AGENTS.md`（逐文件软链接约定）。以下官方 README 内容保留作原始设计参考，
-其中安装路径说明已不适用。
+and evolves independently; more features are still to be developed (see the roadmap below).
 
 Delegate tasks to specialized subagents with isolated context windows.
+
+## Roadmap
+
+- [x] Background / async execution (`background: true`, fire-and-forget, the main agent isn't blocked; on completion,
+      notifications are merged and delivered through the shared self-managed notification queue (an item leaves the queue only after delivery is confirmed, so Esc never loses one); results are written to `~/.pi/agent/subagent-results/`)
+- [x] Recursion depth guard (`PI_SUBAGENT_DEPTH`; by default only the main session may delegate, one level deep; see "Differences from the official version" below)
+- [ ] Subagent session persistence and resume (multi-turn follow-ups to the same subagent)
+- [ ] Mid-run steering (appending instructions to a subagent while it runs)
+- [ ] Code-level workflow orchestration (DAG / state machine, independent of prompt templates)
+- [x] Artifact persistence (background task results are written to `<task cwd>/.pi/subagent-results/<timestamp>-<task-id>.md`,
+      falling back to the global `~/.pi/agent/subagent-results/` if that isn't writable; ignoring this directory in the project's .gitignore is recommended)
+- [x] Runtime monitoring and per-task kill for foreground parallel/chain/single tasks (the `/subagent` panel + a per-child AbortController; see the dedicated section below)
+
+## Background mode design notes
+
+- The `subagent` tool gains `background: true` (single mode only): it returns `task-N` immediately and the child process runs asynchronously.
+- Completion notification: a custom message (`afang-subagent-notify`) that carries only a ~2KB preview + the result file path per task.
+  It is sent through the **self-managed delivery queue** in `../shared/notify-queue.ts` (shared with tmux-bash): tasks that finish while the main agent is running
+  are held and merged into **one** message at `turn_end` (a steer, delivered at the same turn boundary); when idle, they are held for 300ms and then merged, sent, and
+  wake the agent. An item leaves the queue only once pi's `message_end` confirms it entered the transcript, so pressing Esc (which makes pi clear its steering queue) doesn't
+  lose it either — it is returned to the queue and re-delivered with the next input, without waking the agent proactively. Multiple tasks are ordered by completion time, the whole body has a 24KB budget, and tasks beyond it are demoted to
+  a one-line index (with the `subagent_tasks result` hint and the result file path). This replaces the old "400ms debounce + direct steer", which under
+  `steeringMode: one-at-a-time` (pi's default) was still split into one message per turn, and silently dropped the notification on Esc. The tool's static prompt guidelines and the background-start return value both tell the model explicitly: it can end the current
+  turn normally, with no need to wait or poll; if a task finishes while the session is still active and the agent is idle, the notification automatically starts a new turn.
+- Result persistence: the report is project knowledge → it is written first to `.pi/subagent-results/` under the **task's working directory**, with a timestamp in the filename
+  to avoid task id collisions across sessions, so the main agent can later `read` it by relative path.
+- Filenames carry a semantic slug: `<agent name>-<topic>` (topic optional),
+  e.g. `20260720-133045-task-1-scout-tree-nav-research.md`, so browsing historical reports across sessions is easy;
+  `topic` is also shown in list / status / the completion notification / the report header.
+- The `subagent_tasks` management tool: `list / status / result / cancel`.
+- At most 4 concurrent background tasks; extra requests are explicitly rejected (no queueing).
+- Lifecycle: `session_shutdown` / `session_before_switch` / `session_before_fork` kill all child processes;
+  `/reload` cleans up child processes left by the previous instance through a globalThis PID registry; interrupting the main run with Esc doesn't affect background tasks.
+
+## Foreground task monitoring and per-task kill (the `/subagent` panel)
+
+The three foreground modes (parallel / chain / single) run **synchronously** inside a single tool call. In the past the only handle was a whole-run interrupt with Esc
+(killing every subagent in the batch at once); there was no way to see each subagent's own completion trajectory, or to "kill just one of them".
+This is now covered (Plan A: keep the synchronous semantics + a shared registry + a panel):
+
+- **A module-level registry** (`liveTasks`): every foreground subagent is registered at spawn time, with its own `task-N` id,
+  its status, and a live reference to the child process's streaming result — so it can be "seen" outside `execute()` too.
+- **A per-child AbortController** (`runTrackedAgent`): each subagent holds its own abort switch, and the parent (tool)
+  signal is linked to all of them (so Esc = kill all is preserved); killing a single one aborts only that one while the rest of the batch keeps running. The parallel worker
+  converts "aborted" into a `cancelled` result that is returned rather than thrown, so a single kill doesn't take down the whole `Promise.all`.
+- **The `/subagent` panel (alias `/sa`)**: an interactive overlay, isomorphic to tmux-bash's `/bg` panel —
+  - List view: ↑↓ select, Enter shows a subagent's **completion trajectory** (tool-call timeline + text + usage),
+    `x` kills a single task (inline y/n confirmation), Esc/q quits; it refreshes itself every second, and elapsed time / turns grow live for running tasks.
+  - Trajectory view: ↑↓/PgUp/PgDn/Home/End scroll (following the tail by default), `x` kills the task being viewed, Esc/q goes back.
+  - A **unified view** of live foreground tasks and background tasks (the `kind` column tells parallel/chain/single/bg apart).
+  - Because extension commands can be triggered immediately even while streaming, **you can open the panel and pick one to kill while a parallel run is still executing synchronously**.
+- **The `subagent_tasks` tool is expanded to match**: `list / status / result / cancel` now cover both live foreground tasks
+  and background tasks, so the model itself can also check status and cancel an individual parallel subtask.
+
+Killing a foreground task **sends no extra notification** to the assistant: its aggregated result shows up as
+`aborted` in the tool output that is being awaited, which the model sees naturally (unlike a background task kill, which needs a separate notification). The registry clears
+finished entries before each new tool call and is emptied on session switch/exit, so it doesn't grow without bound.
+
+> **The `/reload` double-instance pitfall (must be followed)**: pi's `/reload` re-imports the extension entry with a cache-busting query
+> (`index.ts?v=<timestamp>`), so `index.ts` ends up as "instance A with a query". If the panel then
+> does `import ... from "./index.ts"` (without a query), the runtime resolves "instance B without a query", and the two instances each have
+> their own independent `liveTasks`/`bgTasks` — the tool registers into A while the panel reads B's empty table, which shows up as "the panel always shows no running
+> subagent". Therefore: **the panel must never import `index.ts`**. Stateless pure functions/types live in `render-helpers.ts`
+> (only imported by relative path and holding no mutable state, so a double instance is harmless); the stateful `snapshot`/`kill` are passed by `index.ts`'s command
+> handler as closures into `openSubagentPanel` through **dependency injection**, so the panel always reads the instance that pi loaded as the entry.
+
+## Differences from the official version
+
+- **Recursion depth guard (`PI_SUBAGENT_DEPTH`)**: when spawning a child pi, `PI_SUBAGENT_DEPTH = current depth + 1` is injected
+  (the main session is depth 0); a child that reaches the limit (default 1, overridable with `PI_SUBAGENT_MAX_DEPTH`) **no longer registers**
+  the `subagent` / `subagent_tasks` tools, and a model that can't see the tool can't nest further. The default effect: main session →
+  subagent (depth 1, no subagent tool), so a subagent cannot dispatch another level. The main session's tool description gets an extra
+  hint telling the model that its subagents cannot delegate further, to avoid tasks that depend on nested delegation. Before this, the only gate was the `--tools`
+  allowlist (and `worker` has no tool restrictions, so it could recurse without bound).
+- When an agent doesn't specify `model`, it inherits the main session's current model **and thinking level** (`ctx.model` / `ctx.thinkingLevel`;
+  the official example has done the same since 0.84.2); an agent that explicitly sets `model:` uses that model's default thinking level.
+- **Built-in agents are registered into the tool description (permanently visible in the system prompt)**: at registration time the extension scans its own `agents/*.md`
+  and writes each name + description into the `subagent` tool description, so the model can "order from the menu" from a cold start; the description is rebuilt on `/reload`
+  and never goes stale. User/project customizations are still discovered dynamically at runtime, and the description only hints at where to put them and how to inspect them.
+- **A call with no mode = list the available agents (first-class behavior, not an error)**: `subagent {}` returns all agents in the current scope
+  (with source and description); `subagent {agentScope:"both"}` lists the project layer as well.
 
 ## Features
 
@@ -102,18 +99,19 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Harness observability**: Captures child pi compaction, agent retry, and summarization-retry events; shows them in expanded tool results, `/subagent` trajectories, `subagent_tasks`, and background result files
 - **Abort support**: Ctrl+C propagates to kill subagent processes
 - **Live monitoring & per-child kill**: `/subagent` (`/sa`) overlay panel to watch each foreground
-  child's trajectory and kill individuals without aborting the whole batch (see 前台任务监控与单杀)
+  child's trajectory and kill individuals without aborting the whole batch (see "Foreground task monitoring and per-task kill")
 
 ## Structure
 
 ```
 subagent/
 ├── README.md            # This file
+├── README-CN.md         # Chinese version
 ├── index.ts             # The extension (entry point)
-├── child-events.ts      # 子 pi JSON 事件归一化：message/tool + compaction/retry 可观测性
-├── test-child-events.ts # child JSON 事件摄取回归测试（bun 直接运行）
-├── subagent-panel.ts    # /subagent (/sa) 用户面板：列表 → 轨迹 → 单杀
-├── render-helpers.ts    # 无状态纯 helper/类型（面板与 index 共享，避开 /reload 双实例，见下）
+├── child-events.ts      # Child pi JSON event normalization: message/tool + compaction/retry observability
+├── test-child-events.ts # Regression test for child JSON event ingestion (run directly with bun)
+├── subagent-panel.ts    # /subagent (/sa) user panel: list → trajectory → per-task kill
+├── render-helpers.ts    # Stateless pure helpers/types (shared by the panel and index, avoiding the /reload double instance; see above)
 ├── agents.ts            # Agent discovery logic
 ├── agents/              # Built-in agent definitions (auto-discovered, self-contained)
 │   ├── scout.md         # Fast recon, returns compressed context
@@ -227,7 +225,7 @@ Agents are markdown files with YAML frontmatter:
 ---
 name: my-agent
 description: What this agent does
-tools: read, grep, find, ls   # 逗号字符串或 YAML 数组 [read, grep] 均可
+tools: read, grep, find, ls   # a comma-separated string or a YAML array [read, grep] both work
 model: claude-haiku-4-5
 ---
 
@@ -249,14 +247,14 @@ Built-in agents (bundled in `agents/`, overridable by same-name user/project age
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|
-| `scout` | Fast codebase recon | (继承主模型) | read, grep, find, ls, bash |
-| `planner` | Implementation plans | (继承主模型) | read, grep, find, ls |
-| `reviewer` | Code review | (继承主模型) | read, grep, find, ls, bash |
-| `worker` | General-purpose | (继承主模型) | (all default) |
+| `scout` | Fast codebase recon | (inherits the main model) | read, grep, find, ls, bash |
+| `planner` | Implementation plans | (inherits the main model) | read, grep, find, ls |
+| `reviewer` | Code review | (inherits the main model) | read, grep, find, ls, bash |
+| `worker` | General-purpose | (inherits the main model) | (all default) |
 
-> **本 fork 的改动**：agent 定义中不指定 `model` 时，自动继承主会话当前模型
-> （`ctx.model`，含 `/model` 切换后的）与 thinking level（`ctx.thinkingLevel`）；在 frontmatter 里
-> 显式写 `model:` 仍可覆盖（此时不继承思考档位）。
+> **Change in this fork**: when an agent definition doesn't specify `model`, it automatically inherits the main session's current model
+> (`ctx.model`, including after a `/model` switch) and thinking level (`ctx.thinkingLevel`); writing an
+> explicit `model:` in the frontmatter still overrides it (in which case the thinking level is not inherited).
 
 ## Workflow Prompts
 
@@ -271,8 +269,8 @@ Built-in agents (bundled in `agents/`, overridable by same-name user/project age
 - **Child harness activity**: `compaction_start/end`, agent retry, and summarization-retry events are retained in tool details and shown in expanded results, `/subagent`, `subagent_tasks`, and background reports. A failed compaction is appended to the model-visible failure diagnostic instead of being silently dropped
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
-- **stopReason "aborted"**: 中断子进程；single/chain 直接报错，parallel 收敛为该子任务 cancelled
-  （不连累同批其余）。可来自 Esc 全杀，或 `/subagent` 面板 / `subagent_tasks cancel` 的单杀
+- **stopReason "aborted"**: the child process is interrupted; single/chain report an error directly, while parallel converts it into a cancelled result for that subtask
+  (without affecting the rest of the batch). It can come from an Esc kill-all, or from a single kill via the `/subagent` panel / `subagent_tasks cancel`
 - **Chain mode**: Stops at first failing step, reports which step failed
 
 ## Limitations

@@ -1,0 +1,430 @@
+# tmux-bash
+
+[English](README.md) | **简体中文**
+
+用 tmux 后台化**覆盖 pi 内置 `bash` 工具**：命令始终在 detached 的 tmux 窗口里跑，execute
+前台同步等待并「流式转发」输出；未在前台等待窗口（默认 120s）内结束则**自动转后台**（不杀命令），
+完成后经 steer 通知模型（若 Agent 正忙，则在当前 assistant 消息的工具全部结束后、下一次 LLM
+调用前投递）。另附一个 `bg` 工具管理这些后台任务。
+
+> 进程交给 tmux server 持有：pi 运行期间的 `/reload`、切换会话、意外崩溃都不会中断后台任务
+> （也不占 Node 事件循环）。**但任务生命周期严格不超过 pi 进程**：每个 pi 进程独占一个 tmux
+> 会话 `pi-bg-<pid>`，pi 退出（quit）时连根拆除该会话并回收磁盘产物（详见「会话生命周期」）。
+> 覆盖内置 bash 时逐条对齐其结果/错误文案/截断等「形状」。
+
+## 行为一览
+
+| 调用方式 | 行为 |
+|---|---|
+| `bash { command }`（默认） | 前台流式等待；跑满前台窗口（默认 120s）仍未结束则**自动转后台**（不杀），完成后自动通知 |
+| `bash { command, timeout: N }` | 保留内置「硬超时」语义：到点**硬杀**命令，退出码 124，**不转后台** |
+| `bash { command, background: true }` | **立即分离**，不等待（dev server / watcher / 长构建等），完成后自动通知 |
+| `bg { action, window, lines }` | 管理后台任务：`list` 列出运行中及本 runtime 已完成/已终止任务并显示状态、`logs` 按需读取尾部输出（快照，不阻塞，禁止用作轮询等待）、`kill` 按 `window_id` 终止 |
+| `/bg`（斜杠命令） | **面向用户**的交互 overlay 面板：列出本会话后台任务，`↑↓` 选择、`Enter` 看输出（可滚动/跟随尾部）、`x` kill（内联 `y/n` 确认）、`Esc` 退出；每秒自刷新（详见下方「用户侧交互面板」） |
+
+- 命令完成（无论自动转后台还是 `background:true`）会收到一条 `⏻ background bash` 消息
+  （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。**TUI 里该消息折叠显示**（头部状态行
+  + 尾部最新输出 + `… +N lines`），避免大输出刷屏；选中该消息**展开**即可看全文。折叠只影响 TUI 展示。
+  发给 LLM 的 `content` 另有**体积上限**：输出尾部按 `PI_TMUX_BASH_NOTIFY_MAX_BYTES`（默认 12KB）收紧，
+  超出时附 `[output truncated; showing the tail only. Full log: <.out>]`。理由：通知是 custom 消息，会
+  **永久留在 transcript、之后每轮请求都重复计费**，旧的 2000 行 / 50KB 一条就可能 ~12k token；前台
+  tool result（内置 bash 契约）与 `bg action=logs`（模型主动查看）不受影响，仍按 `maxLines/maxBytes`。
+- **自动转后台时附输出预览**：返回给模型的结果开头是转后台那一刻的输出**尾部一小段**（≤20 行 / 2KB，
+  被截时标注 `Output so far (last lines only; full log: …)`；没输出则写 `No output so far.`），其后才是
+  原有的「已转后台、禁止轮询」说明。模型在前台等待期间看不到流式输出（onUpdate 只给 TUI），没有预览
+  就只能靠 `bg logs` 看进度——那正是轮询的起点。TUI 折叠态下预览只显示末 5 行、说明段始终完整可见，
+  展开看全部。`background:true`（立即分离）没有预览。
+- 工具描述、静态 prompt guideline 与转后台后的返回消息都会明确告诉模型：后台化后**禁止**通过
+  `bash sleep`、轮询循环或反复调用 `bg list/logs` 等待完成；只能继续与该任务无关的有效工作，否则应
+  立即结束当前 turn。任务完成后，通知会在会话空闲时自动拉起新 turn。
+- TUI footer 会显示 `bg: N running`；后台任务自然完成时由 watcher 立即刷新计数，不必等下一次
+  `bash` / `bg` 工具调用，也不受完成消息的 steer 投递时机影响。计数以 `listJobsForSession`（tmux
+  权威源）为准，与 `/bg` 面板一致：**含 reload 后从 tmux 标签恢复的后台任务**（旧的只数内存表
+  `state.jobs` 在 reload 后会漏数）；**不计入正在执行的前台命令**——前台窗口执行期间不打
+  tmux 标签，仅当它超时转后台时才打标签（否则 `/bg` 会列出、footer 会多计、用户还能误杀
+  在跑的前台命令）。`/bg` 面板打开时每秒同步刷新该计数，杀任务后立即更新。
+- `bg action=list` 优先列出活跃任务，并附最近完成/终止状态；内存最多保留 100 条终态历史，单次
+  最多输出 50 条任务（命令摘要与总输出均截断），避免任务历史无限撑大上下文和 session。
+- 结果末尾附**彩色状态行**（`✓ done · 1.2s` / `✗ exit 1` / `✗ timeout` / `✗ aborted` /
+  `⧉ running in background`，合并自原独立扩展 `bash-status-line`）。
+- 前台工具行会实时显示当前运行上限：显式 `timeout` 显示为
+  `Running · 7s · hard timeout 30s · 23s left`；未设置显式超时时显示为
+  `Running · 37s · auto-bg after 120s · 83s left`。这只是渲染层增强，不改变 runtime
+  的「显式 timeout 硬杀 / 未设置 timeout 自动切后台」语义；`background:true` 不显示无效的
+  timeout，因为该参数当前会被立即分离路径忽略。
+- **`bash -n` 语法预检**：建窗口前先对 wrapper 脚本做语法校验，失败立即以 `✗ exit 2`
+  返回（报错行号优先相对原始命令，附本机 bash 版本），命令不会启动、无副作用。典型
+  诱因：macOS 系统 bash 3.2 的 `$(…)` 扫描器会把 heredoc 正文里的撚号（`don't`）误判为
+  未闭合引号——不预检的话窗口会秒死且错误不可见。
+- **窗口死亡检测**：前台等待期间约每秒探测一次 tmux 窗口存活；窗口未写退出码哨兵就
+  消失（wrapper 崩溃 / 被外部 `kill-window` / tmux server 挂掉）时立即报错返回
+  （`details.exitCode: -1`），而不是空等 120s 后把死任务误转后台。
+
+## 用户侧交互面板：`/bg`
+
+上面的 `bg` **工具**是给模型用的；`/bg` **斜杠命令**是给**用户**用的交互面板，用完即走
+（临时唤起的 overlay 组件，不是常驻悬浮窗）。二者共用同一套 runtime helper
+（`listJobsForSession` / `readJobLogs` / `killWindow`+`markJobKilled` /
+`reconcileCompletedJobs`），行为与 `bg` 工具一致，只多包一层键盘交互与绘制（组件实现见
+`bg-panel.ts`，共享的格式化辅助在 `format.ts`）。
+
+交互（自绘 overlay，`ctx.ui.custom`）：
+
+1. `/bg` → 弹出**任务列表**：每行 `窗口id  ● running   3m   $ 命令`
+   （运行中排前，图标按状态着色：`● running` / `✓ completed`(exit 0 绿 / 非 0 红) /
+   `✗ killed` / `⚠ missing`）。
+2. **列表视图**键位：
+   - `↑` / `↓`：移动选择；
+   - `Enter`：查看选中任务的输出（进入输出视图）；
+   - `x`：请求 kill 选中任务 → 底部内联 `y/n` 二次确认，`y` 确认、`n`/`Esc` 取消；
+   - `Esc` / `q`：退出面板。
+3. **输出视图**键位：
+   - `↑` / `↓` / `PgUp` / `PgDn` / `Home` / `End`：滚动（默认**跟随尾部**，向上滚动即脱离跟随、
+     `End` 恢复跟随）；
+   - `x`：kill **当前正在查看**的任务（同样 `y/n` 内联确认）；
+   - `Esc` / `q`：返回列表。
+4. 面板**每秒自刷新**：运行中任务的耗时实时增长、状态 `running→completed` 自动更新、输出视图
+   跟随尾部。刷新纯展示、无副作用（`listJobsForSession` 只读；完成通知仍由 runtime 的
+   `fs.watch` watcher 独立发送）；只有 `x` kill 这类用户动作才 `reconcile` + 改状态。
+
+> 只在 TUI（`ctx.hasUI`）下可用；无 tmux 时 `notify` 提示。当前会话无后台任务时列表显示
+> 「(no background jobs in this session)」占位（界面文案为英文）。kill 走内联 `y/n` 确认避免误杀；已结束的任务只能看输出、
+> `x` 会提示无需 kill。
+
+### kill 的两类通知
+
+用户在 `/bg` 面板里 kill 一个任务后，会产生**两层**通知：
+
+1. **TUI 通知**：面板内标题行即时反馈（`Killed @xxx`），同时发一条 `ctx.ui.notify`
+   （持久 toast，**关掉面板后仍可见**）。消息以 `killWindow` 结果为准并处理竞争：成功 →
+   `Killed @xxx`；杀之前刚好自然完成 → `Job @xxx already completed (exit N); nothing to kill`；窗口不存在 →
+   `Window @xxx no longer exists (it may have already finished)`。
+2. **给 assistant 的消息**：因为这是**用户手动** kill（assistant 并不知道），面板会经
+   `notifyUserKilled` 给 assistant 注入一条通知（复用完成通知的 `⏻ background bash` 渲染），
+   **正文明确写「TERMINATED BY THE USER」**，并附命令与被杀前的尾部输出。它与完成通知走同一个
+   自管投递队列（见下文「完成通知」），以 `wake: false` 入队：
+   - **assistant 在 turn 内（streaming）** → 随 `turn_end` 与其他待投递通知合并成一条 steer，
+     在当前 assistant 消息的工具调用全部执行完、下一次 LLM 调用前注入，不打断在途工具；
+   - **已是 user turn（idle）** → 不发，等下次用户 prompt 时经 `before_agent_start` 一起带上
+     （= 原 `nextTurn` 语义），**不主动打断 / 唤醒 assistant**；
+   - **永不主动唤醒**——kill 是用户意图动作，不该因 UI 清理让 assistant 突然开口（对比
+     自然完成以 `wake: true` 入队，因为那是 assistant 可能在等的结果）。
+   - **去重**：仅在「确实杀掉一个运行中任务」时发；若任务其实刚自然完成，`handleCompletion`
+     已发过完成通知，kill 不再重复。
+
+> `bg` **工具**的 kill（assistant 自己调用）**不**发这条消息——它从工具返回值已经知道结果，
+> 再发会冗余。只有 `/bg` **面板**的用户 kill 才通知 assistant。
+
+## 为什么这么设计
+
+- **覆盖内置 `bash`（而非另起 `bg_*` 工具）**：让「长命令自动转后台」成为默认路径，模型无需
+  学新工具、也不会两套 bash 并存。代价是要严格对齐内置 bash 的结果/错误/截断形状，pi 升级
+  后须复核。
+- **进程交给 tmux server 持有**：Node 侧不 hold 子进程，pi 运行期间的 `/reload`、切换会话、意外
+  崩溃都不会中断后台任务，也不占 Node 事件循环。这是相对「扩展内 `spawn(detached)` 自管进程」
+  最大的优势。**但不允许任务活过 pi 进程**：会话按 pid 独占 + 退出时连根拆除（见「会话生命周期」）。
+- **哨兵退出码文件 + `.out` 输出文件**：把「是否完成」和「输出内容」都落盘，和进程句柄解耦：
+  - 完成检测走 `fs.watch(runDir)` 监听哨兵文件；
+  - 日志读取优先读 `.out`，读不到再 `tmux capture-pane` 兜底；
+  - 用 `tee -a` + `${PIPESTATUS[0]}` 拿到准确退出码。
+- **完成通知走自管投递队列**（`../shared/notify-queue.ts`，与 afang-subagent 共用）。直接
+  `pi.sendMessage(steer + triggerTurn)` 有两个问题（pi 1.1.0 源码核对）：① pi 默认
+  `steeringMode: "one-at-a-time"`，每个 turn 边界只取一条——一次长前台调用期间完成 N 个任务就要多
+  N−1 轮，且模型看到第 1 条时不知道第 2 条早已到达；② 按 Esc 时 pi 会 `clearAllQueues()`，扩展进队的
+  custom 消息没有备份，**完成通知被静默丢掉**。队列的做法：
+  - Agent 运行中：先攒着，在 `turn_end` handler 里把全部待投递通知**合并成一条** steer 发出。pi 在
+    `finishTurn` 里 await 扩展的 turn_end，之后才取 steering 队列，所以送达时机与原先逐条 steer 完全
+    一致（当前 assistant 消息的工具全部结束后、下一次 LLM 调用前），只是合并了；
+  - Agent 空闲：攒 300ms（吸收几乎同时完成的任务）后合并发出并 `triggerTurn` 唤醒；
+  - **确认送达才出队**：看到带同一 `batchId` 的 `message_end` 才删除；run 结束（`agent_settled`）仍未确认
+    的批次视为被清掉，退回重发。`aborted`（Esc）时不唤醒，随下一次用户输入经 `before_agent_start` 带上；
+  - 体积：多条按完成先后排列，整条正文预算 2×`PI_TMUX_BASH_NOTIFY_MAX_BYTES`（默认 24KB）平分、短条目省下
+    的预算补给被截的；平分后每条不足 1KB 时只内联前若干条，其余降级为一行索引（含 `.out` 路径）；索引超过
+    40 行再落盘到 `runDir/notify/<batchId>.md`。队列本身不落盘：条目只是元数据，输出本就在 `.out` 里；
+  - TUI：通知渲染成**带背景的卡片**（`../shared/notice-card.ts`，与 afang-subagent 共用；底色按结果取
+    `toolSuccessBg` / `toolErrorBg` / 全是用户 kill 时 `toolPendingBg`，padding 跟随 `outputPad`）。pi 在扩展
+    提供 renderer 时不再套默认的 customMessageBg 背景，所以要自己画。多任务通知折叠态每个任务一行（✓ / ✗ /
+    ⊘ 用户 kill · 耗时 · 命令），展开看各自输出。**单条点击展开**：fullscreen 模式下左键单击卡片只切换这一条
+    （同 pi 内置工具行 / compaction 的 MouseRegion 做法）；`Ctrl+O` 仍是全局展开 / 折叠，并覆盖各条的单独状态。
+  - 已知边界：非 interactive 的 abort（RPC `abort` 不 `clear_queue`）下被退回重发的批次可能与 pi 稍后补投
+    的旧消息重复一次（宁重勿丢）；`/reload` 会丢失尚未投递的条目（同「reload 后不恢复 job 表」）。
+
+  通知内容包一层 `<background-task-notification-<随机后缀>>` 自描述框（协议在
+  `../shared/bg-notify.ts` 的 `makeBgNotifyFramer`，与 afang-subagent 共享；`config.ts` 只定制引言
+  文案），防止被降级成 `role:"user"` 后被模型误当成用户新指令；UI 渲染时用
+  `stripBgNotifyFrame` 剥掉框（兼容旧会话里的固定标签格式）。
+  - **随机边界防提前闭合**：每条通知生成 12 位 hex 后缀，开闭标签都带上，引言声明「只有同后缀的
+    闭合标签才结束本块」。payload 里出现的裸 `</background-task-notification>`（例如在本仓库里
+    `rg` 这串标签）无法把框提前闭合；而 payload **一个字节都不改**（不学 omp 的 `&lt;` 转义——
+    那会让模型照抄输出时把 `&lt;` 静默写进文件）。设计取舍详见 `bg-notify.ts` 头注释。
+- **工作目录用 `ctx.cwd`**：不强制在 git 仓库内。
+- **tmux 调用全用 `execFileSync` 数组参数**：不拼 shell 字符串，从根上避开引号/空格问题。
+
+## 会话生命周期（方案 A：任务生命周期不超过 pi）
+
+**一个 pi 进程 ↔ 一个 tmux 会话**，名字为 `pi-bg-<pid>`（`PI_TMUX_BASH_SESSION_PREFIX` 改前缀）。
+
+为什么不是固定名的共享会话（早期是裸 `pi-bg`）：固定名 + 占位窗口让会话永不消亡，于是 tmux
+server 会**比创建它的 pi 进程、甚至比终端程序活得更久**，后续 pi 会话都复用它，继承它**诞生那一
+刻的进程上下文**。实测事故（macOS，2026-10）：server 由 5 天前某次跑在「Documents 权限被拒」终端里
+的 pi 创建 → 之后所有会话的 bash 对 `~/Documents` 一律 `Operation not permitted`，而 pi 自身的 `read`
+工具正常（TCC 按 responsible process 归属，`ls -lde` 的 ACL 完全正常，极易误判成 pi 的 bug）。
+同源风险还有：`tmux` 升级后 client/server `protocol version mismatch` 让所有命令失败而 `tmux -V`
+照样成功；跨实例窗口泄漏；测试与日常会话互相串台。按 pid 命名后，server 必然是当前 pi 的后代。
+
+**拆除**（`session_shutdown` 按 `reason` 分流）：
+
+| reason | tmux 侧 | 当前会话 runDir |
+|---|---|---|
+| `quit`（pi 进程退出） | **kill 整个会话**，连带所有仍在跑的命令 | **整个删**（含 `.out`） |
+| `new` / `resume` / `fork`（同进程换 pi 会话） | 只 kill 带离任 `@pi_bg_session` 标签的任务窗口（切换后它们永远不会再被列出）；会话留给下一个 pi 会话 | **整个删** |
+| `reload`（`/reload` 热重载） | **一律不动**：窗口、进程、`.out` 全保留，重载后靠窗口标签恢复任务表 | 只删 scriptDir（wrapper 已 exec，POSIX 下 unlink 不影响已打开的 fd） |
+
+> 旧语义「故意不杀窗口，让后台任务活过 pi 退出」已废弃：它站不住——autoClose 回收、完成通知、
+> `.out` 读取全靠 pi 进程里的 watcher，pi 一走窗口就成了无人回收、无人观测的僵尸（新会话按自己的
+> `piSessionId` 过滤，根本看不见它们），而旧代码又在 quit 时把它们的 `.out` 删掉，两条理由自相矛盾。
+
+**崩溃残留回收**：`kill -9`/OOM 不触发 `session_shutdown`，残留会话由下一次启动的
+`gcStaleSessions()` 按 pid 存活性回收——只杀名字严格匹配 `<prefix>-<纯数字>` 且该 pid 已死的会话；
+pid 仍存活（另一个 pi 实例）、非数字后缀（`pi-bg-notes`）、或用 `PI_TMUX_BASH_SESSION` 钉死了会话名
+时一律不动。**旧版遗留的裸 `pi-bg` 会话不在命名空间内**，需手动 `tmux kill-session -t pi-bg` 清掉一次。
+
+## 非交互执行与 stdin
+
+程序判断「能否跟人交互」有四条**独立**信道，分开治：
+
+| 信道 | 探测方式 | 治法 |
+|---|---|---|
+| ① `isatty(fd)` | 系统调用，env 改不了 | stdout/stderr 由 `\| tee` 管道天然不是 tty；stdin 由下述 `stdin` 参数控制 |
+| ② `TERM` | 读环境变量 | 加固为 `TERM=dumb`，curses/全屏 UI 直接降级或拒绘 |
+| ③ 程序自带的非交互旋钮 | 读环境变量 | 加固注入（分页器/编辑器/凭证/包管理器，表在 `config.ts` 的 `NON_INTERACTIVE_ENV`） |
+| ④ `open("/dev/tty")` | 直接找**控制终端**，绕过 fd 重定向 | **有意不治**（见下） |
+
+### stdin（`stdin` 参数）
+
+| 值 | 行为 |
+|---|---|
+| `"null"`（默认） | `< /dev/null`。**对齐 pi 内置 bash** 的 `stdio: ["ignore", …]`：`cat`（无参）、`python`/`node` 进 REPL、`npm init`、`read` 立即拿到 EOF |
+| `"tty"` | 继承 tmux pane 的 PTY，给「人 `tmux attach` 进去敲键盘」用；**同时跳过 env 加固**（要 tty 就是打算交互，对齐 omp 的 PTY 路径不加固） |
+
+改这一条的理由：wrapper 的 `( … ) 2>&1 \| tee` 只重定向了 1/2，**stdin 以前直接继承 pane 的 PTY**（`[ -t 0 ]`
+为真）。于是读 stdin 的命令拿不到 EOF，**挂在那里等没人敲的键盘** → 吃满 120s 前台窗口 → 自动转后台 →
+而模型被明确告知「别 poll 后台任务」→ **静默停滞**。这是与内置 bash 的行为偏离，已修正。
+
+### 加固的层次
+
+加固 export 导出在 ambient `process.env` **之后**，且**只在命令子 shell 内**生效：
+
+```bash
+export PAGER=less            # ← ambient（从用户 shell 继承）
+export TERM=xterm-256color
+(
+export PAGER='cat'           # ← 加固：覆盖 ambient
+export TERM='dumb'
+<command>                    # ← 命令跑在最后：`PAGER=less cmd` 仍然赢
+) < /dev/null 2>&1 | tee -a "$out"
+```
+
+三点设计理由：
+
+- **压在 ambient 之上**：否则用户 shell 里的 `PAGER=less` 会把加固打败，加固形同虚设（与 omp 的
+  `buildNonInteractiveEnv()` 层次一致：加固在 ambient 之上、显式 caller env 之下）。
+- **用户意图通道 = 命令文本本身**：命令最后执行，所以 `VAR=x cmd` 与命令内的 `export` 依旧生效。
+- **作用域限于子 shell**：不污染 wrapper 末尾用于保留窗口的 `exec $SHELL -l`，否则 `autoClose=false`
+  时 attach 进去会得到一个 `TERM=dumb` 的残废 shell。
+
+全局开关 `PI_TMUX_BASH_HARDEN_ENV=0` 关掉加固（不影响 stdin 重定向，两者独立）；`CI=true` 另有
+`PI_BASH_NO_CI` 逃生口（与 omp 同名同义）。
+
+### 有意不治：`/dev/tty`
+
+`sudo` 讨密码、`ssh` 首连的 host-key 确认这类**直接 `open("/dev/tty")`** 的提示，env 和 fd 重定向都拦不住，
+唯一解法是让进程**没有控制终端**（setsid；内置 bash 的 `detached: true` 就是这么做的）。但那会**废掉
+本扩展「可 attach 接管」的核心优势**，所以不做。缓解：`SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` 能让
+ssh 秒失败而不是挂住；`sudo` 仍会挂（用 `sudo -n`，或提前配好免密）。
+
+## 产物权限与回收
+
+**权限收紧**（wrapper 脚本内联了导出的环境变量，可能含密钥）：
+
+- runDir / scriptDir 目录：`0o700`（仅 owner 可进）。
+- wrapper `.sh` 脚本：`0o700`（仅 owner 执行 / `bash -n` 预检读取，不给 group/other）。
+- `.out` 输出与退出码哨兵文件：`0o600`。实现上用**子 shell 局部 `umask 077`** 创建这些内部
+  文件，**不影响用户命令自己创建的文件**（全局 `umask` 会把用户 `touch` 出来的文件也变 600，
+  故意避开）。
+
+**磁盘回收**（与上表同步；每次 `cleanup` 另外**回收历史会话产物**）：扫 `outputDir` 下其它 runDir，
+按目录名里的创建 `pid` 探活——pid 已死（那个 pi 早退出）或 pid == 本进程（自己遗留的旧 runDir）→
+删；pid 属于**另一个存活的 pi 实例** → 保留（不误删并存实例）；目录名解析不出 pid → 保守跳过。
+
+> 注意：pi 被 `SIGKILL` 强杀不会触发 `session_shutdown`，其残骸留待**下一个** pi 实例启动/退出时
+> 由上述历史回收清掉（届时老 pid 已死）。
+
+## 依赖
+
+- 需要 `tmux` 在 `PATH` 中（缺失时 bash / bg 工具直接返回不可用错误；Windows 一般需 WSL）。
+- 其余仅用 pi 自带的 `@earendil-works/pi-coding-agent` / `pi-tui` / `typebox`。
+
+## 配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PI_TMUX_BASH_TMUX` | `tmux` | tmux 可执行文件 |
+| `PI_TMUX_BASH_SESSION` | *（未设）* | **钉死**后台会话名；设了就按原样用（多实例可共用一个会话，自担「继承旧进程上下文」风险），并关闭按 pid 的残留会话回收 |
+| `PI_TMUX_BASH_SESSION_PREFIX` | `pi-bg` | 会话名前缀，实际会话名为 `<prefix>-<pid>`（每个 pi 进程一个） |
+| `PI_TMUX_BASH_DIR` | `$TMPDIR/pi-tmux-bash` | runDir 根目录（存脚本、`.out`、哨兵文件） |
+| `PI_TMUX_BASH_FOREGROUND_TIMEOUT` | `120`（秒） | 前台同步等待窗口；未显式 `timeout` 时跑满此时长仍未结束则自动转后台（不杀）。工具 description 与 prompt guideline 里的时长随之动态生成（扩展加载时确定），模型侧认知与实际一致 |
+| `PI_TMUX_BASH_HARDEN_ENV` | `true` | 是否对非交互命令注入 env 加固（分页器/`TERM=dumb`/编辑器/凭证提示开关）；见「非交互执行与 stdin」 |
+| `PI_TMUX_BASH_AUTOCLOSE` | `true` | 命令完成后是否自动关闭 tmux 窗口（`false` 则跑完仍可 attach） |
+| `PI_TMUX_BASH_MAX_LINES` | pi 默认（2000） | 读日志保留的最大行数 |
+| `PI_TMUX_BASH_MAX_BYTES` | pi 默认（50KB） | 读日志保留的最大字节数 |
+| `PI_TMUX_BASH_NOTIFY_MAX_BYTES` | `12288`（12KB） | 后台完成 / 用户 kill 通知正文的字节上限（取尾部，超出附完整日志路径） |
+
+## 文件结构
+
+```
+tmux-bash/
+├── index.ts                    入口：覆盖内置 bash + 注册 bg 工具 + 完成渲染 + session 生命周期
+├── runtime.ts                  wrapper 脚本生成、前台同步执行/流式转发/自动转后台、fs.watch 完成监听、日志读取
+├── tmux.ts                     tmux 底层封装（execFileSync 数组参数）
+├── config.ts                   配置默认值 + 环境变量 + 窗口标签常量 + 通知框引言（协议见 ../shared/bg-notify.ts）
+├── test-fixes.ts               功能测试（用例清单与用法见文件头；bun 运行）
+（共享：../shared/bg-notify.ts 通知框协议、../shared/notify-queue.ts 通知投递队列 + test-notify-queue.ts、../shared/notice-card.ts 通知卡片渲染）
+├── README.md
+└── README-CN.md                中文版 README
+```
+
+## tmux 后台化怎么实现的（简述）
+
+每个任务写一个一次性 wrapper `.sh`，交给 `tmux new-window -a -d -PF '#{window_id}'` 运行：
+
+```bash
+( umask 077; : > "$out_file" )               # 内部文件 0o600（局部 umask，不污染用户命令）
+( <用户命令> ) 2>&1 | tee -a "$out_file"   # 输出实时落盘
+rc=${PIPESTATUS[0]}                         # 取真实退出码
+( umask 077; printf '%s\n' "$rc" > "$exit_file.tmp" )  # 先写 .tmp
+mv -f "$exit_file.tmp" "$exit_file"         # 原子出现，fs.watch 才看到完整哨兵
+exec "${SHELL:-/bin/bash}" -l               # 命令结束后窗口保活，可 attach
+```
+
+- **前台路径**（`runForegroundBash`）：写完脚本先 `bash -n` 预检（语法错误直接返回，不建
+  窗口）；建窗口后轮询 `.out`（流式 `onUpdate`）+ 哨兵文件 + 窗口存活（约每秒）；
+  完成 → 返回最终结果；窗口未写哨兵就消失 → 立即报错返回；显式 `timeout` 到点 → 杀窗口
+  返回退出码 124；跑满前台窗口 → 登记 job 转后台（先登记再复查哨兵，消除切换瞬间完成的
+  漏通知竞态）。
+- **后台路径**：Node 侧生成脚本 → 建窗口拿到 `@id` → 打窗口标签登记 job →
+  `fs.watch(runDir)` 等哨兵文件出现 → 读退出码 + `.out` → 记录 `completed + exitCode` →
+  `pi.sendMessage` 以 steer 唤醒模型。完成记录保留在当前 runtime 的 job 表中，因此默认 autoClose
+  关闭 tmux 窗口后，`bg action=list` 仍会列出最终状态；`bg action=logs window=@id` 仍可读取日志。
+
+## 与 pi-powerline-footer 的兼容性
+
+### 当前结论：跟随最新版（pi 1.0 + powerline 0.19 复核，2026-10）
+
+仓库安装文档直接跟随 powerline latest：
+
+```bash
+pi install npm:pi-powerline-footer
+```
+
+- **powerline 已不再有自己的 fixed-editor**：0.9.0 起「Native fixed input cutover」移除了扩展自管的
+  固定编辑器与聊天区滚动，改由 pi 原生负责（pi 1.0 默认 `tuiMode: "fullscreen"`）。因此下文
+  「拖影问题路径」「复核路径」中涉及 `powerline.fixedEditor`、DECSTBM compositor、
+  `/powerline fixed-editor` 的内容只对 **powerline < 0.9** 有意义，现仅作历史参考。
+- **peer 范围**：当前 0.19.0 的 `package.json` 声明 `@earendil-works/* >=0.81.0`，无上界，pi 1.0.0
+  满足（旧注「peer 上界 `<0.84.0`」已过时并删除）。
+- 历史上曾固定 `pi-powerline-footer@0.7.0` 规避 `0.8.0` fixed-editor 在 tmux 下的滚动拖影；该 pin
+  早已解除——旧版 peer 为 `>=0.74.0 <0.81.0`，在 0.84+ 上会让 pi 打不开。
+
+### 拖影问题路径（历史背景，仅 powerline < 0.9）
+
+下面记录的是旧版（`0.8.0`）fixed-editor 在 tmux 下拖影的成因，保留供日后排查同类问题参考：
+
+```text
+tmux-bash 的长输出 / 流式更新
+  → tool result 触发聊天 viewport 频繁重绘（触发条件，不是根因）
+  → powerline fixed-editor 接管 pi-tui 的 render / doRender / terminal.write / terminal.rows
+  → powerline 0.8.0 用 DECSTBM 滚动区 + SU/SD 搬行 + cached transcript 做增量滚动
+  → tmux 屏幕状态与扩展缓存偶发偏离
+  → 已搬动的旧像素未被完整覆盖，形成拖影
+```
+
+powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除并重绘整个 viewport；0.8.0
+新增的 SU/SD 行搬移与屏上旧像素复用是两版之间最关键的差异。另一个待上游确认的状态泄漏路径是
+`buildFixedClusterPaint()` 在 `cluster.lines.length === 0` 时先返回，可能跳过后面的
+`resetScrollRegion()`。
+
+这和 tmux-bash 曾经存在的控制序列穿透是两个独立问题。当前 tmux-bash 已在数据进入 renderer 前做
+归一化：
+
+- `runtime.ts` 的 `normalizeForegroundOutput()`：先折叠 CR/EL，再剥 ANSI，之后才截断并送入
+  `onUpdate` / 最终结果；
+- `index.ts` 的 `renderCall()`：用 `collapseCarriageReturns()` 清理命令回显；
+- `shared/terminal-text.ts`：丢弃会跨行移动光标的 CSI，维护“一条 render 字符串对应一个物理行”的
+  约束。
+
+因此，后续若拖影仍只随 `fixedEditor` 开关出现，应优先排查 powerline compositor，不要先回退
+上述输出归一化。
+
+### 上游变化后的复核路径（历史，仅 powerline < 0.9）
+
+> powerline 0.9+ 已无 fixed-editor，以下步骤里的 `fixed-editor` A/B 不再适用；若 pi 原生 fullscreen
+> 下出现拖影，改用 `tuiMode: "regular"` 作为对照基线，思路同下。
+
+若日后升级 powerline 或 pi 后拖影重现，按此复核：
+
+1. 记录候选环境版本：`pi --version`、`tmux -V`、`npm view pi-powerline-footer version`，并确认实际
+   安装的 powerline 版本。
+2. 先保持同一份会话和输出，执行 `/powerline fixed-editor off` 作为无拖影基线；再开启 fixed-editor
+   做 A/B，避免把 tmux-bash 输出问题和 fixed-editor 问题混在一起。
+3. 在 tmux 中覆盖这些场景：长静态输出、带 `\r` / `ESC[K` 的进度输出、流式 tool result、
+   `Ctrl+O` 展开/折叠、连续向上/向下滚动。
+4. 检查 powerline 候选版的 `fixed-editor/terminal-split.ts`：
+   - tmux 下是否已禁用 SU/SD 增量搬行，或提供全 viewport 重绘开关；
+   - 所有分支是否都会复位 DECSTBM 滚动区；
+   - 是否仍 monkey-patch `tui.doRender`、`terminal.write` 和 `terminal.rows`，从而绕开 pi 自身修复。
+5. 只有 fixed-editor 开启时也不再复现，且关闭时行为无回退，才认为该版本安全。
+
+可从以下上游位置开始比较：
+
+- [pi-powerline-footer v0.8.0 CHANGELOG](https://github.com/nicobailon/pi-powerline-footer/blob/v0.8.0/CHANGELOG.md)
+- [powerline fixed-editor compositor](https://github.com/nicobailon/pi-powerline-footer/blob/v0.8.0/fixed-editor/terminal-split.ts)
+- [powerline PR #118：smooth fixed-editor scrolling](https://github.com/nicobailon/pi-powerline-footer/pull/118)
+- [pi v0.82.1...v0.83.0](https://github.com/earendil-works/pi/compare/v0.82.1...v0.83.0)
+
+## 已知限制 / TODO
+
+- **跨 `/reload` 不恢复 job 表与通知队列**（**待做，收益最高**——这是目前唯一还会丢通知的路径）：
+  - reload 后内存里的 job 映射会清空，reload 前启动的任务完成时不会再自动通知（任务本身仍在
+    tmux 里跑、`.out` 日志仍保留，可用 `bg action=list` / `tmux` 手动查）；
+  - 自管通知队列（`../shared/notify-queue.ts`）里**尚未送达**的条目也随扩展实例重建而丢失；
+  - 思路：`session_start` 扫描 runDir + 窗口标签重建 job 表，并重新 watch 旧 runDir 的哨兵；
+    队列的 pending/inflight 落盘到 runDir（或经 `globalThis` 跨实例交接），重载后补投。
+    可参考 omp 的 epoch 思路区分「换会话应丢弃」与「reload 应保留」。
+- **转后台的任务在 pi 存活期间不自动回收**：自动转后台/`background:true` 的命令除非手动
+  `bg action=kill`，否则会一直保活占资源（这是相对旧 `bash-default-timeout`「120s 硬杀跑飞命令」
+  的行为反转）。上限是 pi 进程：`quit` 时整个会话被拆除，不会泄到 pi 之外（见「会话生命周期」）。
+- **占位窗口**：首次会建一个 `pi-bg` 占位 shell 窗口，保证所有任务窗口关闭后会话仍存活；
+  `bg action=list` 已按标签过滤掉它。注意它的**名字不再等于会话名**（会话名带 pid 后缀），这顺带
+  削弱了 `new-window` 的 target 歧义，但 `tmux.ts` 里 `-t <session>:` 的尾冒号写法仍是必须的。
+- **直接走 `/dev/tty` 的提示仍会挂**：`sudo` 密码、`ssh` 首连 host-key 确认能绕过 env 与 fd 重定向，
+  只能靠 setsid 堵住，而那会废掉 attach 接管，所以有意不做（见「非交互执行与 stdin」）。
+- `execFileSync` 同步调用 tmux、`fs.watch` 跨平台可靠性等，量大时可考虑加兜底轮询。
+- **RPC 模式下 abort 可能重复投递一次通知**：非 interactive 的 abort（RPC `abort` 不跟 `clear_queue`）
+  不会清 pi 的 steering 队列，被我们退回重发的批次可能与 pi 稍后补投的旧消息重复。有意选择「宁重勿丢」；
+  若要根治，需要能区分「pi 队列已被清空」与「只是被中断」的信号。
+- **（待评估）精简防轮询文案**：「禁止轮询」目前在 description、5 条 guideline、`bg` 的 snippet/guideline、
+  转后台结果里多处重复，是为压制轮询而刻意加的。精简前先写脚本扫本机 session jsonl，统计「转后台之后、
+  完成通知到达之前」模型调用 `sleep`/`wait` 与 `bg list/logs` 的次数作为基线；之后任何改动用同一脚本
+  对比是否回潮。倾向：只合并同一层里的字面重复（如 bash guideline #5 与 bg guideline #1），转后台结果里
+  那段（离决策点最近）不动。
+- **（待调研）收到用户插话时提前转后台**：omp 的前台等待会同时竞速 `steeringSignal`，用户在长命令
+  等待期间插话时立即转后台、让消息尽快注入。需先确认 pi 扩展 API 是否暴露 steering 到达信号
+  （或能否从 `hasPendingMessages()` 轮询近似）。
+- **主题配色**：通知卡片按结果取 `toolSuccessBg` / `toolErrorBg` / `toolPendingBg`，但 gruvbox-dark 主题
+  里这三个都是 `dark0Soft`，成功 / 失败底色无区别，只能靠行首 ✓ / ✗ 颜色区分。改主题即可，不涉及代码。
+
+## 本地开发
+
+源码在本仓库 `extensions/tmux-bash/`。本地开发时可将其软链接到
+`~/.pi/agent/extensions/tmux-bash`，改完 `/reload` 生效。
