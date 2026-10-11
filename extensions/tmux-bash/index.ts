@@ -13,12 +13,14 @@
 
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { toSingleLine, stripAnsi, collapseCarriageReturns } from "../shared/terminal-text.js";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import { openBgPanel } from "./bg-panel.js";
 import {
+	AUTO_BG_HEADLINE_PREFIX,
+	BACKGROUND_START_HEADLINE_PREFIX,
 	cleanup,
 	createState,
 	gcStaleSessions,
@@ -104,6 +106,36 @@ function formatRunningLimit(
 	return ` · ${describeLimit(limit)} · ${remaining}`;
 }
 
+// 转后台结果在折叠态的排版：上方输出预览只留末几行（与 Running 态的流式预览同为 dim，视觉连续），
+// 下方说明段（job / window / bg 命令 / attach）总是完整可见——按旧的「前 15 行」折叠，预览一长就会把说明
+// 挤到折叠线以下。定位不到说明段（理论上不会）时返回 null，调用方退回普通折叠。
+const HANDOFF_PREVIEW_FOLD_LINES = 5;
+
+function renderBackgroundedBody(lines: string[], theme: Theme): string | null {
+	// 取最后一处匹配：预览是命令输出，极端情况下可能恰好包含同样开头的行。
+	let head = -1;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		if (lines[i].startsWith(AUTO_BG_HEADLINE_PREFIX) || lines[i].startsWith(BACKGROUND_START_HEADLINE_PREFIX)) {
+			head = i;
+			break;
+		}
+	}
+	if (head < 0) return null;
+	const before = lines.slice(0, head);
+	while (before.length > 0 && !before[before.length - 1].trim()) before.pop();
+	const out: string[] = [];
+	if (before.length > 0) {
+		// before[0] 是「Output so far…:」/「No output so far.」标签行，其后是预览正文。
+		const [label, ...preview] = before;
+		out.push(theme.fg("muted", label));
+		const shown = preview.slice(-HANDOFF_PREVIEW_FOLD_LINES);
+		if (preview.length > shown.length) out.push(theme.fg("muted", `… +${preview.length - shown.length} lines`));
+		out.push(...shown.map((l) => theme.fg("dim", l)), "");
+	}
+	out.push(...lines.slice(head).map((l) => theme.fg("toolOutput", l)));
+	return out.join("\n");
+}
+
 // 内置 bash 形状（command + timeout）保持不变，仅新增 background / stdin 两个可选参数。见 BUILTIN-BASH-REFERENCE.md §2/§7。
 const BashParams = Type.Object({
 	command: Type.String({ description: "The shell command to execute" }),
@@ -141,14 +173,21 @@ const BgParams = Type.Object({
 	),
 });
 
-const BASH_DESCRIPTION =
-	"Execute a shell command in the current working directory. Returns stdout and stderr (merged), " +
-	"truncated to the last 2000 lines / 50KB (full output saved to a temp file when truncated). " +
-	"Output streams live while the command runs. If it does not finish within the foreground wait window " +
-	"(default 120s), it is automatically moved to a background tmux window and keeps running. Completion is " +
-	"delivered automatically. Once backgrounded, do NOT wait for it or check merely to detect completion: never " +
-	"call bash with sleep/polling loops or repeatedly call bg list/logs. Set timeout to enforce a hard kill at the " +
-	"deadline instead (exit code 124, no background handoff). Set background:true to detach immediately.";
+// 前台等待窗口是可配置的（PI_TMUX_BASH_FOREGROUND_TIMEOUT），而 TUI 的 renderCall 与转后台说明里的 waitSec 早就是
+// 动态值；模型侧的 description / guideline 若写死 120s，改配置后模型会按错误的窗口做决策（例如为了「赶在
+// 120s 前」多余地设硬 timeout，把转后台变成到点硬杀）。值在扩展加载时确定、进程内不变 → 不会逐轮打破 prompt
+// cache；默认 120s 时生成的文本与改动前逐字相同。
+function bashDescription(foregroundTimeoutMs: number): string {
+	return (
+		"Execute a shell command in the current working directory. Returns stdout and stderr (merged), " +
+		"truncated to the last 2000 lines / 50KB (full output saved to a temp file when truncated). " +
+		"Output streams live while the command runs. If it does not finish within the foreground wait window " +
+		`(default ${formatLimitValue(foregroundTimeoutMs)}), it is automatically moved to a background tmux window and keeps running. Completion is ` +
+		"delivered automatically. Once backgrounded, do NOT wait for it or check merely to detect completion: never " +
+		"call bash with sleep/polling loops or repeatedly call bg list/logs. Set timeout to enforce a hard kill at the " +
+		"deadline instead (exit code 124, no background handoff). Set background:true to detach immediately."
+	);
+}
 
 function reply(text: string, details: unknown = null, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
@@ -228,9 +267,9 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
-		description: BASH_DESCRIPTION,
+		description: bashDescription(state.options.foregroundTimeoutMs),
 		promptGuidelines: [
-			"Use bash for shell commands; a long command auto-moves to the background after ~120s and notifies on completion — never wait or poll for it.",
+			`Use bash for shell commands; a long command auto-moves to the background after ~${formatLimitValue(state.options.foregroundTimeoutMs)} and notifies on completion — never wait or poll for it.`,
 			"Set bash timeout only when you want a hard kill at the deadline (exit code 124), not a background handoff.",
 			"Set bash background:true to detach immediately (dev servers, watchers, long builds).",
 			"Once bash reports a background job, NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished. Continue only with independent useful work; otherwise end your turn immediately. Its completion notification will automatically trigger a new turn when the session is idle.",
@@ -251,7 +290,7 @@ export default function (pi: ExtensionAPI): void {
 							{
 								type: "text" as const,
 								text: [
-									`Started background job ${r.jobId} in tmux window ${r.windowId}.`,
+									`${BACKGROUND_START_HEADLINE_PREFIX} ${r.jobId} in tmux window ${r.windowId}.`,
 									"The command is already detached. Do not wait for it: NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished.",
 									"Continue only with independent useful work; otherwise end your turn now. Completion is delivered automatically and will trigger a new turn when the session is idle.",
 									`For deliberate manual inspection only (not polling): bg action=logs window=${r.windowId} · Stop: bg action=kill window=${r.windowId}`,
@@ -333,11 +372,17 @@ export default function (pi: ExtensionAPI): void {
 				st.interval = undefined;
 			}
 
-			// 输出主体（15 行折叠 / expanded 全展开）。
+			// 输出主体（15 行折叠 / expanded 全展开）。转后台结果在折叠态下单独排版（见 renderBackgroundedBody）。
 			const trimmed = output.trim();
+			const backgroundedBody =
+				trimmed && !options?.expanded && (result.details as { backgrounded?: boolean } | undefined)?.backgrounded
+					? renderBackgroundedBody(trimmed.split("\n"), theme)
+					: null;
 			let body: string;
 			if (!trimmed) {
 				body = theme.fg("muted", "(no output)");
+			} else if (backgroundedBody !== null) {
+				body = backgroundedBody;
 			} else {
 				const lines = trimmed.split("\n");
 				const max = options?.expanded ? Infinity : 15;

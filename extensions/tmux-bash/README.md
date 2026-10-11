@@ -23,8 +23,16 @@
 
 - 命令完成（无论自动转后台还是 `background:true`）会收到一条 `⏻ background bash` 消息
   （自定义渲染），含退出码、耗时、输出尾部与完整日志路径。**TUI 里该消息折叠显示**（头部状态行
-  + 尾部最新输出 + `… +N 行`），避免大输出刷屏；选中该消息**展开**即可看全文。折叠只影响 TUI 展示，
-  发给 LLM 的 `content` 不变（仍按 `maxLines/maxBytes` 截断）。
+  + 尾部最新输出 + `… +N 行`），避免大输出刷屏；选中该消息**展开**即可看全文。折叠只影响 TUI 展示。
+  发给 LLM 的 `content` 另有**体积上限**：输出尾部按 `PI_TMUX_BASH_NOTIFY_MAX_BYTES`（默认 12KB）收紧，
+  超出时附 `[output truncated; showing the tail only. Full log: <.out>]`。理由：通知是 custom 消息，会
+  **永久留在 transcript、之后每轮请求都重复计费**，旧的 2000 行 / 50KB 一条就可能 ~12k token；前台
+  tool result（内置 bash 契约）与 `bg action=logs`（模型主动查看）不受影响，仍按 `maxLines/maxBytes`。
+- **自动转后台时附输出预览**：返回给模型的结果开头是转后台那一刻的输出**尾部一小段**（≤20 行 / 2KB，
+  被截时标注 `Output so far (last lines only; full log: …)`；没输出则写 `No output so far.`），其后才是
+  原有的「已转后台、禁止轮询」说明。模型在前台等待期间看不到流式输出（onUpdate 只给 TUI），没有预览
+  就只能靠 `bg logs` 看进度——那正是轮询的起点。TUI 折叠态下预览只显示末 5 行、说明段始终完整可见，
+  展开看全部。`background:true`（立即分离）没有预览。
 - 工具描述、静态 prompt guideline 与转后台后的返回消息都会明确告诉模型：后台化后**禁止**通过
   `bash sleep`、轮询循环或反复调用 `bg list/logs` 等待完成；只能继续与该任务无关的有效工作，否则应
   立即结束当前 turn。任务完成后，通知会在会话空闲时自动拉起新 turn。
@@ -120,10 +128,14 @@
 - **完成通知走官方 API**：`pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`。
   Agent 空闲时立即唤醒；Agent 正忙时，通知在当前 assistant 消息的全部工具调用结束后、下一次 LLM
   调用前投递，不会中断正在执行的工具，也不会像 followUp 那样因模型持续 `sleep` / `bg` 轮询而
-  长期饥饿。通知内容包一层 `<background-task-notification>` 自描述框（协议在
+  长期饥饿。通知内容包一层 `<background-task-notification-<随机后缀>>` 自描述框（协议在
   `../shared/bg-notify.ts` 的 `makeBgNotifyFramer`，与 afang-subagent 共享；`config.ts` 只定制引言
   文案），防止被降级成 `role:"user"` 后被模型误当成用户新指令；UI 渲染时用
-  `stripBgNotifyFrame` 剥掉框。
+  `stripBgNotifyFrame` 剥掉框（兼容旧会话里的固定标签格式）。
+  - **随机边界防提前闭合**：每条通知生成 12 位 hex 后缀，开闭标签都带上，引言声明「只有同后缀的
+    闭合标签才结束本块」。payload 里出现的裸 `</background-task-notification>`（例如在本仓库里
+    `rg` 这串标签）无法把框提前闭合；而 payload **一个字节都不改**（不学 omp 的 `&lt;` 转义——
+    那会让模型照抄输出时把 `&lt;` 静默写进文件）。设计取舍详见 `bg-notify.ts` 头注释。
 - **工作目录用 `ctx.cwd`**：不强制在 git 仓库内。
 - **tmux 调用全用 `execFileSync` 数组参数**：不拼 shell 字符串，从根上避开引号/空格问题。
 
@@ -240,11 +252,12 @@ ssh 秒失败而不是挂住；`sudo` 仍会挂（用 `sudo -n`，或提前配�
 | `PI_TMUX_BASH_SESSION` | *（未设）* | **钉死**后台会话名；设了就按原样用（多实例可共用一个会话，自担「继承旧进程上下文」风险），并关闭按 pid 的残留会话回收 |
 | `PI_TMUX_BASH_SESSION_PREFIX` | `pi-bg` | 会话名前缀，实际会话名为 `<prefix>-<pid>`（每个 pi 进程一个） |
 | `PI_TMUX_BASH_DIR` | `$TMPDIR/pi-tmux-bash` | runDir 根目录（存脚本、`.out`、哨兵文件） |
-| `PI_TMUX_BASH_FOREGROUND_TIMEOUT` | `120`（秒） | 前台同步等待窗口；未显式 `timeout` 时跑满此时长仍未结束则自动转后台（不杀） |
+| `PI_TMUX_BASH_FOREGROUND_TIMEOUT` | `120`（秒） | 前台同步等待窗口；未显式 `timeout` 时跑满此时长仍未结束则自动转后台（不杀）。工具 description 与 prompt guideline 里的时长随之动态生成（扩展加载时确定），模型侧认知与实际一致 |
 | `PI_TMUX_BASH_HARDEN_ENV` | `true` | 是否对非交互命令注入 env 加固（分页器/`TERM=dumb`/编辑器/凭证提示开关）；见「非交互执行与 stdin」 |
 | `PI_TMUX_BASH_AUTOCLOSE` | `true` | 命令完成后是否自动关闭 tmux 窗口（`false` 则跑完仍可 attach） |
 | `PI_TMUX_BASH_MAX_LINES` | pi 默认（2000） | 读日志保留的最大行数 |
 | `PI_TMUX_BASH_MAX_BYTES` | pi 默认（50KB） | 读日志保留的最大字节数 |
+| `PI_TMUX_BASH_NOTIFY_MAX_BYTES` | `12288`（12KB） | 后台完成 / 用户 kill 通知正文的字节上限（取尾部，超出附完整日志路径） |
 
 ## 文件结构
 

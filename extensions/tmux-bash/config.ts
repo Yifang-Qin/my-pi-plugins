@@ -45,6 +45,13 @@ export interface TmuxBashOptions {
 	/** 读日志时保留的最大行数 / 字节数（复用 pi 的截断阈值）。 */
 	maxLines: number;
 	maxBytes: number;
+	/**
+	 * 后台完成 / 用户 kill 通知正文的字节上限（PI_TMUX_BASH_NOTIFY_MAX_BYTES，默认 12KB）。
+	 * 只管「通知」这条我们自己发明的通道：它作为 custom 消息永久留在 transcript，之后每轮请求都重复计费，
+	 * 旧的 2000 行 / 50KB 往往一条就有 ~12k token。前台 tool result（内置 bash 契约）与 `bg action=logs`
+	 *（模型主动查看）仍用 maxLines/maxBytes。超出部分模型可按脚注里的 .out 路径用 read 取。
+	 */
+	notifyMaxBytes: number;
 	/** 前台同步等待窗口（毫秒）。未显式 timeout 时，命令跑满此时长仍未结束则自动转后台（不杀）。 */
 	foregroundTimeoutMs: number;
 	/** tmux 窗口名最大长度。 */
@@ -154,6 +161,7 @@ export function loadOptions(): TmuxBashOptions {
 		autoCloseOnComplete: bool(process.env.PI_TMUX_BASH_AUTOCLOSE, true),
 		maxLines: num(process.env.PI_TMUX_BASH_MAX_LINES, DEFAULT_MAX_LINES),
 		maxBytes: num(process.env.PI_TMUX_BASH_MAX_BYTES, DEFAULT_MAX_BYTES),
+		notifyMaxBytes: num(process.env.PI_TMUX_BASH_NOTIFY_MAX_BYTES, 12 * 1024),
 		foregroundTimeoutMs: num(process.env.PI_TMUX_BASH_FOREGROUND_TIMEOUT, 120) * 1000,
 		maxWindowNameLength: 30,
 		envDenylist: DEFAULT_ENV_DENYLIST,

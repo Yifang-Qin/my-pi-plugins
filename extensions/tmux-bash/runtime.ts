@@ -576,12 +576,26 @@ export async function runForegroundBash(
 				[WINDOW_OPTIONS.command]: displayCommand,
 			});
 			const waitSec = Math.round(options.foregroundTimeoutMs / 1000);
+			// 转后台那一刻的输出预览：模型在整个前台等待期间一个字节都没看到（流式 onUpdate 只给 TUI），
+			// 没有预览就无法判断「放心去做别的」还是「明显卡住/跑偏该 kill」，只好去 bg logs 看一眼——
+			// 那正是轮询的起点。只给尾部一小段：完整输出会随完成通知到达，这里不重复花 token。
+			const preview = buildHandoffPreview(outputFile);
+			const previewSection = preview.text
+				? [
+						preview.truncated
+							? `Output so far (last lines only; full log: ${outputFile}):`
+							: "Output so far:",
+						preview.text,
+						"",
+					]
+				: ["No output so far.", ""];
 			return {
 				content: [
 					{
 						type: "text",
 						text: [
-							`Command still running after ${waitSec}s — moved to background as job ${id} (tmux window ${windowId}).`,
+							...previewSection,
+							`${AUTO_BG_HEADLINE_PREFIX} ${waitSec}s — moved to background as job ${id} (tmux window ${windowId}).`,
 							"The command is already detached. Do not wait for it: NEVER call bash with sleep or polling loops, and NEVER call bg list/logs merely to check whether it has finished.",
 							"Continue only with independent useful work; otherwise end your turn now. Completion is delivered automatically and will trigger a new turn when the session is idle.",
 							`For deliberate manual inspection only (not polling): bg action=logs window=${windowId} · Stop: bg action=kill window=${windowId}`,
@@ -589,12 +603,29 @@ export async function runForegroundBash(
 						].join("\n"),
 					},
 				],
-				details: { jobId: id, windowId, outputFile, backgrounded: true },
+				details: { jobId: id, windowId, outputFile, backgrounded: true, previewTruncated: preview.truncated },
 			};
 		}
 
 		await sleep(POLL_MS);
 	}
+}
+
+// 自动转后台通知的首行前缀。renderer 靠它（与 BACKGROUND_START_HEADLINE_PREFIX）在 content 里定位「说明段」，
+// 从而把上方的输出预览与下方的说明分开排版；两边引用同一常量，改文案不会惄悄失配。
+export const AUTO_BG_HEADLINE_PREFIX = "Command still running after";
+export const BACKGROUND_START_HEADLINE_PREFIX = "Started background job";
+
+// 转后台预览的上限：够看出「进行到哪、是否卡在提示符/重复报错」即可。
+const HANDOFF_PREVIEW_MAX_LINES = 20;
+const HANDOFF_PREVIEW_MAX_BYTES = 2 * 1024;
+
+// 与前台流式同一套清洗（CR 折叠 + stripAnsi），再按预览上限取尾部。尾部空行去掉，免得预览配额被空行吃掉。
+export function buildHandoffPreview(outputFile: string): { text: string; truncated: boolean } {
+	const normalized = normalizeForegroundOutput(readOutputFile(outputFile)).replace(/\s+$/, "");
+	if (!normalized) return { text: "", truncated: false };
+	const t = truncateTail(normalized, { maxLines: HANDOFF_PREVIEW_MAX_LINES, maxBytes: HANDOFF_PREVIEW_MAX_BYTES });
+	return { text: t.content, truncated: t.truncated };
 }
 
 // 读日志：优先读 .out 文件（精确），拿不到再退回 capture-pane。按 tail 截断。
@@ -617,6 +648,26 @@ export function readJobLogs(
 }
 
 // 启动完成监听：watch runDir，哨兵文件出现即读退出码 + .out，发完成通知唤醒模型。
+
+/**
+ * 后台完成 / 用户 kill 通知的正文：在 readJobLogs（2000 行 / 50KB）之上再按 notifyMaxBytes 收一次尾部，
+ * 并拼上截断脚注。保留尾部是因为错误信息、测试汇总、退出前的最后状态几乎总在末尾。
+ * `text` 须已是给模型的纯文本（stripAnsi 后），这样字节预算不会被颜色转义白白吃掉。
+ */
+export function capNotificationBody(
+	options: Pick<TmuxBashOptions, "maxLines" | "notifyMaxBytes">,
+	text: string,
+	alreadyTruncated: boolean,
+	fullPath: string | undefined,
+): string {
+	const t = truncateTail(text, { maxLines: options.maxLines, maxBytes: options.notifyMaxBytes });
+	const body = t.content || "(no output)";
+	if (!alreadyTruncated && !t.truncated) return body;
+	const footer = fullPath
+		? `[output truncated; showing the tail only. Full log: ${fullPath} (read it only if you need the earlier part)]`
+		: "[output truncated; showing the tail only]";
+	return `${body}\n\n${footer}`;
+}
 export function startWatcher(
 	state: RuntimeState,
 	pi: ExtensionAPI,
@@ -680,9 +731,9 @@ function handleCompletion(
 	const durSec = ((Date.now() - job.startedAt) / 1000).toFixed(1);
 	const status = exitCode === 0 ? "exited 0" : `exited ${exitCode}`;
 	const header = `Background job ${job.id} (${job.windowId}) ${status} after ${durSec}s\n$ ${job.command}`;
-	const footer = truncated ? `\n\n[output truncated; full log: ${job.outputFile}]` : "";
-	// 给模型看的文本剥掉 ANSI（颜色转义在上下文里只是噪音）；面板那边仍保留 SGR。
-	const content = frameBgNotify(`${header}\n\n${stripAnsi(text)}${footer}`);
+	// 给模型看的文本剥掉 ANSI（颜色转义在上下文里只是噪音），再按通知上限收紧；面板那边仍保留 SGR。
+	const body = capNotificationBody(state.options, stripAnsi(text), truncated, job.outputFile);
+	const content = frameBgNotify(`${header}\n\n${body}`);
 
 	// 清理哨兵文件；按配置关闭窗口。
 	try {
@@ -774,8 +825,8 @@ export function notifyUserKilled(
 		`Background job ${info.jobId ?? "?"} (${info.windowId}) was TERMINATED BY THE USER from the /bg panel ` +
 		`after ${durSec}s. The user manually killed it — this is not an error, not a crash, and not something ` +
 		`to retry or resume unless the user asks.`;
-	const footer = truncated && fullPath ? `\n\n[output truncated; full log: ${fullPath}]` : "";
-	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${stripAnsi(text)}${footer}`);
+	const body = capNotificationBody(state.options, stripAnsi(text), truncated, fullPath);
+	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${body}`);
 	pi.sendMessage(
 		{
 			customType: COMPLETION_CUSTOM_TYPE,
