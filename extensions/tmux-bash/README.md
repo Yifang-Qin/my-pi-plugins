@@ -393,9 +393,13 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
 
 ## 已知限制 / TODO
 
-- **跨 `/reload` 不恢复 job 表**：reload 后内存里的 job 映射会清空，reload 前启动的任务完成时
-  不会再自动通知（任务本身仍在 tmux 里跑、`.out` 日志仍保留，可用 `bg action=list` / `tmux`
-  手动查）。后续可在 `session_start` 扫描 runDir + 窗口标签重建 job 表。
+- **跨 `/reload` 不恢复 job 表与通知队列**（**待做，收益最高**——这是目前唯一还会丢通知的路径）：
+  - reload 后内存里的 job 映射会清空，reload 前启动的任务完成时不会再自动通知（任务本身仍在
+    tmux 里跑、`.out` 日志仍保留，可用 `bg action=list` / `tmux` 手动查）；
+  - 自管通知队列（`../shared/notify-queue.ts`）里**尚未送达**的条目也随扩展实例重建而丢失；
+  - 思路：`session_start` 扫描 runDir + 窗口标签重建 job 表，并重新 watch 旧 runDir 的哨兵；
+    队列的 pending/inflight 落盘到 runDir（或经 `globalThis` 跨实例交接），重载后补投。
+    可参考 omp 的 epoch 思路区分「换会话应丢弃」与「reload 应保留」。
 - **转后台的任务在 pi 存活期间不自动回收**：自动转后台/`background:true` 的命令除非手动
   `bg action=kill`，否则会一直保活占资源（这是相对旧 `bash-default-timeout`「120s 硬杀跑飞命令」
   的行为反转）。上限是 pi 进程：`quit` 时整个会话被拆除，不会泄到 pi 之外（见「会话生命周期」）。
@@ -405,6 +409,19 @@ powerline 0.7.0 虽然也接管 viewport 并使用 DECSTBM，但滚动时清除�
 - **直接走 `/dev/tty` 的提示仍会挂**：`sudo` 密码、`ssh` 首连 host-key 确认能绕过 env 与 fd 重定向，
   只能靠 setsid 堵住，而那会废掉 attach 接管，所以有意不做（见「非交互执行与 stdin」）。
 - `execFileSync` 同步调用 tmux、`fs.watch` 跨平台可靠性等，量大时可考虑加兜底轮询。
+- **RPC 模式下 abort 可能重复投递一次通知**：非 interactive 的 abort（RPC `abort` 不跟 `clear_queue`）
+  不会清 pi 的 steering 队列，被我们退回重发的批次可能与 pi 稍后补投的旧消息重复。有意选择「宁重勿丢」；
+  若要根治，需要能区分「pi 队列已被清空」与「只是被中断」的信号。
+- **（待评估）精简防轮询文案**：「禁止轮询」目前在 description、5 条 guideline、`bg` 的 snippet/guideline、
+  转后台结果里多处重复，是为压制轮询而刻意加的。精简前先写脚本扫本机 session jsonl，统计「转后台之后、
+  完成通知到达之前」模型调用 `sleep`/`wait` 与 `bg list/logs` 的次数作为基线；之后任何改动用同一脚本
+  对比是否回潮。倾向：只合并同一层里的字面重复（如 bash guideline #5 与 bg guideline #1），转后台结果里
+  那段（离决策点最近）不动。
+- **（待调研）收到用户插话时提前转后台**：omp 的前台等待会同时竞速 `steeringSignal`，用户在长命令
+  等待期间插话时立即转后台、让消息尽快注入。需先确认 pi 扩展 API 是否暴露 steering 到达信号
+  （或能否从 `hasPendingMessages()` 轮询近似）。
+- **主题配色**：通知卡片按结果取 `toolSuccessBg` / `toolErrorBg` / `toolPendingBg`，但 gruvbox-dark 主题
+  里这三个都是 `dark0Soft`，成功 / 失败底色无区别，只能靠行首 ✓ / ✗ 颜色区分。改主题即可，不涉及代码。
 
 ## 本地开发
 
