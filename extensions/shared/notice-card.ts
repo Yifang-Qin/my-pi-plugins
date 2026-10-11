@@ -44,7 +44,7 @@ export function expandHint(expanded: boolean): string {
 	} catch {
 		/* keybindings not initialized */
 	}
-	return expanded ? `点击或 ${key} 收起` : `点击或 ${key} 展开`;
+	return expanded ? `click or ${key} to collapse` : `click or ${key} to expand`;
 }
 
 export interface NoticeCardOptions {

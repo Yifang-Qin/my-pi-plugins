@@ -159,16 +159,16 @@ class BgPanel implements Component {
 		let level: "info" | "warning";
 		if (job?.status === "completed") {
 			// 杀之前刚好自然完成：handleCompletion 已发过完成通知，这里不再重复通知 assistant。
-			msg = `任务 ${windowId} 已完成（exit ${job.exitCode ?? "?"}），无需 kill`;
+			msg = `Job ${windowId} already completed (exit ${job.exitCode ?? "?"}); nothing to kill`;
 			level = "info";
 		} else if (ok) {
 			markJobKilled(this.state, windowId);
-			msg = `已 kill ${windowId}`;
+			msg = `Killed ${windowId}`;
 			level = "info";
 			// 确实杀掉了一个运行中任务 → 通知 assistant（用户手动 kill，附杀前读好的尾部输出）。
 			if (info) this.onUserKill(info, logs);
 		} else {
-			msg = `窗口 ${windowId} 已不存在（可能已结束）`;
+			msg = `Window ${windowId} no longer exists (it may have already finished)`;
 			level = "warning";
 		}
 		this.notice = msg; // 面板内即时反馈
@@ -231,7 +231,7 @@ class BgPanel implements Component {
 		} else if (matchesKey(data, "x")) {
 			const job = this.currentJob();
 			if (job && isKillable(job)) this.confirmKillWindow = job.windowId;
-			else if (job) this.notice = `任务已${job.status === "killed" ? "终止" : "结束"}，无需 kill`;
+			else if (job) this.notice = `Job already ${job.status === "killed" ? "killed" : "finished"}; nothing to kill`;
 		} else {
 			return;
 		}
@@ -320,14 +320,14 @@ class BgPanel implements Component {
 		sep: string,
 	): string[] {
 		const running = this.jobs.filter((j) => j.status === "running").length;
-		const titleText = ` ${th.fg("accent", "⏻ 后台任务")}  ${th.fg("muted", `${running} 运行中 / ${this.jobs.length} 共`)}`;
+		const titleText = ` ${th.fg("accent", "⏻ background jobs")}  ${th.fg("muted", `${running} running / ${this.jobs.length} total`)}`;
 		const notice = this.notice ? `  ${th.fg("warning", this.notice)}` : "";
 
 		const lines: string[] = [top, row(titleText + notice), sep];
 
 		if (this.jobs.length === 0) {
 			lines.push(row(""));
-			lines.push(row(` ${th.fg("muted", "（当前会话没有后台任务）")}`));
+			lines.push(row(` ${th.fg("muted", "(no background jobs in this session)")}`));
 			for (let i = 3; i < bodyRows; i++) lines.push(row(""));
 		} else {
 			// 让选中项保持可见的滚动窗口。
@@ -391,12 +391,12 @@ class BgPanel implements Component {
 		sep: string,
 	): string[] {
 		const job = this.outputJob();
-		const statusText = job ? fmtJobStatus(job) : "已结束";
+		const statusText = job ? fmtJobStatus(job) : "finished";
 		// 标题长度自适应：先算固定部分（id + 状态）占宽，剩下的全给命令预览。
-		const headPlain = ` 输出 ${this.outputWindowId ?? ""} ·   [${statusText}]`;
+		const headPlain = ` output ${this.outputWindowId ?? ""} ·   [${statusText}]`;
 		const cmdBudget = Math.max(8, innerW - visibleWidth(headPlain));
 		const cmdPreview = truncateToWidth(this.outputCommand, cmdBudget, "…");
-		const titleText = ` ${th.fg("accent", "输出")} ${th.fg("muted", `${this.outputWindowId ?? ""} · ${cmdPreview}`)}  ${th.fg("muted", `[${statusText}]`)}`;
+		const titleText = ` ${th.fg("accent", "output")} ${th.fg("muted", `${this.outputWindowId ?? ""} · ${cmdPreview}`)}  ${th.fg("muted", `[${statusText}]`)}`;
 		const lines: string[] = [top, row(titleText), sep];
 
 		// 跟随尾部时把 scroll 钉到底部。
@@ -416,7 +416,7 @@ class BgPanel implements Component {
 	// 底部提示行；kill 确认态时改显确认提示。
 	private footer(th: Theme, innerW: number, hint: string): string {
 		const content = this.confirmKillWindow
-			? ` ${th.fg("error", `⚠ kill ${this.confirmKillWindow} ?`)}  ${th.fg("accent", "y")} 确认 · ${th.fg("accent", "n")} 取消`
+			? ` ${th.fg("error", `⚠ kill ${this.confirmKillWindow} ?`)}  ${th.fg("accent", "y")} confirm · ${th.fg("accent", "n")} cancel`
 			: ` ${hint}`;
 		return th.fg("border", "│") + padVisible(truncateToWidth(toSingleLine(content), innerW), innerW) + th.fg("border", "│");
 	}
@@ -424,16 +424,16 @@ class BgPanel implements Component {
 	private listHint(th: Theme): string {
 		return th.fg(
 			"muted",
-			`↑↓ 选择 · ${th.fg("dim", "Enter")} 看输出 · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} 退出`,
+			`↑↓ select · ${th.fg("dim", "Enter")} view output · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} close`,
 		);
 	}
 
 	private outputHint(th: Theme, start: number): string {
-		const follow = this.outputFollow ? th.fg("success", "跟随尾部") : th.fg("dim", `行 ${start + 1}+`);
-		const trunc = this.outputTruncated && this.outputFullPath ? th.fg("dim", ` · 完整日志: ${this.outputFullPath}`) : "";
+		const follow = this.outputFollow ? th.fg("success", "following tail") : th.fg("dim", `line ${start + 1}+`);
+		const trunc = this.outputTruncated && this.outputFullPath ? th.fg("dim", ` · full log: ${this.outputFullPath}`) : "";
 		return th.fg(
 			"muted",
-			`↑↓/PgUp/PgDn 滚动 · ${follow} · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} 返回${trunc}`,
+			`↑↓/PgUp/PgDn scroll · ${follow} · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} back${trunc}`,
 		);
 	}
 

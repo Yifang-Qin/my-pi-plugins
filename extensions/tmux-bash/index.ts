@@ -268,7 +268,7 @@ export default function (pi: ExtensionAPI): void {
 		if (multi && /^\d+ background jobs finished/.test(lines[0] ?? "")) lines = lines.slice(lines[1] === "" ? 2 : 1);
 		const foldable = multi || lines.length > COMPLETION_FOLD_HEAD + COMPLETION_FOLD_TAIL + 2;
 		const label = theme.fg("accent", theme.bold("⏻ background bash")) + (multi ? theme.fg("muted", ` · ${items.length} jobs`) : "");
-		const hint = (expanded: boolean) => theme.fg("dim", `（${expandHint(expanded)}）`);
+		const hint = (expanded: boolean) => theme.fg("dim", `(${expandHint(expanded)})`);
 
 		const body = (expanded: boolean): string => {
 			// 合并通知折叠态：每个任务一行状态（✓ / ✗ / ⊘ · 耗时 · 命令），展开看各自输出。
@@ -282,7 +282,7 @@ export default function (pi: ExtensionAPI): void {
 			const head = lines.slice(0, COMPLETION_FOLD_HEAD).map((l) => theme.fg("toolOutput", l));
 			const tail = lines.slice(-COMPLETION_FOLD_TAIL).map((l) => theme.fg("toolOutput", l));
 			const omitted = lines.length - COMPLETION_FOLD_HEAD - COMPLETION_FOLD_TAIL;
-			return [label, ...head, theme.fg("muted", `  … +${omitted} 行`) + " " + hint(false), ...tail].join("\n");
+			return [label, ...head, theme.fg("muted", `  … +${omitted} lines`) + " " + hint(false), ...tail].join("\n");
 		};
 
 		// 卡片底色按结果选：有失败 → toolErrorBg；全是用户 kill → toolPendingBg；否则 toolSuccessBg。
@@ -616,11 +616,11 @@ export default function (pi: ExtensionAPI): void {
 	// —— /bg 面向用户的交互面板（overlay：列表 → Enter 看输出 / x kill）—— //
 	// 组件实现见 bg-panel.ts；与模型用的 `bg` 工具共用同一套 runtime helper。
 	pi.registerCommand("bg", {
-		description: "查看/管理后台 bash 任务（列表、看输出、kill）",
+		description: "View/manage background bash jobs (list, view output, kill)",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
 			if (!tmuxAvailable(state.options)) {
-				ctx.ui.notify("tmux 不可用：请安装 tmux 并确保在 PATH 中。", "error");
+				ctx.ui.notify("tmux is not available: install tmux and make sure it is on PATH.", "error");
 				return;
 			}
 			await openBgPanel(pi, state, ctx, (n) => setBgStatus(ctx, n));

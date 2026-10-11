@@ -191,7 +191,7 @@ __tmux=${shellQuote(params.tmuxBinary)}
 __window_id=$("$__tmux" display-message -p -t "\${TMUX_PANE:-}" '#{window_id}' 2>/dev/null || printf '@0')
 __exit_file="$__run_dir/$__id.$__window_id"
 __out_file="$__exit_file.out"
-# 收紧内部文件权限（0o600），且只在子 shell 里临时改 umask——不影响下面用户命令自己创建的文件。
+# Tighten internal file permissions (0o600). umask is changed only inside a subshell, so files created by the user's command below are unaffected.
 ( umask 077; : > "$__out_file" )
 printf '$ %s\\n' ${shellQuote(params.displayCommand)}
 ${params.envExports}
@@ -199,10 +199,10 @@ ${params.envExports}
 ${hardening}${params.command}
 ) ${stdinRedirect}2>&1 | tee -a "$__out_file"
 __rc=\${PIPESTATUS[0]}
-# 先写 .tmp 再 mv，保证 fs.watch 看到的是完整的哨兵文件（原子出现）；同样局部 umask 收紧权限，mv 会保留 0o600。
+# Write to .tmp and then mv, so fs.watch only ever sees a complete sentinel file (it appears atomically). Same scoped umask to tighten permissions; mv preserves 0o600.
 ( umask 077; printf '%s\\n' "$__rc" > "$__exit_file.tmp" )
 mv -f "$__exit_file.tmp" "$__exit_file"
-# 命令结束后保持窗口存活、可 attach（autoClose 关闭时才真正有意义）。
+# Keep the window alive after the command finishes so it can be attached to (only matters when autoClose is off).
 exec "\${SHELL:-/bin/bash}" -l 2>/dev/null || exec bash -l
 `;
 }

@@ -910,10 +910,10 @@ export default function (pi: ExtensionAPI) {
 					const who = `${it.taskId ?? "?"} (${it.agent ?? "?"}${it.topic ? ` — ${it.topic}` : ""})`;
 					return `  ${icon} ${theme.fg("toolOutput", who)} ${theme.fg("muted", it.status ?? "")}`;
 				});
-				return [label, ...rows, theme.fg("dim", `（${expandHint(false)}）`)].join("\n");
+				return [label, ...rows, theme.fg("dim", `(${expandHint(false)})`)].join("\n");
 			}
 			const lines = text.split("\n").map((l) => theme.fg("toolOutput", l));
-			return [label, ...lines, ...(multi ? [theme.fg("dim", `（${expandHint(true)}）`)] : [])].join("\n");
+			return [label, ...lines, ...(multi ? [theme.fg("dim", `(${expandHint(true)})`)] : [])].join("\n");
 		};
 		const failed = items.some((it) => it.status && it.status !== "completed");
 		return renderNoticeCard(message, options, theme, {
@@ -953,11 +953,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(SA_STATUS_KEY, undefined);
 	};
 	pi.registerCommand("subagent", {
-		description: "查看/管理 subagent 任务（parallel/chain/background 的轨迹与终止）",
+		description: "View/manage subagent tasks (traces and kill for parallel/chain/background runs)",
 		handler: openPanel,
 	});
 	pi.registerCommand("sa", {
-		description: "查看/管理 subagent 任务（/subagent 的简写）",
+		description: "View/manage subagent tasks (shorthand for /subagent)",
 		handler: openPanel,
 	});
 

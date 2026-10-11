@@ -235,13 +235,13 @@ class SubagentPanel implements Component {
 		let msg: string;
 		let level: "info" | "warning";
 		if (r === "killed") {
-			msg = `已终止 ${id}`;
+			msg = `Killed ${id}`;
 			level = "info";
 		} else if (r === "not-running") {
-			msg = `${id} 已结束，无需终止`;
+			msg = `${id} already finished; nothing to kill`;
 			level = "info";
 		} else {
-			msg = `未找到任务 ${id}`;
+			msg = `Task ${id} not found`;
 			level = "warning";
 		}
 		this.notice = msg;
@@ -299,7 +299,7 @@ class SubagentPanel implements Component {
 		} else if (matchesKey(data, "x")) {
 			const t = this.currentTask();
 			if (t?.killable) this.confirmKillId = t.id;
-			else if (t) this.notice = `任务已${t.status === "cancelled" ? "终止" : "结束"}，无需 kill`;
+			else if (t) this.notice = `Task already ${t.status === "cancelled" ? "cancelled" : "finished"}; nothing to kill`;
 		} else {
 			return;
 		}
@@ -391,13 +391,13 @@ class SubagentPanel implements Component {
 		sep: string,
 	): string[] {
 		const running = this.runningNow();
-		const titleText = ` ${th.fg("accent", "⚙ subagent 任务")}  ${th.fg("muted", `${running} 运行中 / ${this.tasks.length} 共`)}`;
+		const titleText = ` ${th.fg("accent", "⚙ subagent tasks")}  ${th.fg("muted", `${running} running / ${this.tasks.length} total`)}`;
 		const notice = this.notice ? `  ${th.fg("warning", this.notice)}` : "";
 		const lines: string[] = [top, row(titleText + notice), sep];
 
 		if (this.tasks.length === 0) {
 			lines.push(row(""));
-			lines.push(row(` ${th.fg("muted", "（当前没有 subagent 任务）")}`));
+			lines.push(row(` ${th.fg("muted", "(no subagent tasks)")}`));
 			for (let i = 3; i < bodyRows; i++) lines.push(row(""));
 		} else {
 			let start = 0;
@@ -448,8 +448,8 @@ class SubagentPanel implements Component {
 		sep: string,
 	): string[] {
 		const t = this.outputTask();
-		const statusText = t ? t.status : "已结束";
-		const titleText = ` ${th.fg("accent", "轨迹")} ${th.fg("muted", this.outputTitle)}  ${th.fg("muted", `[${statusText}]`)}`;
+		const statusText = t ? t.status : "finished";
+		const titleText = ` ${th.fg("accent", "trace")} ${th.fg("muted", this.outputTitle)}  ${th.fg("muted", `[${statusText}]`)}`;
 		const lines: string[] = [top, row(titleText), sep];
 
 		if (this.outputFollow) this.outputScroll = this.maxOutputScroll();
@@ -467,7 +467,7 @@ class SubagentPanel implements Component {
 
 	private footer(th: Theme, innerW: number, hint: string): string {
 		const content = this.confirmKillId
-			? ` ${th.fg("error", `⚠ kill ${this.confirmKillId} ?`)}  ${th.fg("accent", "y")} 确认 · ${th.fg("accent", "n")} 取消`
+			? ` ${th.fg("error", `⚠ kill ${this.confirmKillId} ?`)}  ${th.fg("accent", "y")} confirm · ${th.fg("accent", "n")} cancel`
 			: ` ${hint}`;
 		return th.fg("border", "│") + padVisible(truncateToWidth(toSingleLine(content), innerW), innerW) + th.fg("border", "│");
 	}
@@ -475,15 +475,15 @@ class SubagentPanel implements Component {
 	private listHint(th: Theme): string {
 		return th.fg(
 			"muted",
-			`↑↓ 选择 · ${th.fg("dim", "Enter")} 看轨迹 · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} 退出`,
+			`↑↓ select · ${th.fg("dim", "Enter")} view trace · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} close`,
 		);
 	}
 
 	private outputHint(th: Theme, start: number): string {
-		const follow = this.outputFollow ? th.fg("success", "跟随尾部") : th.fg("dim", `行 ${start + 1}+`);
+		const follow = this.outputFollow ? th.fg("success", "following tail") : th.fg("dim", `line ${start + 1}+`);
 		return th.fg(
 			"muted",
-			`↑↓/PgUp/PgDn 滚动 · ${follow} · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} 返回`,
+			`↑↓/PgUp/PgDn scroll · ${follow} · ${th.fg("dim", "x")} kill · ${th.fg("dim", "Esc")} back`,
 		);
 	}
 
