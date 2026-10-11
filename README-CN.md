@@ -87,7 +87,7 @@ fork 自 pi 官方 todo 示例、自维护演进。任务按 **phase → task �
 | `rm` | `id` 或 `phase`，都不传则删除全部 | 删除目标任务及空 phase |
 | `view` / `clear` | 无 | 查看完整计划 / 清空整份计划 |
 
-**参数宽容度**：不适用于当前 action 的字段一律忽略（如 `done` 带 `reason`、`view` 带 `items`），只有三类「目标歧义」会报错：`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase`；`clear` 带了目标（会提示改用 `rm`，避免误清整份计划）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
+**参数宽容度**：schema 校验前先剔除不适用于当前 action 的字段（如 `done` 带 `reason`、`view` 带 `items`、值为 `null` 的字段），避免「把所有可选参数都填上占位值」的模型陷入重试死循环。`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase` 时以 `id` 为准，除非 `phase` 指向**另一个**已存在的 phase。只有这几类「目标歧义」会报错：`id` 与 `phase` 指向不同的已存在目标；两者都显式为空（`null` / `""`，不会静默放大成「全部任务」）；`clear` 带了目标（会提示改用 `rm`，避免误清整份计划）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）。报错文案会回显出错的值，失败提醒里附带收到的参数。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
 
 ```json
 {"action":"init","phases":[{"name":"调研","items":["核对接口","确认边界"]},{"name":"实现","items":["完成改动","验证行为"]}]}

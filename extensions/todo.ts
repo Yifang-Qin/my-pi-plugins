@@ -30,6 +30,7 @@ import {
 	isActionable,
 	isClosed,
 	plainTodoText,
+	prepareTodoArguments,
 	readTodoSnapshot,
 	restoreTodos,
 	snapshotText,
@@ -55,7 +56,7 @@ Use the \`todo\` tool for non-trivial work or 3+ steps. Organize tasks into phas
 - \`block\` (id or phase, reason?): record an external wait; closed tasks stay closed. \`unblock\` returns blocked tasks to pending.
 - \`rm\` (id or phase or neither): remove tasks and empty phases. \`clear\`: remove the whole plan.
 - \`view\`: read the full plan, including closed tasks and their IDs.
-Fields that don't apply to the action are ignored. For done/drop/block/unblock/rm pass either id or phase, never both.
+Only send the fields the action uses; omit the rest instead of filling them with placeholders ("ignored", "none", "", [], null). For done/drop/block/unblock/rm target a single task with id, or a whole phase with phase.
 After each mutation the tool keeps at most one in_progress task, and automatically starts the earliest pending task when none is active. Blocked tasks never start automatically.
 Mark done immediately and continue with the next action in the same turn. Pair planning/updates with actual work; don't spend a turn only on todo bookkeeping.
 Before the final response, reconcile the plan. Clear it if all tasks are completed or abandoned; otherwise preserve remaining tasks (including blocked ones) and explain them to the user.`;
@@ -395,8 +396,11 @@ export default function (pi: ExtensionAPI) {
 		name: "todo",
 		label: "Todo",
 		description:
-			"Manage a two-level phase/task plan. init replaces phases [{name,items[]}], and also accepts a flat items[] (optionally with phase) as a single-phase plan; append adds items to a phase. start requires id; done/drop/rm target id, phase, or all when neither is given. block/unblock require id or phase; block accepts reason. view returns all IDs; clear removes the whole plan. Fields that don't apply are ignored; for done/drop/block/unblock/rm pass either id or phase. Mutations are atomic and auto-start the earliest pending task if none is active. Status: pending/in_progress/completed/abandoned/blocked; IDs stay unique across init/clear on the current branch.",
+			"Manage a two-level phase/task plan. init replaces phases [{name,items[]}], and also accepts a flat items[] (optionally with phase) as a single-phase plan; append adds items to a phase. start requires id; done/drop/rm target id, phase, or all when neither is given. block/unblock require id or phase; block accepts reason. view returns all IDs; clear removes the whole plan. Only send the fields the action uses — omit the rest, never fill them with placeholders. Mutations are atomic and auto-start the earliest pending task if none is active. Status: pending/in_progress/completed/abandoned/blocked; IDs stay unique across init/clear on the current branch.",
 		parameters: TodoSchema,
+		// Some models fill every optional field (e.g. phase:"ignored" next to id); drop fields the
+		// action doesn't use before validation instead of failing the call in a retry loop.
+		prepareArguments: prepareTodoArguments,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			let result: ReturnType<typeof applyTodo>;
@@ -417,7 +421,8 @@ export default function (pi: ExtensionAPI) {
 								text:
 									"<system-reminder>\nThe todo call failed, so the plan is unchanged and its progress is not visible to the user.\n" +
 									`Failure: ${error instanceof Error ? error.message : String(error)}\n` +
-									"Fix the arguments and call todo again before continuing.\n</system-reminder>",
+									`Arguments received: ${JSON.stringify(params)}\n` +
+									"Fix the arguments (send only the fields this action uses) and call todo again before continuing.\n</system-reminder>",
 							},
 						],
 					},
@@ -453,7 +458,8 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", plainTodoText(String(args.action ?? "")));
 			if (args.id !== undefined) text += ` ${theme.fg("accent", `#${args.id}`)}`;
-			if (typeof args.phase === "string") text += ` ${plainTodoText(args.phase)}`;
+			// Label the phase so a stray value (e.g. "ignored") reads as an argument, not a status.
+			if (typeof args.phase === "string") text += ` ${theme.fg("dim", "phase:")}${plainTodoText(args.phase)}`;
 			if (Array.isArray(args.phases)) text += theme.fg("dim", ` (${args.phases.length} phases)`);
 			if (Array.isArray(args.items)) text += theme.fg("dim", ` (+${args.items.length} tasks)`);
 			if (typeof old.text === "string") text += ` ${plainTodoText(old.text)}`;

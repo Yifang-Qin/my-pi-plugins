@@ -48,7 +48,7 @@ export const TodoSchema = Type.Object(
 			Type.Integer({
 				minimum: 1,
 				maximum: Number.MAX_SAFE_INTEGER - 1,
-				description: "Task ID from the latest result; for done/drop/block/unblock/rm pass either id or phase",
+				description: "Task ID from the latest result; to target one task send id and omit phase",
 			}),
 		),
 		phase: Type.Optional(
@@ -121,18 +121,90 @@ const DUAL_TARGET: readonly TodoParams["action"][] = ["done", "drop", "block", "
 /** 扁平 init 的默认 phase 名。 */
 const DEFAULT_PHASE = "Tasks";
 
+/**
+ * Fields each action actually reads. Anything else is dropped before schema validation, so
+ * models that fill every parameter (with placeholders, nulls or empty arrays) don't trip
+ * conflict checks on fields that were never meant to apply.
+ * `clear` keeps id/phase on purpose: "clear phase X" almost always means `rm`, and must not
+ * silently wipe the whole plan.
+ */
+const ACTION_FIELDS: Record<TodoParams["action"], readonly string[]> = {
+	init: ["phases", "items", "phase"],
+	append: ["phase", "items"],
+	start: ["id"],
+	done: ["id", "phase"],
+	drop: ["id", "phase"],
+	block: ["id", "phase", "reason"],
+	unblock: ["id", "phase"],
+	rm: ["id", "phase"],
+	view: [],
+	clear: ["id", "phase"],
+};
+
+const isBlank = (value: unknown): boolean =>
+	value === null || value === undefined || (typeof value === "string" && plainTodoText(value) === "");
+
+/**
+ * `prepareArguments` shim, runs before schema validation:
+ * - drops fields that don't apply to the action (and `null` values);
+ * - for id/phase targeting, a blank `phase` next to a real `id` (or a `null` id next to a real
+ *   phase) is treated as omitted. When *both* targets are explicitly blank it throws instead —
+ *   falling through to "no target = every task" would be the dangerous direction.
+ */
+export function prepareTodoArguments(args: unknown): TodoParams {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return args as TodoParams;
+	const raw = args as Record<string, unknown>;
+	const action = raw.action as TodoParams["action"];
+	if (!TODO_ACTIONS.includes(action)) return args as TodoParams;
+	const allowed = ACTION_FIELDS[action];
+	const out: Record<string, unknown> = { action };
+	for (const key of allowed) if (raw[key] !== null && raw[key] !== undefined) out[key] = raw[key];
+	if (allowed.includes("id") && allowed.includes("phase")) {
+		const hasId = !isBlank(raw.id);
+		const hasPhase = !isBlank(raw.phase);
+		if (hasId && !hasPhase) delete out.phase;
+		if (!hasId && hasPhase) delete out.id;
+		if (!hasId && !hasPhase && ("id" in raw || "phase" in raw)) {
+			throw new Error(
+				`${action}: id and phase are both empty. Pass id for one task or phase for a whole phase; ` +
+					"to target every task, omit both fields entirely.",
+			);
+		}
+	}
+	return out as TodoParams;
+}
+
 /** 在副本上执行；校验失败直接 throw，调用方只提交成功返回的 state。 */
 export function applyTodo(
 	state: TodoState,
 	params: TodoParams,
 ): { state: TodoState; message: string; touchedPhases: string[] } {
 	if (!TODO_ACTIONS.includes(params.action)) throw new Error(`Unknown todo action: ${params.action}`);
-	// 不适用于当前 action 的字段一律忽略；只有「目标歧义」才报错。
+	// Fields that don't apply to the action are ignored. With both id and phase, id wins unless
+	// phase names a *different* existing phase: a phase that doesn't exist (typically a filler
+	// such as "ignored" / "none") or the task's own phase is no real ambiguity.
 	if (DUAL_TARGET.includes(params.action) && params.id !== undefined && params.phase !== undefined) {
-		throw new Error("Use either id or phase, not both");
+		const name = plainTodoText(params.phase);
+		const named = state.phases.find((phase) => phase.name === name);
+		if (named && !named.tasks.some((task) => task.id === params.id)) {
+			const owner = state.phases.find((phase) => phase.tasks.some((task) => task.id === params.id));
+			throw new Error(
+				`Conflicting targets: got id=${params.id}${owner ? ` (in phase "${owner.name}")` : ""} and ` +
+					`phase="${name}". Send only id to target one task, or only phase to target a whole phase.`,
+			);
+		}
+		params = { ...params, phase: undefined };
 	}
 	if (params.action === "clear" && (params.id !== undefined || params.phase !== undefined)) {
-		throw new Error("clear removes the whole plan; use rm with id or phase to remove specific tasks");
+		const got = [
+			params.id !== undefined ? `id=${params.id}` : "",
+			params.phase !== undefined ? `phase=${JSON.stringify(params.phase)}` : "",
+		]
+			.filter(Boolean)
+			.join(", ");
+		throw new Error(
+			`clear takes no target (got ${got}) and removes the whole plan; use rm with id or phase to remove specific tasks`,
+		);
 	}
 	const next = cloneState(state);
 	const touched = new Set<string>();

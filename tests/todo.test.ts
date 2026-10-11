@@ -14,6 +14,7 @@ import {
 	allTasks,
 	applyTodo,
 	emptyTodoState,
+	prepareTodoArguments,
 	readTodoSnapshot,
 	restoreTodos,
 	snapshotText,
@@ -158,7 +159,7 @@ test("扁平 init 合成默认 phase；无关参数被忽略；目标歧义仍�
 test("目标歧义和缺少必填参数必须报错，不能误操作全部任务", () => {
 	const state = init();
 	for (const params of [
-		{ action: "done", id: 1, phase: "调研" },
+		{ action: "done", id: 1, phase: "实现" }, // #1 is in 调研: id and phase point at different targets
 		{ action: "clear", id: 1 },
 		{ action: "clear", phase: "调研" },
 		{ action: "start" },
@@ -689,4 +690,32 @@ test("compaction 后补注入：有计划补状态摘要，没计划重申 eager
 	h.setActive([]);
 	await h.compact();
 	assert.equal(h.sent.length, 2);
+});
+
+test("placeholder-filled args (phase:'ignored' next to id) don't trap the model in a retry loop", () => {
+	// Regression: a model filled every field and kept sending
+	// { action: "done", id: 1, phase: "ignored", phases: [], items: [] } -> "Use either id or phase".
+	const prepared = prepareTodoArguments({ action: "done", id: 1, phase: "ignored", phases: [], items: [], reason: null });
+	assert.deepEqual(prepared, { action: "done", id: 1, phase: "ignored" }); // irrelevant fields dropped
+	assert.deepEqual(statuses(applyTodo(init(), prepared).state).slice(0, 2), ["completed", "in_progress"]);
+	// id + the task's own phase is not ambiguous either.
+	assert.equal(statuses(applyTodo(init(), { action: "done", id: 1, phase: "调研" }).state)[1], "in_progress");
+	// Blank / null phase next to an id is treated as omitted; a null id next to a phase likewise.
+	assert.deepEqual(prepareTodoArguments({ action: "drop", id: 2, phase: "" }), { action: "drop", id: 2 });
+	assert.deepEqual(prepareTodoArguments({ action: "rm", id: null, phase: "调研" }), { action: "rm", phase: "调研" });
+	// Both targets explicitly blank must not widen to "every task".
+	assert.throws(() => prepareTodoArguments({ action: "done", id: null, phase: "  " }), /both empty/);
+	// Omitting both entirely still means "every task".
+	assert.deepEqual(prepareTodoArguments({ action: "done", phases: [] }), { action: "done" });
+	// Other actions: unrelated fields dropped, start ignores phase, clear keeps its guard.
+	assert.deepEqual(prepareTodoArguments({ action: "view", id: 1, phase: "x", items: [] }), { action: "view" });
+	assert.deepEqual(prepareTodoArguments({ action: "start", id: 3, phase: "ignored" }), { action: "start", id: 3 });
+	assert.throws(() => applyTodo(init(), { action: "clear", phase: "ignored" }), /phase="ignored"/);
+	// The conflict error echoes both values so the model can see what to drop.
+	assert.throws(
+		() => applyTodo(init(), { action: "done", id: 1, phase: "实现" }),
+		/id=1 \(in phase "调研"\).*phase="实现"/,
+	);
+	// The registered tool wires the shim in.
+	assert.equal(harness("json").tool.prepareArguments, prepareTodoArguments);
 });
