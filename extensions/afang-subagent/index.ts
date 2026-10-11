@@ -31,6 +31,8 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { makeBgNotifyFramer } from "../shared/bg-notify.js";
+import { expandHint, renderNoticeCard } from "../shared/notice-card.js";
+import { createNotifyQueue, truncateUtf8Head, type NotifyQueue, type RenderedItem } from "../shared/notify-queue.js";
 import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents, discoverBuiltinAgents } from "./agents.ts";
 import { processChildEvent } from "./child-events.ts";
 import { openSubagentPanel } from "./subagent-panel.ts";
@@ -398,11 +400,14 @@ const BG_NOTIFY_CUSTOM_TYPE = "afang-subagent-notify";
 // 与 tmux-bash 共用；这里只定制引言文案。为什么需要框，见该共享模块头注释。
 const { frame: frameBgNotify, strip: stripBgNotifyFrame } = makeBgNotifyFramer(
 	"System notification from the subagent extension — NOT a message from the user. Background subagent " +
-		"task(s) you started earlier have finished; their results are below. Treat it as a status update: use " +
-		"it if relevant to the current task, otherwise acknowledge briefly and continue.",
+		"task(s) you started earlier have finished; their results are below in completion order. Treat it as a " +
+		"status update: use it if relevant to the current task, otherwise acknowledge briefly and continue.",
 );
 const BG_MAX_TASKS = 4;
-const BG_NOTIFY_DEBOUNCE_MS = 400;
+// 合并通知的预算（与 tmux-bash 同一组数值）：单条 12KB、整条 24KB、每条至少 1KB、空闲攒批 300ms。
+// 子 agent 的预览本身还受 BG_NOTIFY_PREVIEW_CHARS 限制，单条上限通常碰不到。
+const BG_NOTIFY_ITEM_MAX_BYTES = 12 * 1024;
+const BG_NOTIFY_IDLE_DEBOUNCE_MS = 300;
 const BG_NOTIFY_PREVIEW_CHARS = 2000;
 const BG_RESULT_INLINE_CAP = 10 * 1024;
 
@@ -564,9 +569,10 @@ export function killSubagentTask(id: string): "killed" | "not-running" | "unknow
 	}
 	return "unknown";
 }
-let piApi: ExtensionAPI | null = null;
-const pendingBgNotify: BgTask[] = [];
-let bgNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+// 完成通知的自管投递队列（合并成一条、确认送达才出队、Esc 后随下次输入补投；见 ../shared/notify-queue.ts）。
+// 取代旧的「400ms 防抖 + 直接 steer」：后者在一次长工具调用期间完成的多个任务仍会被
+// steeringMode=one-at-a-time 拆成多轮，且按 Esc 会被 pi 清队列静默丢掉。
+let bgNotifier: NotifyQueue<BgTask> | null = null;
 
 // Kill children left behind by a previous extension instance (e.g. /reload).
 // The registry lives on globalThis so it survives module re-instantiation.
@@ -654,15 +660,15 @@ function writeBgResultFileTo(t: BgTask, dir: string): void {
 	t.resultFile = file;
 }
 
-function formatBgCompletion(t: BgTask): string {
+function formatBgCompletion(t: BgTask, budgetBytes: number): RenderedItem {
 	const output = getResultOutput(t.result);
-	const preview =
-		output.length > BG_NOTIFY_PREVIEW_CHARS
-			? `${output.slice(0, BG_NOTIFY_PREVIEW_CHARS)}\n…[truncated]`
-			: output;
+	const byChars = output.length > BG_NOTIFY_PREVIEW_CHARS ? output.slice(0, BG_NOTIFY_PREVIEW_CHARS) : output;
+	const byBytes = truncateUtf8Head(byChars, budgetBytes);
+	const truncated = byChars !== output || byBytes.truncated;
+	const preview = truncated ? `${byBytes.text}\n…[truncated]` : output;
 	const usage = formatUsageStats(t.result.usage, t.result.model);
 	const harness = formatHarnessStats(t.result);
-	return [
+	const text = [
 		`**${t.id}** (${t.agentName}${t.topic ? ` — ${t.topic}` : ""}) — ${t.status}`,
 		preview.trim() || "(no output)",
 		usage,
@@ -673,31 +679,34 @@ function formatBgCompletion(t: BgTask): string {
 	]
 		.filter(Boolean)
 		.join("\n");
+	return { text, truncated: byBytes.truncated };
 }
 
-function flushBgNotify(): void {
-	bgNotifyTimer = null;
-	const items = pendingBgNotify.splice(0);
-	if (items.length === 0 || !piApi) return;
-	const header =
-		items.length === 1 ? "Background subagent task finished:" : `Background subagent tasks finished (${items.length}):`;
-	const content = [header, "", ...items.map(formatBgCompletion)].join("\n\n");
-	try {
-		piApi.sendMessage(
-			{ customType: BG_NOTIFY_CUSTOM_TYPE, content: frameBgNotify(content), display: true, details: { taskIds: items.map((t) => t.id) } },
-			// 与 tmux-bash 对齐：当前工具批次结束后、下一次 LLM 调用前投递，避免 followUp
-			// 因主 Agent 持续调用工具而长期饥饿。
-			{ triggerTurn: true, deliverAs: "steer" },
-		);
-	} catch {
-		/* session may be shutting down */
-	}
+function bgIndexLine(t: BgTask): string {
+	const where = t.resultFile ? ` or read ${t.resultFile}` : "";
+	return `- ${t.id} (${t.agentName}${t.topic ? ` — ${t.topic}` : ""}) — ${t.status} · full result: subagent_tasks {action:"result", id:"${t.id}"}${where}`;
+}
+
+function createBgNotifier(pi: ExtensionAPI): NotifyQueue<BgTask> {
+	return createNotifyQueue<BgTask>(pi, {
+		customType: BG_NOTIFY_CUSTOM_TYPE,
+		frame: frameBgNotify,
+		header: (count) =>
+			count === 1
+				? "Background subagent task finished:"
+				: `Background subagent tasks finished (${count}, in completion order):`,
+		renderItem: formatBgCompletion,
+		indexLine: bgIndexLine,
+		itemDetails: (t) => ({ taskId: t.id, agent: t.agentName, topic: t.topic, status: t.status, resultFile: t.resultFile }),
+		maxItemBytes: BG_NOTIFY_ITEM_MAX_BYTES,
+		totalBudgetBytes: BG_NOTIFY_ITEM_MAX_BYTES * 2,
+		minItemBytes: 1024,
+		idleDebounceMs: BG_NOTIFY_IDLE_DEBOUNCE_MS,
+	});
 }
 
 function scheduleBgNotify(t: BgTask): void {
-	pendingBgNotify.push(t);
-	if (bgNotifyTimer) clearTimeout(bgNotifyTimer);
-	bgNotifyTimer = setTimeout(flushBgNotify, BG_NOTIFY_DEBOUNCE_MS);
+	bgNotifier?.enqueue(t);
 }
 
 function finalizeBgTask(t: BgTask, exitCode: number): void {
@@ -866,7 +875,7 @@ const BgTasksParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
-	piApi = pi;
+	bgNotifier = createBgNotifier(pi);
 
 	// 内建 agent 是注册时就确定的静态集合：扫描一次并写进工具描述，让模型在 system prompt
 	// 里就能看到可用 agent（描述随 /reload 重建，不会过期）；user/project 定制仍在 execute 时
@@ -879,14 +888,39 @@ export default function (pi: ExtensionAPI) {
 		promptPaths: [BUILTIN_PROMPTS_DIR],
 	}));
 
-	pi.registerMessageRenderer(BG_NOTIFY_CUSTOM_TYPE, (message, _options, theme) => {
+	pi.registerMessageRenderer(BG_NOTIFY_CUSTOM_TYPE, (message, options, theme) => {
 		const raw =
 			typeof message.content === "string"
 				? message.content
 				: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
 		// 注入时加的「系统通知框」只给模型看，UI 里剔掉。
-		const text = stripBgNotifyFrame(raw);
-		return new Text(theme.fg("accent", "⏻ background subagent") + "\n" + theme.fg("toolOutput", text), 0, 0);
+		const text = stripBgNotifyFrame(raw).replace(/\s+$/, "");
+		// 合并通知的 details.items（新）；旧会话只有 details.taskIds。
+		type Item = { taskId?: string; agent?: string; topic?: string; status?: string };
+		const items = (message.details as { items?: Item[] } | undefined)?.items ?? [];
+		const multi = items.length > 1;
+		const label =
+			theme.fg("accent", theme.bold("⏻ background subagent")) + (multi ? theme.fg("muted", ` · ${items.length} tasks`) : "");
+		const body = (expanded: boolean): string => {
+			// 多任务折叠态：每个任务一行（✓ completed / ✗ failed），展开看各自 preview。
+			if (!expanded && multi) {
+				const rows = items.map((it) => {
+					const ok = it.status === "completed";
+					const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const who = `${it.taskId ?? "?"} (${it.agent ?? "?"}${it.topic ? ` — ${it.topic}` : ""})`;
+					return `  ${icon} ${theme.fg("toolOutput", who)} ${theme.fg("muted", it.status ?? "")}`;
+				});
+				return [label, ...rows, theme.fg("dim", `（${expandHint(false)}）`)].join("\n");
+			}
+			const lines = text.split("\n").map((l) => theme.fg("toolOutput", l));
+			return [label, ...lines, ...(multi ? [theme.fg("dim", `（${expandHint(true)}）`)] : [])].join("\n");
+		};
+		const failed = items.some((it) => it.status && it.status !== "completed");
+		return renderNoticeCard(message, options, theme, {
+			bg: failed ? "toolErrorBg" : "toolSuccessBg",
+			body,
+			expandable: multi,
+		});
 	});
 
 	pi.on("session_shutdown", () => {

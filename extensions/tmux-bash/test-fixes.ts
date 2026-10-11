@@ -14,6 +14,8 @@
 //  12. 通知框随机边界：payload 里伪造的闭合标签不能结束框、payload 逐字保真、每条边界不同、兼容旧固定标签
 //  13. 通知体积上限：完成/kill 通知正文按 notifyMaxBytes 收尾部 + 截断脚注（含 .out 路径）
 //  14. 自动转后台附输出预览：只给尾部一小段 + 截断标签；无输出时明确写 No output so far.
+//  15. 通知自管队列（真实 tmux 任务）：运行中完成的多个任务在 turn_end 合并成一条；Esc 后不丢、随下次输入补投
+//      （队列状态机的完整单测在 ../shared/test-notify-queue.ts）
 // 用法：仓库根目录执行 `bun extensions/tmux-bash/test-fixes.ts`。
 // ⚠️ 用例 11（非交互加固）必须在**干净环境**里跑：若你是从 pi 的 bash 工具里调用本测试，
 //    当前进程已经带着加固后的 TERM=dumb / PAGER=cat / CI=true…，子进程继承后
@@ -44,6 +46,7 @@ import { loadOptions, stripBgNotifyFrame } from "./config.ts";
 import {
 	AUTO_BG_HEADLINE_PREFIX,
 	capNotificationBody,
+	createBashNotifyQueue,
 	buildWrapperScript,
 	checkBashSyntax,
 	cleanup,
@@ -273,7 +276,12 @@ const fakePi = {
 	sendMessage(message: unknown, options?: { deliverAs?: string; triggerTurn?: boolean }) {
 		sent.push({ message, options });
 	},
+	on() {
+		return () => {};
+	},
 } as unknown as ExtensionAPI;
+// 完成通知经自管队列投递（空闲 → 攒 300ms 后 steer + triggerTurn）。
+bgState.notify = createBashNotifyQueue(fakePi, bgState);
 let statusRefreshes = 0;
 const refreshedRunningCounts: number[] = [];
 startWatcher(bgState, fakePi, () => {
@@ -582,6 +590,56 @@ cleanup(hardenState, "quit");
 	const det2 = r2.details as { windowId?: string };
 	if (det2?.windowId) killWindow(pvState.options, det2.windowId);
 	cleanup(pvState, "quit");
+}
+
+// 15. 通知自管队列 × 真实 tmux 任务：Agent 运行中完成的两个任务，在 turn_end 合并成一条；
+//     Esc（pi 清队列 = 不发 message_end）后不丢，随下一次输入（before_agent_start）补投。
+{
+	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+	const qSent: Array<{ message: { content: string; details: { batchId: string; items: { jobId?: string }[] } }; options?: { deliverAs?: string; triggerTurn?: boolean } }> = [];
+	const qPi = {
+		sendMessage(message: (typeof qSent)[number]["message"], options?: (typeof qSent)[number]["options"]) {
+			qSent.push({ message, options });
+		},
+		on(name: string, fn: (event: unknown, ctx: unknown) => unknown) {
+			handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+			return () => {};
+		},
+	} as unknown as ExtensionAPI;
+	const emit = (name: string, event: Record<string, unknown> = {}, ctx: Record<string, unknown> = {}) => {
+		let result: unknown;
+		for (const fn of handlers.get(name) ?? []) result = fn({ type: name, ...event }, ctx) ?? result;
+		return result;
+	};
+	const qState = createState(loadOptions());
+	resetRunDir(qState, `test-queue-${Date.now()}`);
+	qState.notify = createBashNotifyQueue(qPi, qState);
+	startWatcher(qState, qPi);
+
+	emit("agent_start"); // 模型正在跑（比如一个长前台调用）
+	const j1 = startBackgroundCommand(qState, "sleep 0.2; echo QUEUE-JOB-1", undefined, process.cwd());
+	const j2 = startBackgroundCommand(qState, "sleep 0.6; echo QUEUE-JOB-2", undefined, process.cwd());
+	const until = Date.now() + 5000;
+	while (qState.notify.snapshot().pending < 2 && Date.now() < until) {
+		reconcileCompletedJobs(qState, qPi); // fs.watch 偶发漏事件的兜底（同用例 4 的说明）
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	check("队列：运行中完成的两个任务都在排队", qState.notify.snapshot().pending === 2, JSON.stringify(qState.notify.snapshot()));
+	check("队列：运行中不直接发消息", qSent.length === 0);
+	emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	const merged = qSent[0];
+	const payload = merged ? (parseBgNotifyFrame(merged.message.content)?.payload ?? "") : "";
+	check("队列：turn_end 合并成 1 条", qSent.length === 1, String(qSent.length));
+	check("队列：两条输出都在、按完成先后", payload.indexOf("QUEUE-JOB-1") >= 0 && payload.indexOf("QUEUE-JOB-1") < payload.indexOf("QUEUE-JOB-2"));
+	check("队列：批次标题", payload.startsWith("2 background jobs finished (in completion order):"), payload.split("\n")[0]);
+	check("队列：details.items 带两个 jobId", merged?.message.details.items.map((i) => i.jobId).join(",") === `${j1.jobId},${j2.jobId}`);
+
+	// 模拟 Esc：pi 清掉了队列（不发 message_end），run 以 aborted 收尾。
+	emit("agent_settled", { aborted: true });
+	check("队列：Esc 后条目退回而不是丢失", qState.notify.snapshot().pending === 2);
+	const resent = emit("before_agent_start") as { message?: { content: string } } | undefined;
+	check("队列：下次输入时补投", !!resent?.message && resent.message.content.includes("QUEUE-JOB-2"));
+	cleanup(qState, "quit");
 }
 
 cleanup(state, "quit");

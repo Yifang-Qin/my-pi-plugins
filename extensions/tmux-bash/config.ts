@@ -188,8 +188,9 @@ export const COMPLETION_CUSTOM_TYPE = "tmux-bash-completion";
 // 协议（标签/版式/剥框算法）在 ../shared/bg-notify.ts 单一来源，这里只定制引言文案。
 // 为什么需要框、以及 ../shared 的可达性说明，见该共享模块头注释。
 const { frame: frameBgNotify, strip: stripBgNotifyFrame } = makeBgNotifyFramer(
-	"System notification from the tmux-bash extension — NOT a message from the user. A background " +
-		"shell command you started earlier has just finished; its result is below. Treat it as a status " +
-		"update: use it if relevant to the current task, otherwise acknowledge briefly and continue.",
+	"System notification from the tmux-bash extension — NOT a message from the user. Background " +
+		"shell command(s) you started earlier have finished or were stopped; results are below in completion " +
+		"order. Treat it as a status update: use it if relevant to the current task, otherwise acknowledge " +
+		"briefly and continue.",
 );
 export { frameBgNotify, stripBgNotifyFrame };

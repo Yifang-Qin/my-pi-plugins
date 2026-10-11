@@ -30,7 +30,7 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { basename, join } from "node:path";
-import { truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateLine, truncateTail, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	COMPLETION_CUSTOM_TYPE,
 	WINDOW_OPTIONS,
@@ -39,7 +39,8 @@ import {
 	type StdinMode,
 	type TmuxBashOptions,
 } from "./config.js";
-import { applyCarriageReturns, collapseCarriageReturns, stripAnsi } from "../shared/terminal-text.js";
+import { applyCarriageReturns, collapseCarriageReturns, stripAnsi, toSingleLine } from "../shared/terminal-text.js";
+import { createNotifyQueue, type NotifyQueue, type RenderedItem } from "../shared/notify-queue.js";
 import {
 	attachHint,
 	ensureSession,
@@ -79,6 +80,8 @@ export interface RuntimeState {
 	jobs: Map<string, Job>;
 	pendingTimers: Set<NodeJS.Timeout>;
 	shuttingDown: boolean;
+	/** 完成 / 用户 kill 通知的自管投递队列（合并、确认送达、Esc 后补投；见 ../shared/notify-queue.ts）。 */
+	notify: NotifyQueue<BashNotice> | null;
 }
 
 export function createState(options: TmuxBashOptions): RuntimeState {
@@ -91,6 +94,7 @@ export function createState(options: TmuxBashOptions): RuntimeState {
 		jobs: new Map(),
 		pendingTimers: new Set(),
 		shuttingDown: false,
+		notify: null,
 	};
 }
 
@@ -660,13 +664,105 @@ export function capNotificationBody(
 	alreadyTruncated: boolean,
 	fullPath: string | undefined,
 ): string {
+	return capNotificationBodyEx(options, text, alreadyTruncated, fullPath).text;
+}
+
+// 同上，额外报告「本次是否因预算截断」（合并通知按预算二次分配时要知道哪些条目被截了）。
+function capNotificationBodyEx(
+	options: Pick<TmuxBashOptions, "maxLines" | "notifyMaxBytes">,
+	text: string,
+	alreadyTruncated: boolean,
+	fullPath: string | undefined,
+): RenderedItem {
 	const t = truncateTail(text, { maxLines: options.maxLines, maxBytes: options.notifyMaxBytes });
 	const body = t.content || "(no output)";
-	if (!alreadyTruncated && !t.truncated) return body;
+	if (!alreadyTruncated && !t.truncated) return { text: body, truncated: false };
 	const footer = fullPath
 		? `[output truncated; showing the tail only. Full log: ${fullPath} (read it only if you need the earlier part)]`
 		: "[output truncated; showing the tail only]";
-	return `${body}\n\n${footer}`;
+	return { text: `${body}\n\n${footer}`, truncated: t.truncated };
+}
+
+// —— 通知条目与投递队列 —— //
+
+/** 一条待投递的后台通知（完成 / 用户 kill）。输出在入队时就读好并预截到 notifyMaxBytes。 */
+export interface BashNotice {
+	kind: "completed" | "killed";
+	jobId?: string;
+	windowId: string;
+	command: string;
+	outputFile?: string;
+	exitCode?: number;
+	durationMs?: number;
+	/** 已剥 ANSI、已按 notifyMaxBytes 预截的输出尾部。 */
+	text: string;
+	/** 输出是否已被截断（readJobLogs 或预截）。 */
+	truncated: boolean;
+	fullPath?: string;
+}
+
+function noticeDuration(n: BashNotice): string {
+	return n.durationMs === undefined ? "?" : `${(n.durationMs / 1000).toFixed(1)}s`;
+}
+
+function renderBashNotice(options: TmuxBashOptions, n: BashNotice, budgetBytes: number): RenderedItem {
+	const capOpts = { maxLines: options.maxLines, notifyMaxBytes: Math.min(budgetBytes, options.notifyMaxBytes) };
+	const body = capNotificationBodyEx(capOpts, n.text, n.truncated, n.fullPath);
+	if (n.kind === "killed") {
+		const header =
+			`Background job ${n.jobId ?? "?"} (${n.windowId}) was TERMINATED BY THE USER from the /bg panel ` +
+			`after ${noticeDuration(n)}. The user manually killed it — this is not an error, not a crash, and not something ` +
+			`to retry or resume unless the user asks.`;
+		return { text: `${header}\n$ ${n.command}\n\nPartial output before it was killed:\n\n${body.text}`, truncated: body.truncated };
+	}
+	const status = `exited ${n.exitCode ?? "?"}`;
+	const header = `Background job ${n.jobId ?? "?"} (${n.windowId}) ${status} after ${noticeDuration(n)}\n$ ${n.command}`;
+	return { text: `${header}\n\n${body.text}`, truncated: body.truncated };
+}
+
+function bashNoticeIndexLine(n: BashNotice): string {
+	const what = n.kind === "killed" ? "killed by the user" : `exited ${n.exitCode ?? "?"}`;
+	const cmd = truncateLine(toSingleLine(n.command), 120).text;
+	const log = n.fullPath ?? n.outputFile;
+	return `- job ${n.jobId ?? "?"} (${n.windowId}) ${what} after ${noticeDuration(n)} — $ ${cmd}${log ? ` — full log: ${log}` : ""}`;
+}
+
+/**
+ * 建 tmux-bash 的通知队列（index.ts 在扩展工厂里调用一次并挂到 state.notify）。
+ * 数值：单条 notifyMaxBytes（默认 12KB）、整条 2× 单条（默认 24KB）、每条至少 1KB、空闲攒批 300ms。
+ */
+export function createBashNotifyQueue(pi: ExtensionAPI, state: RuntimeState): NotifyQueue<BashNotice> {
+	const { options } = state;
+	return createNotifyQueue<BashNotice>(pi, {
+		customType: COMPLETION_CUSTOM_TYPE,
+		frame: frameBgNotify,
+		header: (count) => (count > 1 ? `${count} background jobs finished (in completion order):` : ""),
+		renderItem: (n, budget) => renderBashNotice(options, n, budget),
+		indexLine: bashNoticeIndexLine,
+		itemDetails: (n) => ({
+			jobId: n.jobId,
+			windowId: n.windowId,
+			exitCode: n.exitCode,
+			command: n.command,
+			outputFile: n.outputFile,
+			durationMs: n.durationMs,
+			...(n.kind === "killed" ? { killedByUser: true } : {}),
+		}),
+		maxItemBytes: options.notifyMaxBytes,
+		totalBudgetBytes: options.notifyMaxBytes * 2,
+		minItemBytes: 1024,
+		idleDebounceMs: 300,
+		spillDir: () => (state.runDir ? join(state.runDir, "notify") : join(options.outputDir, "notify")),
+	});
+}
+
+// 入队前把输出读好（窗口 / .out 之后可能被回收），剥 ANSI 并预截到单条上限，内存里不囤 50KB。
+function makeNoticeText(
+	options: TmuxBashOptions,
+	logs: { text: string; truncated: boolean },
+): { text: string; truncated: boolean } {
+	const t = truncateTail(stripAnsi(logs.text), { maxLines: options.maxLines, maxBytes: options.notifyMaxBytes });
+	return { text: t.content, truncated: logs.truncated || t.truncated };
 }
 export function startWatcher(
 	state: RuntimeState,
@@ -696,7 +792,7 @@ export function startWatcher(
 
 function handleCompletion(
 	state: RuntimeState,
-	pi: ExtensionAPI,
+	_pi: ExtensionAPI, // 通知已改走 state.notify；保留参数以免牵动 startWatcher / reconcile 的调用方
 	id: string,
 	exitPath: string,
 	onJobsChanged?: () => void,
@@ -727,13 +823,11 @@ function handleCompletion(
 		[WINDOW_OPTIONS.finishedAt]: String(Math.floor(job.finishedAt / 1000)),
 	});
 
-	const { text, truncated } = readJobLogs(state, job.windowId, job.outputFile, state.options.maxLines);
-	const durSec = ((Date.now() - job.startedAt) / 1000).toFixed(1);
-	const status = exitCode === 0 ? "exited 0" : `exited ${exitCode}`;
-	const header = `Background job ${job.id} (${job.windowId}) ${status} after ${durSec}s\n$ ${job.command}`;
 	// 给模型看的文本剥掉 ANSI（颜色转义在上下文里只是噪音），再按通知上限收紧；面板那边仍保留 SGR。
-	const body = capNotificationBody(state.options, stripAnsi(text), truncated, job.outputFile);
-	const content = frameBgNotify(`${header}\n\n${body}`);
+	const noticeText = makeNoticeText(
+		state.options,
+		readJobLogs(state, job.windowId, job.outputFile, state.options.maxLines),
+	);
 
 	// 清理哨兵文件；按配置关闭窗口。
 	try {
@@ -744,24 +838,20 @@ function handleCompletion(
 	if (state.options.autoCloseOnComplete) killWindow(state.options, job.windowId);
 
 	if (state.shuttingDown) return;
-	pi.sendMessage(
-		{
-			customType: COMPLETION_CUSTOM_TYPE,
-			content,
-			display: true,
-			details: {
-				jobId: job.id,
-				windowId: job.windowId,
-				exitCode,
-				command: job.command,
-				outputFile: job.outputFile,
-				durationMs: Date.now() - job.startedAt,
-			},
-		},
-		// steer：若 Agent 正在跑工具，则在当前 assistant 消息的全部工具结束后、下一次 LLM 调用前投递；
-		// 避免 followUp 因模型持续 sleep/bg 轮询而永远等不到 Agent 收尾。
-		{ deliverAs: "steer", triggerTurn: true },
-	);
+	// 交给自管队列：运行中随 turn_end 合并成一条 steer；空闲时攒 300ms 后唤醒；确认进入 transcript 才出队
+	// （Esc 清掉 pi 队列也不会丢）。语义与时机见 ../shared/notify-queue.ts 头注释。
+	state.notify?.enqueue({
+		kind: "completed",
+		jobId: job.id,
+		windowId: job.windowId,
+		command: job.command,
+		outputFile: job.outputFile,
+		exitCode,
+		durationMs: Date.now() - job.startedAt,
+		text: noticeText.text,
+		truncated: noticeText.truncated,
+		fullPath: job.outputFile,
+	});
 	pruneFinishedJobs(state);
 }
 
@@ -804,46 +894,29 @@ export interface JobLogSnapshot {
 }
 
 // 用户从 /bg 面板手动 kill 一个仍在运行的任务时，给 assistant 发一条通知（含尾部输出），
-// 正文里明确写「是用户杀的」。时机：turn 内 steer / idle nextTurn，**永不 triggerTurn**——
-// kill 是用户的意图动作，不该主动唤醒 assistant 说话（对比自然完成 handleCompletion 用
-// steer + triggerTurn，因为那是 assistant 可能在等的后台结果）。
+// 正文里明确写「是用户杀的」。**永不唤醒**（wake:false）——kill 是用户的意图动作，不该主动让 assistant
+// 说话（对比自然完成用 wake:true，因为那是 assistant 可能在等的后台结果）。经自管队列投递：运行中随
+// turn_end 合并成 steer；空闲时不发，随用户下一次输入（或下一次唤醒性完成）一起带上 = 原 nextTurn 语义。
 // 去重：仅由调用方在「确实杀掉一个 running 任务」时调用；若任务其实刚自然完成，handleCompletion
 // 已发过完成通知，这里不会被触及。
 // 输出（logs）由调用方在【杀窗口之前】读好传入（趁窗口还活着，capture-pane 兜底可用，
 // .out 即使被 reload 回收也不至于丢）。
-export function notifyUserKilled(
-	state: RuntimeState,
-	pi: ExtensionAPI,
-	info: BackgroundJobInfo,
-	streaming: boolean,
-	logs: JobLogSnapshot,
-): void {
+export function notifyUserKilled(state: RuntimeState, info: BackgroundJobInfo, logs: JobLogSnapshot): void {
 	if (state.shuttingDown) return;
-	const { text, truncated, fullPath } = logs;
-	const durSec = info.startedAt ? ((Date.now() - info.startedAt) / 1000).toFixed(1) : "?";
-	const header =
-		`Background job ${info.jobId ?? "?"} (${info.windowId}) was TERMINATED BY THE USER from the /bg panel ` +
-		`after ${durSec}s. The user manually killed it — this is not an error, not a crash, and not something ` +
-		`to retry or resume unless the user asks.`;
-	const body = capNotificationBody(state.options, stripAnsi(text), truncated, fullPath);
-	const content = frameBgNotify(`${header}\n$ ${info.command}\n\nPartial output before it was killed:\n\n${body}`);
-	pi.sendMessage(
+	const noticeText = makeNoticeText(state.options, logs);
+	state.notify?.enqueue(
 		{
-			customType: COMPLETION_CUSTOM_TYPE,
-			content,
-			display: true,
-			details: {
-				jobId: info.jobId,
-				windowId: info.windowId,
-				killedByUser: true,
-				command: info.command,
-				outputFile: info.outputFile,
-				durationMs: info.startedAt ? Date.now() - info.startedAt : undefined,
-			},
+			kind: "killed",
+			jobId: info.jobId,
+			windowId: info.windowId,
+			command: info.command,
+			outputFile: info.outputFile,
+			durationMs: info.startedAt ? Date.now() - info.startedAt : undefined,
+			text: noticeText.text,
+			truncated: noticeText.truncated,
+			fullPath: logs.fullPath,
 		},
-		// turn 内 steer（当前消息工具跑完、下次 LLM 调用前注入）；idle 时 nextTurn（随下个用户
-		// prompt 带上，不打断、不触发）。两种都不 triggerTurn。
-		{ deliverAs: streaming ? "steer" : "nextTurn" },
+		{ wake: false },
 	);
 }
 

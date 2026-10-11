@@ -470,9 +470,9 @@ export async function openBgPanel(
 				pi,
 				state,
 				(msg, level) => ctx.ui.notify(msg, level),
-				// turn 内 steer / idle nextTurn；每次 kill 时实时判断 idle（面板开着时也可能因
-				// 后台完成 triggerTurn 而进入 streaming）。logs 由面板在杀之前读好传入。
-				(info, logs) => notifyUserKilled(state, pi, info, !ctx.isIdle(), logs),
+				// 经 state.notify 自管队列：运行中随 turn_end 合并投递，空闲时不唤醒、随下次输入带上。
+				// logs 由面板在杀之前读好传入。
+				(info, logs) => notifyUserKilled(state, info, logs),
 				setRunningCount,
 			),
 		{

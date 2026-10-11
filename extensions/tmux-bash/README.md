@@ -100,13 +100,14 @@
    `窗口 @xxx 已不存在`。
 2. **给 assistant 的消息**：因为这是**用户手动** kill（assistant 并不知道），面板会经
    `notifyUserKilled` 给 assistant 注入一条通知（复用完成通知的 `⏻ background bash` 渲染），
-   **正文明确写「TERMINATED BY THE USER」**，并附命令与被杀前的尾部输出。时机：
-   - **assistant 在 turn 内（streaming）** → `deliverAs: "steer"`：在当前 assistant 消息的工具
-     调用全部执行完、下一次 LLM 调用前注入，不打断在途工具；
-   - **已是 user turn（idle）** → `deliverAs: "nextTurn"`：静默挂到下次用户 prompt 一起带上，
-     **不主动打断 / 唤醒 assistant**；
-   - **永不 `triggerTurn`**——kill 是用户意图动作，不该因 UI 清理让 assistant 突然开口（对比
-     自然完成 `handleCompletion` 用 `steer + triggerTurn`，因为那是 assistant 可能在等的结果）。
+   **正文明确写「TERMINATED BY THE USER」**，并附命令与被杀前的尾部输出。它与完成通知走同一个
+   自管投递队列（见下文「完成通知」），以 `wake: false` 入队：
+   - **assistant 在 turn 内（streaming）** → 随 `turn_end` 与其他待投递通知合并成一条 steer，
+     在当前 assistant 消息的工具调用全部执行完、下一次 LLM 调用前注入，不打断在途工具；
+   - **已是 user turn（idle）** → 不发，等下次用户 prompt 时经 `before_agent_start` 一起带上
+     （= 原 `nextTurn` 语义），**不主动打断 / 唤醒 assistant**；
+   - **永不主动唤醒**——kill 是用户意图动作，不该因 UI 清理让 assistant 突然开口（对比
+     自然完成以 `wake: true` 入队，因为那是 assistant 可能在等的结果）。
    - **去重**：仅在「确实杀掉一个运行中任务」时发；若任务其实刚自然完成，`handleCompletion`
      已发过完成通知，kill 不再重复。
 
@@ -125,10 +126,29 @@
   - 完成检测走 `fs.watch(runDir)` 监听哨兵文件；
   - 日志读取优先读 `.out`，读不到再 `tmux capture-pane` 兜底；
   - 用 `tee -a` + `${PIPESTATUS[0]}` 拿到准确退出码。
-- **完成通知走官方 API**：`pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`。
-  Agent 空闲时立即唤醒；Agent 正忙时，通知在当前 assistant 消息的全部工具调用结束后、下一次 LLM
-  调用前投递，不会中断正在执行的工具，也不会像 followUp 那样因模型持续 `sleep` / `bg` 轮询而
-  长期饥饿。通知内容包一层 `<background-task-notification-<随机后缀>>` 自描述框（协议在
+- **完成通知走自管投递队列**（`../shared/notify-queue.ts`，与 afang-subagent 共用）。直接
+  `pi.sendMessage(steer + triggerTurn)` 有两个问题（pi 1.1.0 源码核对）：① pi 默认
+  `steeringMode: "one-at-a-time"`，每个 turn 边界只取一条——一次长前台调用期间完成 N 个任务就要多
+  N−1 轮，且模型看到第 1 条时不知道第 2 条早已到达；② 按 Esc 时 pi 会 `clearAllQueues()`，扩展进队的
+  custom 消息没有备份，**完成通知被静默丢掉**。队列的做法：
+  - Agent 运行中：先攒着，在 `turn_end` handler 里把全部待投递通知**合并成一条** steer 发出。pi 在
+    `finishTurn` 里 await 扩展的 turn_end，之后才取 steering 队列，所以送达时机与原先逐条 steer 完全
+    一致（当前 assistant 消息的工具全部结束后、下一次 LLM 调用前），只是合并了；
+  - Agent 空闲：攒 300ms（吸收几乎同时完成的任务）后合并发出并 `triggerTurn` 唤醒；
+  - **确认送达才出队**：看到带同一 `batchId` 的 `message_end` 才删除；run 结束（`agent_settled`）仍未确认
+    的批次视为被清掉，退回重发。`aborted`（Esc）时不唤醒，随下一次用户输入经 `before_agent_start` 带上；
+  - 体积：多条按完成先后排列，整条正文预算 2×`PI_TMUX_BASH_NOTIFY_MAX_BYTES`（默认 24KB）平分、短条目省下
+    的预算补给被截的；平分后每条不足 1KB 时只内联前若干条，其余降级为一行索引（含 `.out` 路径）；索引超过
+    40 行再落盘到 `runDir/notify/<batchId>.md`。队列本身不落盘：条目只是元数据，输出本就在 `.out` 里；
+  - TUI：通知渲染成**带背景的卡片**（`../shared/notice-card.ts`，与 afang-subagent 共用；底色按结果取
+    `toolSuccessBg` / `toolErrorBg` / 全是用户 kill 时 `toolPendingBg`，padding 跟随 `outputPad`）。pi 在扩展
+    提供 renderer 时不再套默认的 customMessageBg 背景，所以要自己画。多任务通知折叠态每个任务一行（✓ / ✗ /
+    ⊘ 用户 kill · 耗时 · 命令），展开看各自输出。**单条点击展开**：fullscreen 模式下左键单击卡片只切换这一条
+    （同 pi 内置工具行 / compaction 的 MouseRegion 做法）；`Ctrl+O` 仍是全局展开 / 折叠，并覆盖各条的单独状态。
+  - 已知边界：非 interactive 的 abort（RPC `abort` 不 `clear_queue`）下被退回重发的批次可能与 pi 稍后补投
+    的旧消息重复一次（宁重勿丢）；`/reload` 会丢失尚未投递的条目（同「reload 后不恢复 job 表」）。
+
+  通知内容包一层 `<background-task-notification-<随机后缀>>` 自描述框（协议在
   `../shared/bg-notify.ts` 的 `makeBgNotifyFramer`，与 afang-subagent 共享；`config.ts` 只定制引言
   文案），防止被降级成 `role:"user"` 后被模型误当成用户新指令；UI 渲染时用
   `stripBgNotifyFrame` 剥掉框（兼容旧会话里的固定标签格式）。
@@ -267,7 +287,8 @@ tmux-bash/
 ├── runtime.ts                  wrapper 脚本生成、前台同步执行/流式转发/自动转后台、fs.watch 完成监听、日志读取
 ├── tmux.ts                     tmux 底层封装（execFileSync 数组参数）
 ├── config.ts                   配置默认值 + 环境变量 + 窗口标签常量 + 通知框引言（协议见 ../shared/bg-notify.ts）
-├── test-fixes.ts               功能测试（bash -n 预检 + 窗口死亡检测；bun 运行，用法见文件头）
+├── test-fixes.ts               功能测试（用例清单与用法见文件头；bun 运行）
+（共享：../shared/bg-notify.ts 通知框协议、../shared/notify-queue.ts 通知投递队列 + test-notify-queue.ts、../shared/notice-card.ts 通知卡片渲染）
 ├── README.md
 └── BUILTIN-BASH-REFERENCE.md   覆盖内置 bash 的逐条对齐/偏离清单（pi 升级后须复核）
 ```

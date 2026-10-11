@@ -16,10 +16,12 @@ import { Type } from "typebox";
 import { truncateLine, truncateTail, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { toSingleLine, stripAnsi, collapseCarriageReturns } from "../shared/terminal-text.js";
 import { COMPLETION_CUSTOM_TYPE, loadOptions, stripBgNotifyFrame } from "./config.js";
+import { expandHint, renderNoticeCard } from "../shared/notice-card.js";
 import { fmtDuration, fmtJobStatus } from "./format.js";
 import { openBgPanel } from "./bg-panel.js";
 import {
 	AUTO_BG_HEADLINE_PREFIX,
+	createBashNotifyQueue,
 	BACKGROUND_START_HEADLINE_PREFIX,
 	cleanup,
 	createState,
@@ -48,6 +50,28 @@ const COMPLETION_FOLD_HEAD = 4;
 const COMPLETION_FOLD_TAIL = 10;
 // 从内置 bash 的非零退出文案里回捞退出码（合并自原 bash-status-line 扩展）。
 const EXIT_CODE_PATTERN = /Command exited with code (\d+)/;
+
+// 合并通知 details.items 里每个任务的结构化信息（见 runtime.ts createBashNotifyQueue 的 itemDetails）。
+type NotifyItemDetails = {
+	jobId?: string;
+	windowId?: string;
+	exitCode?: number;
+	command?: string;
+	durationMs?: number;
+	killedByUser?: boolean;
+};
+
+function formatNotifyItemRow(it: NotifyItemDetails, theme: Theme): string {
+	const icon = it.killedByUser
+		? theme.fg("warning", "⊘")
+		: it.exitCode === 0
+			? theme.fg("success", "✓")
+			: theme.fg("error", "✗");
+	const status = it.killedByUser ? "killed by user" : `exit ${it.exitCode ?? "?"}`;
+	const dur = typeof it.durationMs === "number" ? ` · ${(it.durationMs / 1000).toFixed(1)}s` : "";
+	const cmd = truncateLine(toSingleLine(it.command ?? ""), 80).text;
+	return `  ${icon} ${theme.fg("toolOutput", `${it.jobId ?? "?"} ${it.windowId ?? ""} ${status}${dur}`)}  ${theme.fg("muted", `$ ${cmd}`)}`;
+}
 
 // renderCall/renderResult 之间共享、跨重绘持久的渲染态（= tool-execution 的 rendererState）：
 // 前台运行中的实时计时器，对齐内置 bash 的 "Elapsed X.Xs" 活计时。
@@ -222,6 +246,9 @@ function buildSessionEnv(ctx: ExtensionContext): SessionEnv {
 
 export default function (pi: ExtensionAPI): void {
 	const state = createState(loadOptions());
+	// 完成 / 用户 kill 通知的自管投递队列：合并成一条、确认送达才出队（见 ../shared/notify-queue.ts）。
+	// 必须在工厂里同步创建：它要在这里注册 turn_end / message_end / agent_settled 等事件。
+	state.notify = createBashNotifyQueue(pi, state);
 
 	// 完成 / 用户 kill 通知的自定义渲染：大输出任务折叠显示（头部 + 尾部），避免刷屏消息历史；
 	// options.expanded 时展开全文（与工具结果一致的交互）。
@@ -232,19 +259,37 @@ export default function (pi: ExtensionAPI): void {
 				: message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
 		// 注入时加的「系统通知框」只给模型看，UI 里剔掉；再去掉尾部空行避免多余空行。
 		const text = stripBgNotifyFrame(raw).replace(/\s+$/, "");
-		const label = theme.fg("accent", "⏻ background bash");
-		const lines = text.split("\n");
-		const foldable = lines.length > COMPLETION_FOLD_HEAD + COMPLETION_FOLD_TAIL + 2;
-		let body: string;
-		if (options.expanded || !foldable) {
-			body = lines.map((l) => theme.fg("toolOutput", l)).join("\n");
-		} else {
+		// 合并通知的 details.items；旧版单条通知（随机边界之前的会话）details 本身就是那一条。
+		const details = message.details as ({ items?: NotifyItemDetails[] } & NotifyItemDetails) | undefined;
+		const items: NotifyItemDetails[] = details?.items ?? (details ? [details] : []);
+		const multi = items.length > 1;
+		let lines = text.split("\n");
+		// 合并通知正文首行「N background jobs finished…」与卡片标题的「· N jobs」重复，UI 里省掉（模型侧不变）。
+		if (multi && /^\d+ background jobs finished/.test(lines[0] ?? "")) lines = lines.slice(lines[1] === "" ? 2 : 1);
+		const foldable = multi || lines.length > COMPLETION_FOLD_HEAD + COMPLETION_FOLD_TAIL + 2;
+		const label = theme.fg("accent", theme.bold("⏻ background bash")) + (multi ? theme.fg("muted", ` · ${items.length} jobs`) : "");
+		const hint = (expanded: boolean) => theme.fg("dim", `（${expandHint(expanded)}）`);
+
+		const body = (expanded: boolean): string => {
+			// 合并通知折叠态：每个任务一行状态（✓ / ✗ / ⊘ · 耗时 · 命令），展开看各自输出。
+			if (!expanded && multi) {
+				return [label, ...items.map((it) => formatNotifyItemRow(it, theme)), hint(false)].join("\n");
+			}
+			if (expanded || !foldable) {
+				const all = lines.map((l) => theme.fg("toolOutput", l));
+				return [label, ...all, ...(foldable ? [hint(true)] : [])].join("\n");
+			}
 			const head = lines.slice(0, COMPLETION_FOLD_HEAD).map((l) => theme.fg("toolOutput", l));
 			const tail = lines.slice(-COMPLETION_FOLD_TAIL).map((l) => theme.fg("toolOutput", l));
 			const omitted = lines.length - COMPLETION_FOLD_HEAD - COMPLETION_FOLD_TAIL;
-			body = [...head, theme.fg("muted", `  … +${omitted} 行（展开查看全部）`), ...tail].join("\n");
-		}
-		return new Text(`${label}\n${body}`, 0, 0);
+			return [label, ...head, theme.fg("muted", `  … +${omitted} 行`) + " " + hint(false), ...tail].join("\n");
+		};
+
+		// 卡片底色按结果选：有失败 → toolErrorBg；全是用户 kill → toolPendingBg；否则 toolSuccessBg。
+		const failed = items.some((it) => !it.killedByUser && typeof it.exitCode === "number" && it.exitCode !== 0);
+		const allKilled = items.length > 0 && items.every((it) => it.killedByUser);
+		const bg = failed ? "toolErrorBg" : allKilled ? "toolPendingBg" : "toolSuccessBg";
+		return renderNoticeCard(message, options, theme, { bg, body, expandable: foldable });
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
