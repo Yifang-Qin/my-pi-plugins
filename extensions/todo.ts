@@ -34,6 +34,7 @@ import {
 	readTodoSnapshot,
 	restoreTodos,
 	snapshotText,
+	TodoConfirmationRequired,
 	todoCounts,
 	TodoSchema,
 	type TodoDetails,
@@ -241,6 +242,9 @@ export default function (pi: ExtensionAPI) {
 	// mid-run nudge 的两个计数器，每个 user prompt 重置。
 	let mutationsSinceTouch = 0;
 	let nudgesThisCycle = 0;
+	// Retry-loop breakers for failed todo calls (see execute); reset per user prompt and on restore.
+	let consecutiveFailures = 0;
+	let clearConfirmArmed = false;
 	let tuiRef: { requestRender(): void } | undefined;
 	let widgetInstalled = false;
 
@@ -299,6 +303,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		mutationsSinceTouch = 0;
 		nudgesThisCycle = 0;
+		consecutiveFailures = 0;
+		clearConfirmArmed = false;
 		const options = event.systemPromptOptions;
 		if (!options.selectedTools?.includes("todo")) return;
 		options.sections.todo_guide = TODO_GUIDE;
@@ -386,6 +392,8 @@ export default function (pi: ExtensionAPI) {
 		touchedPhases = [];
 		mutationsSinceTouch = 0;
 		nudgesThisCycle = 0;
+		consecutiveFailures = 0;
+		clearConfirmArmed = false;
 		refreshWidget(ctx);
 	};
 
@@ -403,33 +411,51 @@ export default function (pi: ExtensionAPI) {
 		prepareArguments: prepareTodoArguments,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// A clear rejected for discarding unfinished work is confirmed by the very next todo call
+			// being clear again (whatever its arguments); any other todo call disarms it.
+			const confirmClear = clearConfirmArmed && params.action === "clear";
+			clearConfirmArmed = false;
 			let result: ReturnType<typeof applyTodo>;
 			try {
-				result = applyTodo(state, params); // throw 由 pi 转为失败 toolResult，状态不提交
+				result = applyTodo(state, params, { confirmClear }); // pi turns a throw into a failed toolResult; state is not committed
 			} catch (error) {
-				// 失败提醒：错误文本本身没说「计划未变、用户看不到进度」，补上这层语义。
-				// 用 triggerTurn:false 而不是 deliverAs:"nextTurn"——后者在 pi 里要等到下个 user
-				// prompt 才投递（_pendingNextTurnMessages），对 mid-run 失败太晩；前者进
-				// _pendingCustomMessages，本轮工具结果落盘后 flush，下一次 LLM call 即可见。
+				if (error instanceof TodoConfirmationRequired) {
+					// The error text already says how to proceed (rm, or repeat clear); a generic "fix the
+					// arguments" reminder would contradict it, and it isn't a failure streak either.
+					clearConfirmArmed = true;
+					throw error;
+				}
+				// The error text alone doesn't say that the plan is unchanged and progress is invisible to
+				// the user, so add a hidden reminder. triggerTurn:false (not deliverAs:"nextTurn", which waits
+				// for the next user prompt) flushes it right after this turn's tool results.
+				// From the second failure in a row it switches to "stop retrying": a model that can't satisfy
+				// the guard (e.g. one that always fills every field) would otherwise loop on it, and a
+				// reminder that keeps saying "call todo again" only drives that loop.
+				consecutiveFailures++;
+				const detail =
+					`Failure: ${error instanceof Error ? error.message : String(error)}\n` +
+					`Arguments received: ${JSON.stringify(params)}\n`;
+				const text =
+					consecutiveFailures === 1
+						? "The todo call failed, so the plan is unchanged and its progress is not visible to the user.\n" +
+							detail +
+							"Fix the arguments (send only the fields this action uses) and call todo again. " +
+							"If it fails the same way, stop retrying and continue with the work."
+						: `todo has failed ${consecutiveFailures} times in a row; the plan is unchanged.\n` +
+							detail +
+							"Do not repeat this call: the same arguments fail the same way. Either change the arguments to " +
+							"address the error, or leave the plan as it is and continue with the work (or finish your response).";
 				pi.sendMessage(
 					{
 						customType: "todo-error-reminder",
 						display: false,
-						content: [
-							{
-								type: "text",
-								text:
-									"<system-reminder>\nThe todo call failed, so the plan is unchanged and its progress is not visible to the user.\n" +
-									`Failure: ${error instanceof Error ? error.message : String(error)}\n` +
-									`Arguments received: ${JSON.stringify(params)}\n` +
-									"Fix the arguments (send only the fields this action uses) and call todo again before continuing.\n</system-reminder>",
-							},
-						],
+						content: [{ type: "text", text: `<system-reminder>\n${text}\n</system-reminder>` }],
 					},
 					{ triggerTurn: false },
 				);
 				throw error;
 			}
+			consecutiveFailures = 0;
 			if (params.action !== "view") {
 				state = result.state;
 				touchedPhases = result.touchedPhases;

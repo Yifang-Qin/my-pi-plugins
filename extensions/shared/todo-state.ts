@@ -122,11 +122,23 @@ const DUAL_TARGET: readonly TodoParams["action"][] = ["done", "drop", "block", "
 const DEFAULT_PHASE = "Tasks";
 
 /**
+ * Thrown when a call is plausible but would discard unfinished work. The caller arms a one-shot
+ * confirmation: repeating the action (with any arguments) goes through. Unlike a plain error this
+ * is always satisfiable, even by models that can't stop sending the offending fields.
+ */
+export class TodoConfirmationRequired extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "TodoConfirmationRequired";
+	}
+}
+
+/**
  * Fields each action actually reads. Anything else is dropped before schema validation, so
  * models that fill every parameter (with placeholders, nulls or empty arrays) don't trip
  * conflict checks on fields that were never meant to apply.
- * `clear` keeps id/phase on purpose: "clear phase X" almost always means `rm`, and must not
- * silently wipe the whole plan.
+ * `clear` keeps id/phase so applyTodo can tell a stray target apart from a plain clear: with
+ * unfinished tasks left, "clear phase X" may really mean `rm` and needs a confirmation.
  */
 const ACTION_FIELDS: Record<TodoParams["action"], readonly string[]> = {
 	init: ["phases", "items", "phase"],
@@ -174,24 +186,31 @@ export function prepareTodoArguments(args: unknown): TodoParams {
 	return out as TodoParams;
 }
 
-/** 在副本上执行；校验失败直接 throw，调用方只提交成功返回的 state。 */
+/**
+ * Runs on a copy; validation failures throw and the caller only commits a returned state.
+ *
+ * Argument guards must stay satisfiable by models that fill every field (typically echoing the
+ * previous call's id/phase): an error such a model can only fix by *omitting* a field traps it in
+ * a retry loop. So stray-but-harmless arguments are applied in the safe direction and reported in
+ * the result message instead of failing the call.
+ */
 export function applyTodo(
 	state: TodoState,
 	params: TodoParams,
+	options: { confirmClear?: boolean } = {},
 ): { state: TodoState; message: string; touchedPhases: string[] } {
 	if (!TODO_ACTIONS.includes(params.action)) throw new Error(`Unknown todo action: ${params.action}`);
-	// Fields that don't apply to the action are ignored. With both id and phase, id wins unless
-	// phase names a *different* existing phase: a phase that doesn't exist (typically a filler
-	// such as "ignored" / "none") or the task's own phase is no real ambiguity.
+	// Arguments that were sent but not applied; appended to the result message.
+	const ignored: string[] = [];
+	// With both id and phase, the narrower target (id) always wins: touching one task when a whole
+	// phase was meant is a visible, recoverable under-reach, while the reverse would close or delete
+	// work by mistake. A phase that doesn't hold the task (a filler such as "ignored", or a stale
+	// echo of an earlier phase) is reported rather than rejected.
 	if (DUAL_TARGET.includes(params.action) && params.id !== undefined && params.phase !== undefined) {
 		const name = plainTodoText(params.phase);
-		const named = state.phases.find((phase) => phase.name === name);
-		if (named && !named.tasks.some((task) => task.id === params.id)) {
-			const owner = state.phases.find((phase) => phase.tasks.some((task) => task.id === params.id));
-			throw new Error(
-				`Conflicting targets: got id=${params.id}${owner ? ` (in phase "${owner.name}")` : ""} and ` +
-					`phase="${name}". Send only id to target one task, or only phase to target a whole phase.`,
-			);
+		const owner = state.phases.find((phase) => phase.tasks.some((task) => task.id === params.id));
+		if (owner && owner.name !== name) {
+			ignored.push(`phase=${JSON.stringify(name)} (#${params.id} is in "${owner.name}"; id takes precedence)`);
 		}
 		params = { ...params, phase: undefined };
 	}
@@ -202,9 +221,19 @@ export function applyTodo(
 		]
 			.filter(Boolean)
 			.join(", ");
-		throw new Error(
-			`clear takes no target (got ${got}) and removes the whole plan; use rm with id or phase to remove specific tasks`,
-		);
+		// Nothing unfinished means nothing to lose: the target is just noise. Otherwise the target may
+		// mean `rm`, so ask once; repeating clear confirms (see TodoConfirmationRequired).
+		const unfinished = allTasks(state.phases).filter((task) => !isClosed(task));
+		if (unfinished.length > 0 && !options.confirmClear) {
+			const ids = unfinished.slice(0, 5).map((task) => `#${task.id}`);
+			if (unfinished.length > ids.length) ids.push("…");
+			throw new TodoConfirmationRequired(
+				`clear takes no target (got ${got}) and always removes the whole plan, which still has ` +
+					`${unfinished.length} unfinished task${unfinished.length === 1 ? "" : "s"} (${ids.join(", ")}). ` +
+					"To remove only some tasks, use rm with id or phase. To clear the whole plan anyway, call clear again.",
+			);
+		}
+		ignored.push(`${got} (clear always removes the whole plan)`);
 	}
 	const next = cloneState(state);
 	const touched = new Set<string>();
@@ -322,11 +351,15 @@ export function applyTodo(
 			message = `Removed ${remove.size} tasks`;
 			break;
 		}
-		case "clear":
-			message = `Cleared ${allTasks(next.phases).length} tasks`;
+		case "clear": {
+			const tasks = allTasks(next.phases);
+			const unfinished = tasks.filter((task) => !isClosed(task)).length;
+			message = `Cleared ${tasks.length} tasks${unfinished ? ` (${unfinished} unfinished)` : ""}`;
 			next.phases = [];
 			break;
+		}
 	}
+	if (ignored.length) message += `. Ignored ${ignored.join("; ")}`;
 	normalizeActive(next.phases);
 	return { state: next, message, touchedPhases: [...touched] };
 }

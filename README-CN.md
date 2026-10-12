@@ -72,7 +72,7 @@ fork 自 pi 官方 todo 示例、自维护演进。任务按 **phase → task �
   - **eager prelude**：清单为空且是会话**首条** user 消息时，注入一条隐藏建议（先用一次 `init` 铺好分阶段计划）。以 `?` / `？` / `!` / `！` 结尾的 prompt 是提问而非派活，不推；已有清单改走 `todo_state`，两者天然互斥、不重复施压。只对齐 omp 的 `preferred` 档位（建议、不强制）—— pi 没有强制 `tool_choice` 的接口，而且 pi 把 handler 消息放在 user 消息**之后**（omp 是之前）。
   - `session_compact`：压缩会把**承载计划的工具结果**摘要掉，而 `before_agent_start` 只在 user prompt 时触发、补不上自动续跑那个窗口。所以当场补一条：有计划补状态摘要，没计划重申 eager。同样用 `triggerTurn: false`，不自己拉起一轮。
   - `turn_end`：**mid-run nudge**，按「修改类工具」（`bash`/`edit`/`write` 等，失败不计）调用次数 ≥ 12 触发，每个 user prompt 最多 2 次，任何 `todo` 调用清零计数。内容只有一句「还有 N 项未完成」约 30 token，**不带清单**。读文件/搜索再多也不触发；本轮没调工具（模型正在收工）也跳过。**只追加 `entries`、永不返回 `continue`**。
-  - 调用失败时：补一条隐藏提醒（计划未变、用户看不到进度、修正参数后重试）。用 `triggerTurn: false` 而非 `deliverAs: "nextTurn"` —— 后者在 pi 里要等到下个 user prompt 才投递，对 mid-run 失败太晩。
+  - 调用失败时：补一条隐藏提醒（计划未变、用户看不到进度、修正参数后重试）。**连续第二次失败起**改为「别再重试：要么改参数，要么保持计划不动、继续干活」——一直说「再调一次 todo」的提醒只会加剧重试死循环；任何一次成功调用或新的 user prompt 都会重置计数。用 `triggerTurn: false` 而非 `deliverAs: "nextTurn"` —— 后者在 pi 里要等到下个 user prompt 才投递，对 mid-run 失败太晩。
 - **刻意不做控制流干预**：不因「还有 todo 未完成」而拦住收工，何时结束完全由模型自己定。曾按 omp 的 `checkCompletion` 做过 `agent_before_settle` 拦截 + 自动续跑（带 blocked 豁免、次数上限、子 agent 禁用等六个出口），实测后**整体撑销**：它必须先判断「模型是不是在等用户回答」，而这只能靠关键词/正则启发式；漏判的后果是强行续跑、让模型替用户做决定——错在危险方向。实测反例：「要麻烦你确认一下…」不带「请」也不以问号结尾，就被漏判。自然语言里「我在等你」的说法无穷，补正则是打地鼠，**不要再尝试**。
 
 模型可见参数为 `action` 加可选 `phases` / `items` / `id` / `phase` / `reason`，不再声明旧的 `add` / `set` / `list` 操作；历史调用仍可恢复、渲染。
@@ -87,7 +87,7 @@ fork 自 pi 官方 todo 示例、自维护演进。任务按 **phase → task �
 | `rm` | `id` 或 `phase`，都不传则删除全部 | 删除目标任务及空 phase |
 | `view` / `clear` | 无 | 查看完整计划 / 清空整份计划 |
 
-**参数宽容度**：schema 校验前先剔除不适用于当前 action 的字段（如 `done` 带 `reason`、`view` 带 `items`、值为 `null` 的字段），避免「把所有可选参数都填上占位值」的模型陷入重试死循环。`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase` 时以 `id` 为准，除非 `phase` 指向**另一个**已存在的 phase。只有这几类「目标歧义」会报错：`id` 与 `phase` 指向不同的已存在目标；两者都显式为空（`null` / `""`，不会静默放大成「全部任务」）；`clear` 带了目标（会提示改用 `rm`，避免误清整份计划）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）。报错文案会回显出错的值，失败提醒里附带收到的参数。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
+**参数宽容度**：有些模型会把所有可选参数都填上，常见的是照抄上一次调用的 `id` / `phase`。如果某个参数校验只能靠**省略**字段来满足，这类模型就会陷入重试死循环。所以对「多余但无害」的参数，一律按安全方向执行，并在结果消息里注明（`... Ignored phase="X" (...)`），而不是让调用失败。具体是：schema 校验前先剔除不适用于当前 action 的字段（如 `done` 带 `reason`、`view` 带 `items`、值为 `null` 的字段）；`done`/`drop`/`block`/`unblock`/`rm` 同时传 `id` 和 `phase` 时，范围更窄的 `id` 永远优先（本想操作整组却只动了一项，可见且可补救；反过来则会误关闭或误删任务）；`clear` 带了 `id`/`phase` 时，如果已经没有未完成的任务，直接清空；如果会丢掉 pending/in-progress/blocked 任务，就先确认一次（提示「只删部分任务请用 `rm`，确实要清空就再调一次 `clear`」），紧接着的下一次 `clear` 调用（参数不限）即视为确认，中间插入任何其他 `todo` 调用则取消确认。仍会报错的情况：两个目标都显式为空（`null` / `""`，不会静默放大成「全部任务」）；`start` 没有 `id`（`phase` 对 `start` 无效，不会静默命中整组任务）；`id` 不存在（不会退回按 phase 操作）。报错文案会回显出错的值，失败提醒里附带收到的参数。任务/phase 名和 blocker 会清理 ANSI、折叠空白为单行。
 
 ```json
 {"action":"init","phases":[{"name":"调研","items":["核对接口","确认边界"]},{"name":"实现","items":["完成改动","验证行为"]}]}

@@ -159,8 +159,7 @@ test("扁平 init 合成默认 phase；无关参数被忽略；目标歧义仍�
 test("目标歧义和缺少必填参数必须报错，不能误操作全部任务", () => {
 	const state = init();
 	for (const params of [
-		{ action: "done", id: 1, phase: "实现" }, // #1 is in 调研: id and phase point at different targets
-		{ action: "clear", id: 1 },
+		{ action: "clear", id: 1 }, // unfinished tasks left: a targeted clear needs a confirmation first
 		{ action: "clear", phase: "调研" },
 		{ action: "start" },
 		{ action: "start", phase: "调研" }, // phase 对 start 无效 → 仍缺 id，不能静默命中整组
@@ -707,15 +706,86 @@ test("placeholder-filled args (phase:'ignored' next to id) don't trap the model 
 	assert.throws(() => prepareTodoArguments({ action: "done", id: null, phase: "  " }), /both empty/);
 	// Omitting both entirely still means "every task".
 	assert.deepEqual(prepareTodoArguments({ action: "done", phases: [] }), { action: "done" });
-	// Other actions: unrelated fields dropped, start ignores phase, clear keeps its guard.
+	// Other actions: unrelated fields dropped, start ignores phase, clear keeps id/phase for its check.
 	assert.deepEqual(prepareTodoArguments({ action: "view", id: 1, phase: "x", items: [] }), { action: "view" });
 	assert.deepEqual(prepareTodoArguments({ action: "start", id: 3, phase: "ignored" }), { action: "start", id: 3 });
 	assert.throws(() => applyTodo(init(), { action: "clear", phase: "ignored" }), /phase="ignored"/);
-	// The conflict error echoes both values so the model can see what to drop.
-	assert.throws(
-		() => applyTodo(init(), { action: "done", id: 1, phase: "实现" }),
-		/id=1 \(in phase "调研"\).*phase="实现"/,
-	);
 	// The registered tool wires the shim in.
 	assert.equal(harness("json").tool.prepareArguments, prepareTodoArguments);
+});
+
+test("id beats a conflicting phase (narrower target) and the result reports the ignored phase", () => {
+	// Models that fill every field tend to echo the previous call's phase. Rejecting id + another
+	// phase would loop them forever once work moves on to the next phase.
+	const result = applyTodo(init(), { action: "done", id: 3, phase: "调研" }); // #3 is in 实现
+	assert.deepEqual(statuses(result.state), ["in_progress", "pending", "completed", "pending"]);
+	assert.match(result.message, /updated 1 tasks\. Ignored phase="调研" \(#3 is in "实现"; id takes precedence\)/);
+	// rm with id + another phase removes only the task, never the phase.
+	const removed = applyTodo(init(), { action: "rm", id: 1, phase: "实现" }).state;
+	assert.deepEqual(
+		allTasks(removed.phases).map((task) => task.id),
+		[2, 3, 4],
+	);
+	// The task's own phase is consistent, so nothing is reported.
+	assert.doesNotMatch(applyTodo(init(), { action: "done", id: 1, phase: "调研" }).message, /Ignored/);
+	// A stale id still fails: falling back to the phase would widen the call.
+	assert.throws(() => applyTodo(init(), { action: "done", id: 99, phase: "调研" }), /#99 not found/);
+});
+
+test("clear with an echoed id/phase on a finished plan just clears (reported retry loop)", () => {
+	// Regression: { action: "clear", id: 3, phase: "<real phase>", phases: [], items: [] } was rejected
+	// with "clear takes no target", and a model that always fills every field retried it endlessly.
+	const closed = applyTodo(init(), { action: "done" }).state;
+	const args = prepareTodoArguments({ action: "clear", id: 3, phase: "实现", phases: [], items: [] });
+	const result = applyTodo(closed, args);
+	assert.deepEqual(result.state.phases, []);
+	assert.match(result.message, /^Cleared 4 tasks\. Ignored id=3, phase="实现" \(clear always removes the whole plan\)$/);
+	// Abandoned tasks are closed too; blocked ones count as unfinished.
+	const dropped = applyTodo(init(), { action: "drop" }).state;
+	assert.deepEqual(applyTodo(dropped, { action: "clear", phase: "x" }).state.phases, []);
+	const stuck = applyTodo(init(), { action: "block", phase: "调研" }).state;
+	assert.throws(
+		() => applyTodo(applyTodo(stuck, { action: "done", phase: "实现" }).state, { action: "clear", id: 1 }),
+		/2 unfinished tasks \(#1, #2\)/,
+	);
+	// A plain clear never asks, even with unfinished tasks, and says what it discarded.
+	assert.equal(applyTodo(init(), { action: "clear" }).message, "Cleared 4 tasks (4 unfinished)");
+});
+
+test("targeted clear with unfinished tasks asks once; repeating clear confirms, anything else disarms", async () => {
+	const h = harness("json");
+	await h.call({ action: "init", phases: [{ name: "开发", items: ["a", "b"] }] });
+	const clear = { action: "clear", id: 1, phase: "开发" } as TodoParams;
+	await assert.rejects(() => h.call(clear), /2 unfinished tasks \(#1, #2\).*call clear again/);
+	assert.equal(h.sent.length, 0); // no "fix the arguments" reminder: it would contradict "call clear again"
+	const confirmed = await h.call(clear); // a fill-every-field model repeats the same call verbatim
+	assert.match(confirmed.content[0].type === "text" ? confirmed.content[0].text : "", /^Cleared 2 tasks \(2 unfinished\)\. Ignored/);
+	assert.deepEqual(confirmed.details.phases, []);
+	// Any other todo call in between disarms the confirmation.
+	await h.call({ action: "init", items: ["c"] });
+	await assert.rejects(() => h.call(clear));
+	await h.call({ action: "view" });
+	await assert.rejects(() => h.call(clear));
+	// So does a new user prompt.
+	await h.start();
+	await assert.rejects(() => h.call(clear));
+});
+
+test("failure reminder turns into 'stop retrying' on the second failure in a row; success resets it", async () => {
+	const h = harness("json");
+	await h.call({ action: "init", phases: [{ name: "开发", items: ["a"] }] });
+	await assert.rejects(() => h.call({ action: "done", id: 99 }));
+	assert.match(h.sent[0].text, /call todo again\. If it fails the same way, stop retrying/);
+	await assert.rejects(() => h.call({ action: "done", id: 99 }));
+	assert.match(h.sent[1].text, /failed 2 times in a row/);
+	assert.match(h.sent[1].text, /Do not repeat this call/);
+	assert.match(h.sent[1].text, /Todo #99 not found/);
+	assert.doesNotMatch(h.sent[1].text, /call todo again/);
+	await h.call({ action: "view" }); // a success ends the streak
+	await assert.rejects(() => h.call({ action: "done", id: 99 }));
+	assert.match(h.sent[2].text, /plan is unchanged and its progress is not visible/);
+	await assert.rejects(() => h.call({ action: "done", id: 99 }));
+	await h.start(); // and so does a new user prompt
+	await assert.rejects(() => h.call({ action: "done", id: 99 }));
+	assert.match(h.sent[4].text, /plan is unchanged and its progress is not visible/);
 });
