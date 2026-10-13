@@ -87,6 +87,9 @@ export interface SingleResult {
 	errorMessage?: string;
 	step?: number;
 	harnessActivity?: HarnessActivity[];
+	// True while the child process is still alive. exitCode alone cannot express "running": the live result
+	// starts at exitCode 0 and only gets its real code on exit, so renderers must check this flag first.
+	running?: boolean;
 }
 
 export type BgStatus = "running" | "completed" | "failed" | "cancelled";
@@ -322,6 +325,24 @@ export function getFinalOutput(messages: Message[]): string {
 		}
 	}
 	return "";
+}
+
+// exitCode === -1 is the legacy "not started yet" placeholder sentinel; keep honouring it for old details.
+export function isRunningResult(result: SingleResult): boolean {
+	return result.running === true || result.exitCode === -1;
+}
+
+// Shared by the parallel progress text and the parallel renderer so both always agree.
+export function countResultStates(results: SingleResult[]): { running: number; succeeded: number; failed: number } {
+	let running = 0;
+	let succeeded = 0;
+	let failed = 0;
+	for (const r of results) {
+		if (isRunningResult(r)) running++;
+		else if (isFailedResult(r)) failed++;
+		else succeeded++;
+	}
+	return { running, succeeded, failed };
 }
 
 export function isFailedResult(result: SingleResult): boolean {

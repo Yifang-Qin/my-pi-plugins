@@ -207,7 +207,9 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 **Parallel mode streaming**:
 - Shows all tasks with live status (⏳ running, ✓ done, ✗ failed)
 - Updates as each task makes progress
-- Shows "2/3 done, 1 running" status
+- Shows "2/3 done, 1 running" status. Running state is tracked by an explicit `running` flag on each result: the
+  upstream example decided it from `exitCode === -1`, but a live child result starts at exit code 0, so every child
+  was shown as "done ✓" as soon as it emitted its first event (the same applied to single and chain runs)
 - Returns each completed task's final output to the parent model, capped at 50 KB per task
 - Returns failure diagnostics from stderr/error messages when a child exits before producing output
 

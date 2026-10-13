@@ -47,6 +47,8 @@ import {
 	getFinalOutput,
 	getResultOutput,
 	isFailedResult,
+	isRunningResult,
+	countResultStates,
 	type SingleResult,
 	type SubagentPanelTask,
 	stripNonSgrAnsi,
@@ -181,6 +183,7 @@ async function runSingleAgent(
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: agent.model,
 		step,
+		running: true,
 	};
 
 	// 把 live 结果引用交给调用方（runTrackedAgent），供 registry / 面板实时读取流式轨迹。
@@ -261,6 +264,7 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		currentResult.running = false;
 		if (wasAborted) {
 			currentResult.stopReason = "aborted";
 			if (!currentResult.errorMessage) currentResult.errorMessage = "Cancelled";
@@ -268,6 +272,8 @@ async function runSingleAgent(
 		}
 		return currentResult;
 	} finally {
+		// Also covers early throws (e.g. temp prompt file failure) so the result never stays "running".
+		currentResult.running = false;
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -334,6 +340,7 @@ async function runTrackedAgent(
 			exitCode: base.exitCode > 0 ? base.exitCode : 130,
 			stopReason: "aborted",
 			errorMessage: base.errorMessage || "Cancelled",
+			running: false,
 		};
 		live.result = cancelled;
 		live.status = "cancelled";
@@ -467,6 +474,7 @@ function makePlaceholderResult(agentName: string, task: string): SingleResult {
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		running: true,
 	};
 }
 
@@ -711,6 +719,7 @@ function scheduleBgNotify(t: BgTask): void {
 
 function finalizeBgTask(t: BgTask, exitCode: number): void {
 	if (t.proc?.pid) bgPids.delete(t.proc.pid);
+	t.result.running = false;
 	if (t.status !== "cancelled") {
 		t.result.exitCode = exitCode;
 		t.status =
@@ -724,6 +733,7 @@ function killBgTask(t: BgTask): void {
 	if (t.status !== "running") return;
 	t.status = "cancelled";
 	t.skipNotify = true;
+	t.result.running = false;
 	try {
 		t.proc?.kill("SIGTERM");
 	} catch {
@@ -782,6 +792,7 @@ function startBackgroundTask(
 			stderr: "",
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			model: agent.model,
+			running: true,
 		},
 	};
 	bgTasks.set(id, t);
@@ -1292,17 +1303,18 @@ export default function (pi: ExtensionAPI) {
 						agent: params.tasks[i].agent,
 						agentSource: "unknown",
 						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
+						exitCode: -1, // placeholder until the child's first streamed update replaces it
 						messages: [],
 						stderr: "",
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						running: true,
 					};
 				}
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
+						const { running } = countResultStates(allResults);
+						const done = allResults.length - running;
 						onUpdate({
 							content: [
 								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
@@ -1455,6 +1467,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mdTheme = getMarkdownTheme();
+			// Running beats exit status: a live child has exitCode 0 until it actually exits.
+			const resultIcon = (r: SingleResult) =>
+				isRunningResult(r)
+					? theme.fg("warning", "⏳")
+					: isFailedResult(r)
+						? theme.fg("error", "✗")
+						: theme.fg("success", "✓");
 
 			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
 				const toShow = limit ? items.slice(-limit) : items;
@@ -1485,8 +1504,9 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
-				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const running = isRunningResult(r);
+				const isError = !running && isFailedResult(r);
+				const icon = resultIcon(r);
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
 
@@ -1532,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+				else if (displayItems.length === 0) text += `\n${theme.fg("muted", running ? "(running...)" : "(no output)")}`;
 				else {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
@@ -1558,8 +1578,13 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				const chainRunning = details.results.some(isRunningResult);
+				const successCount = details.results.filter((r) => !isRunningResult(r) && !isFailedResult(r)).length;
+				const icon = chainRunning
+					? theme.fg("warning", "⏳")
+					: successCount === details.results.length
+						? theme.fg("success", "✓")
+						: theme.fg("error", "✗");
 
 				if (expanded) {
 					const container = new Container();
@@ -1575,7 +1600,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = resultIcon(r);
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1628,10 +1653,11 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = resultIcon(r);
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					if (displayItems.length === 0)
+						text += `\n${theme.fg("muted", isRunningResult(r) ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 					const harnessStats = formatHarnessStats(r);
 					if (harnessStats) text += `\n${theme.fg("warning", `↻ ${harnessStats}`)}`;
@@ -1643,9 +1669,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+				const {
+					running,
+					succeeded: successCount,
+					failed: failCount,
+				} = countResultStates(details.results);
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -1667,7 +1695,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						const rIcon = resultIcon(r);
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1712,16 +1740,11 @@ export default function (pi: ExtensionAPI) {
 				// Collapsed view (or still running)
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
 				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
+					const rIcon = resultIcon(r);
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+						text += `\n${theme.fg("muted", isRunningResult(r) ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 					const harnessStats = formatHarnessStats(r);
 					if (harnessStats) text += `\n${theme.fg("warning", `↻ ${harnessStats}`)}`;

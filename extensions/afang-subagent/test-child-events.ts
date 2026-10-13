@@ -3,9 +3,11 @@
 
 import { processChildEvent } from "./child-events.ts";
 import {
+	countResultStates,
 	formatHarnessActivity,
 	formatHarnessStats,
 	getResultOutput,
+	isRunningResult,
 	stripNonSgrAnsi,
 	type SingleResult,
 } from "./render-helpers.ts";
@@ -187,4 +189,28 @@ check(
 		type: "message_end",
 		message: { role: "system", content: "", sections: { preamble: "You are..." }, timestamp: Date.now() },
 	}) === false && systemCarrier.messages.length === 0,
+);
+
+// Regression: a live child result starts at exitCode 0 and only gets its real exit code on close.
+// The parallel/chain/single renderers used exitCode alone and showed running children as "done ✓".
+const liveChild = makeResult();
+liveChild.running = true;
+processChildEvent(liveChild, {
+	type: "message_end",
+	message: { role: "assistant", content: [], provider: "test", model: "m", stopReason: "toolUse", timestamp: Date.now() },
+});
+const placeholder = makeResult();
+placeholder.exitCode = -1;
+const finished = makeResult();
+finished.running = false;
+const failedChild = makeResult();
+failedChild.exitCode = 1;
+failedChild.running = false;
+check("live child with exitCode 0 still counts as running", isRunningResult(liveChild) && liveChild.exitCode === 0);
+check("legacy exitCode -1 placeholder counts as running", isRunningResult(placeholder));
+check("finished child is not running", !isRunningResult(finished));
+const counts = countResultStates([liveChild, placeholder, finished, failedChild]);
+check(
+	"parallel counts split running / succeeded / failed",
+	counts.running === 2 && counts.succeeded === 1 && counts.failed === 1,
 );

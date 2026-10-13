@@ -211,7 +211,8 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 **Parallel mode streaming**:
 - Shows all tasks with live status (⏳ running, ✓ done, ✗ failed)
 - Updates as each task makes progress
-- Shows "2/3 done, 1 running" status
+- Shows "2/3 done, 1 running" status。运行态由每个结果上显式的 `running` 标记判断：上游示例用 `exitCode === -1`
+  判断，但 live child 结果的初始 exit code 是 0，于是每个 child 一发出首个事件就被显示成「done ✓」（single 与 chain 同病）
 - Returns each completed task's final output to the parent model, capped at 50 KB per task
 - Returns failure diagnostics from stderr/error messages when a child exits before producing output
 
