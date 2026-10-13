@@ -36,6 +36,7 @@ import { createNotifyQueue, truncateUtf8Head, type NotifyQueue, type RenderedIte
 import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents, discoverBuiltinAgents } from "./agents.ts";
 import { processChildEvent } from "./child-events.ts";
 import { openSubagentPanel } from "./subagent-panel.ts";
+import { parseHudMode, SubagentHud } from "./subagent-hud.ts";
 import {
 	type BgStatus,
 	type DisplayItem,
@@ -347,6 +348,7 @@ async function runTrackedAgent(
 		return cancelled;
 	} finally {
 		if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
+		notifyRegistryChanged();
 	}
 }
 
@@ -465,6 +467,10 @@ interface LiveTask {
 
 const liveTasks = new Map<string, LiveTask>();
 
+// Lifecycle hook for the always-visible HUD / footer status (see subagent-hud.ts). The extension
+// factory points it at its SubagentHud instance; until then it is a no-op.
+let notifyRegistryChanged: () => void = () => {};
+
 function makePlaceholderResult(agentName: string, task: string): SingleResult {
 	return {
 		agent: agentName,
@@ -502,6 +508,7 @@ function registerLiveTask(
 		abort,
 	};
 	liveTasks.set(id, t);
+	notifyRegistryChanged();
 	return t;
 }
 
@@ -520,6 +527,7 @@ function killLiveTask(t: LiveTask): void {
 	} catch {
 		/* ignore */
 	}
+	notifyRegistryChanged();
 }
 
 function killAllLiveTasks(): void {
@@ -534,6 +542,7 @@ export function snapshotSubagentTasks(): SubagentPanelTask[] {
 		out.push({
 			id: t.id,
 			kind: t.kind,
+			step: t.step,
 			agentName: t.agentName,
 			agentSource: t.result.agentSource,
 			task: t.task,
@@ -727,6 +736,7 @@ function finalizeBgTask(t: BgTask, exitCode: number): void {
 		writeBgResultFile(t);
 		if (!t.skipNotify) scheduleBgNotify(t);
 	}
+	notifyRegistryChanged();
 }
 
 function killBgTask(t: BgTask): void {
@@ -747,6 +757,7 @@ function killBgTask(t: BgTask): void {
 		}
 	}, 5000);
 	writeBgResultFile(t);
+	notifyRegistryChanged();
 }
 
 function killAllBgTasks(): void {
@@ -796,6 +807,7 @@ function startBackgroundTask(
 		},
 	};
 	bgTasks.set(id, t);
+	notifyRegistryChanged();
 
 	void (async () => {
 		const args: string[] = ["--mode", "json", "-p", "--no-session"];
@@ -888,6 +900,12 @@ const BgTasksParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	bgNotifier = createBgNotifier(pi);
 
+	// Always-visible running indicator: footer status + pinned "Subagents" block above the editor.
+	// Child pi processes run in JSON mode without UI, so attach() is a no-op there.
+	const hud = new SubagentHud({ snapshot: snapshotSubagentTasks }, parseHudMode(process.env.PI_SUBAGENT_HUD));
+	notifyRegistryChanged = () => hud.changed();
+	pi.on("session_start", (_event, ctx) => hud.attach(ctx));
+
 	// 内建 agent 是注册时就确定的静态集合：扫描一次并写进工具描述，让模型在 system prompt
 	// 里就能看到可用 agent（描述随 /reload 重建，不会过期）；user/project 定制仍在 execute 时
 	// 动态发现，描述里只提示存放位置与查看方法（无 mode 调用 = 列出当前可用 agent）。
@@ -938,6 +956,7 @@ export default function (pi: ExtensionAPI) {
 		killAllBgTasks();
 		killAllLiveTasks();
 		liveTasks.clear();
+		hud.detach();
 	});
 	pi.on("session_before_switch", () => {
 		killAllBgTasks();
@@ -953,15 +972,15 @@ export default function (pi: ExtensionAPI) {
 	// —— /subagent（别名 /sa）面向用户的交互面板（overlay：列表 → Enter 看轨迹 / x kill）——
 	// 组件实现见 subagent-panel.ts；与模型用的 subagent_tasks 工具共用同一套 registry。
 	// 命令在流式期间也能立即执行，故并行还在同步跑的当口也能开面板单杀某个 child。
-	const SA_STATUS_KEY = "afang-subagent";
+	// The footer status is owned by the HUD now (always on while something runs), so the panel only
+	// nudges it to refresh instead of setting/clearing it around its own lifetime.
 	const openPanel = async (_args: string, ctx: ExtensionCommandContext) => {
 		if (!ctx.hasUI) return;
 		await openSubagentPanel(ctx, {
 			snapshot: snapshotSubagentTasks,
 			kill: killSubagentTask,
-			setRunningCount: (n) => ctx.ui.setStatus(SA_STATUS_KEY, n > 0 ? `sa: ${n} running` : undefined),
+			setRunningCount: () => hud.changed(),
 		});
-		ctx.ui.setStatus(SA_STATUS_KEY, undefined);
 	};
 	pi.registerCommand("subagent", {
 		description: "View/manage subagent tasks (traces and kill for parallel/chain/background runs)",

@@ -73,6 +73,38 @@ finished entries before each new tool call and is emptied on session switch/exit
 > (only imported by relative path and holding no mutable state, so a double instance is harmless); the stateful `snapshot`/`kill` are passed by `index.ts`'s command
 > handler as closures into `openSubagentPanel` through **dependency injection**, so the panel always reads the instance that pi loaded as the entry.
 
+## Always-visible running indicator (pinned HUD + footer status)
+
+The tool block only shows a foreground run while it is on screen (it scrolls away in fullscreen), and a background
+task has no tool block at all once it has started. So while anything runs, two surfaces stay visible
+(modelled on oh-my-pi's pinned `Subagents` block and status-line badge):
+
+- **Footer status**: `sa: 3 running (1 bg)`, cleared as soon as nothing runs. It is no longer tied to the `/sa` panel being open.
+- **Pinned `Subagents` block above the editor**: one row per running task — foreground single/parallel/chain children
+  and background tasks alike — with agent, topic, id, kind (`parallel #2`, `chain step 1`, `bg`), elapsed time, and the
+  child's latest activity (its most recent tool call, else its latest text, else `starting…`):
+
+  ```
+   Subagents 4 running (1 bg) · /sa to inspect or kill
+    ├─ ⏳ worker “fix flaky test” task-2 · bg · 4m05s · → $ bun test
+    ├─ ⏳ scout task-4 · parallel #1 · 1m12s · → read extensions/afang-subagent/index.ts
+    ├─ ⏳ reviewer task-5 · parallel #2 · 1m11s · starting…
+    └─ … +1 more
+  ```
+
+  Collapsed (default) shows up to 3 rows plus `+N more`. Set `PI_SUBAGENT_HUD=full` to list every task, or
+  `PI_SUBAGENT_HUD=off` to hide the block (the footer status stays). It is display-only: use `/sa` to inspect traces or kill.
+
+Implementation notes (`subagent-hud.ts`):
+
+- Driven by registry lifecycle events (task registered / settled / killed, background task finished), plus a 1-second
+  repaint only while something runs, so elapsed time and the latest activity keep moving. Idle sessions do no work.
+- Installed once per session with `setWidget(..., { placement: "aboveEditor" })` and rendered as zero lines when idle:
+  calling `setWidget` again with the same key would move the block to the end of the above-editor stack.
+- Every row is single-lined and truncated to the terminal width (one string = one physical row).
+- Only installed in the interactive TUI; child pi processes (`--mode json`) have no UI and skip it.
+- Same `/reload` rule as the panel: the HUD gets `snapshot` through dependency injection and never imports `index.ts`.
+
 ## Differences from the official version
 
 - **Recursion depth guard (`PI_SUBAGENT_DEPTH`)**: when spawning a child pi, `PI_SUBAGENT_DEPTH = current depth + 1` is injected
@@ -98,6 +130,7 @@ finished entries before each new tool call and is emptied on session switch/exit
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Harness observability**: Captures child pi compaction, agent retry, and summarization-retry events; shows them in expanded tool results, `/subagent` trajectories, `subagent_tasks`, and background result files
 - **Abort support**: Ctrl+C propagates to kill subagent processes
+- **Always-visible running indicator**: pinned `Subagents` block above the editor + `sa: N running` footer status while anything runs
 - **Live monitoring & per-child kill**: `/subagent` (`/sa`) overlay panel to watch each foreground
   child's trajectory and kill individuals without aborting the whole batch (see "Foreground task monitoring and per-task kill")
 
@@ -111,6 +144,8 @@ subagent/
 ├── child-events.ts      # Child pi JSON event normalization: message/tool + compaction/retry observability
 ├── test-child-events.ts # Regression test for child JSON event ingestion (run directly with bun)
 ├── subagent-panel.ts    # /subagent (/sa) user panel: list → trajectory → per-task kill
+├── subagent-hud.ts      # Always-visible running indicator: pinned "Subagents" block + footer status
+├── test-subagent-hud.ts # Rendering checks for the HUD (run directly with bun)
 ├── render-helpers.ts    # Stateless pure helpers/types (shared by the panel and index, avoiding the /reload double instance; see above)
 ├── agents.ts            # Agent discovery logic
 ├── agents/              # Built-in agent definitions (auto-discovered, self-contained)

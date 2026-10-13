@@ -71,6 +71,37 @@
 > （只被相对 import、无可变状态，双实例也无害）；有状态的 `snapshot`/`kill` 由 `index.ts` 的命令
 > handler 以**依赖注入**方式把闭包传给 `openSubagentPanel`，保证面板读到的永远是 pi 入口那个实例。
 
+## 常驻运行指示（输入框上方的 HUD + footer 状态）
+
+工具块只在它还在屏幕上时才能看到前台运行（fullscreen 下会被滚走）；后台任务启动后更是连工具块都没有。
+所以只要有任务在跑，就常驻两处指示（参考 oh-my-pi 的固定 `Subagents` 区块与状态栏徽标）：
+
+- **footer 状态**：`sa: 3 running (1 bg)`，没有任务在跑时立即清除；不再依赖 `/sa` 面板是否打开。
+- **输入框上方固定的 `Subagents` 区块**：每个运行中的任务一行——前台 single/parallel/chain 的各个 child 与后台任务都列出——
+  显示 agent、topic、id、类型（`parallel #2`、`chain step 1`、`bg`）、已运行时长，以及 child 的最新活动
+  （最近一次工具调用；没有则显示最新文本；再没有则显示 `starting…`）：
+
+  ```
+   Subagents 4 running (1 bg) · /sa to inspect or kill
+    ├─ ⏳ worker “fix flaky test” task-2 · bg · 4m05s · → $ bun test
+    ├─ ⏳ scout task-4 · parallel #1 · 1m12s · → read extensions/afang-subagent/index.ts
+    ├─ ⏳ reviewer task-5 · parallel #2 · 1m11s · starting…
+    └─ … +1 more
+  ```
+
+  默认折叠：最多 3 行加 `+N more`。设 `PI_SUBAGENT_HUD=full` 列出全部，`PI_SUBAGENT_HUD=off` 隐藏区块（footer 状态保留）。
+  区块只负责展示：看轨迹或 kill 请用 `/sa`。
+
+实现要点（`subagent-hud.ts`）：
+
+- 由 registry 生命周期事件驱动（任务登记 / 结束 / 被 kill、后台任务完成），外加**仅在有任务运行时**的每秒重绘，
+  让时长与最新活动持续刷新；空闲会话不做任何事。
+- 每个会话只 `setWidget(..., { placement: "aboveEditor" })` 一次，空闲时渲染为 0 行：同 key 再次 `setWidget`
+  会把区块挪到 editor 上方组件栈的末尾。
+- 每行都先单行化、再按终端宽度截断（一个字符串 = 一个物理行）。
+- 只在交互式 TUI 里安装；子 pi（`--mode json`）没有 UI，自动跳过。
+- 与面板同样遵守 `/reload` 规则：HUD 通过依赖注入拿 `snapshot`，绝不 import `index.ts`。
+
 ## 与官方版的差异
 
 - **递归深度护栏（`PI_SUBAGENT_DEPTH`）**：spawn 子 pi 时注入 `PI_SUBAGENT_DEPTH = 当前深度 + 1`
@@ -102,6 +133,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Harness observability**: Captures child pi compaction, agent retry, and summarization-retry events; shows them in expanded tool results, `/subagent` trajectories, `subagent_tasks`, and background result files
 - **Abort support**: Ctrl+C propagates to kill subagent processes
+- **常驻运行指示**：有任务运行时，输入框上方固定显示 `Subagents` 区块，footer 显示 `sa: N running`
 - **Live monitoring & per-child kill**: `/subagent` (`/sa`) overlay panel to watch each foreground
   child's trajectory and kill individuals without aborting the whole batch (see 前台任务监控与单杀)
 
@@ -115,6 +147,8 @@ subagent/
 ├── child-events.ts      # 子 pi JSON 事件归一化：message/tool + compaction/retry 可观测性
 ├── test-child-events.ts # child JSON 事件摄取回归测试（bun 直接运行）
 ├── subagent-panel.ts    # /subagent (/sa) 用户面板：列表 → 轨迹 → 单杀
+├── subagent-hud.ts      # 常驻运行指示：输入框上方的 "Subagents" 区块 + footer 状态
+├── test-subagent-hud.ts # HUD 渲染测试（bun 直接运行）
 ├── render-helpers.ts    # 无状态纯 helper/类型（面板与 index 共享，避开 /reload 双实例，见下）
 ├── agents.ts            # Agent discovery logic
 ├── agents/              # Built-in agent definitions (auto-discovered, self-contained)

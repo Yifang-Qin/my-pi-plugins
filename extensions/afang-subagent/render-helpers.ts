@@ -98,6 +98,7 @@ export type BgStatus = "running" | "completed" | "failed" | "cancelled";
 export interface SubagentPanelTask {
 	id: string;
 	kind: "single" | "parallel" | "chain" | "background";
+	step?: number; // 1-based position inside a parallel batch / chain (foreground only)
 	agentName: string;
 	agentSource: string;
 	topic?: string;
